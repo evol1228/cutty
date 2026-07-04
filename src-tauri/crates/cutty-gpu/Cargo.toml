@@ -1,0 +1,8 @@
+[package]
+name = "cutty-gpu"
+description = "wgpu compositor and WGSL effect/transition shaders"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true

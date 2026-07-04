@@ -1,0 +1,10 @@
+[package]
+name = "cutty-engine"
+description = "Project model, timeline operations, command system, undo/redo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

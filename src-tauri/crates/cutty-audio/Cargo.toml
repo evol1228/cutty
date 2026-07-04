@@ -1,0 +1,11 @@
+[package]
+name = "cutty-audio"
+description = "Audio decode (symphonia) and output (cpal); the audio thread is the master clock"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal = "0.18.1"
+ringbuf = "0.4"
+symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "aac", "opt-simd"] }
+thiserror.workspace = true
