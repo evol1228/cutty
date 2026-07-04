@@ -99,8 +99,20 @@ pub fn engine_add_media(
     has_audio: bool,
 ) -> Result<u64, String> {
     mutate(&app, &state, |e| {
-        e.add_media(path, duration, has_video, has_audio).map(|m| m.0)
+        e.add_media(path, duration, has_video, has_audio)
+            .map(|m| m.0)
     })
+}
+
+/// Remove a media file from the pool and every clip referencing it, as a
+/// single undoable command.
+#[tauri::command]
+pub fn engine_remove_media(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    media_id: u64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| e.remove_media(MediaId(media_id)))
 }
 
 /// Place a new clip on a track; returns the new clip's id.
@@ -160,7 +172,9 @@ pub fn engine_split_clip(
     clip_id: u64,
     at: f64,
 ) -> Result<u64, String> {
-    mutate(&app, &state, |e| e.split_clip(ClipId(clip_id), at).map(|c| c.0))
+    mutate(&app, &state, |e| {
+        e.split_clip(ClipId(clip_id), at).map(|c| c.0)
+    })
 }
 
 /// Remove a clip, leaving a gap.

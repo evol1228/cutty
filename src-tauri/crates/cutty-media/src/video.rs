@@ -35,7 +35,14 @@ impl VideoDecoder {
         let mut child = FfmpegCommand::new()
             // Trim input analysis: proxies are known-good H.264 MP4s and
             // every millisecond here is seek latency.
-            .args(["-probesize", "65536", "-analyzeduration", "0", "-threads", "2"])
+            .args([
+                "-probesize",
+                "65536",
+                "-analyzeduration",
+                "0",
+                "-threads",
+                "2",
+            ])
             .seek(format!("{start_sec:.6}"))
             .input(path.to_string_lossy())
             .no_audio()

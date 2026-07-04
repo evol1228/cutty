@@ -3,6 +3,7 @@ import MediaPool from "./components/MediaPool";
 import Player from "./components/Player";
 import Inspector from "./components/Inspector";
 import Timeline from "./components/Timeline";
+import Toasts from "./components/Toasts";
 
 function App() {
   return (
@@ -14,6 +15,7 @@ function App() {
         <Inspector />
       </div>
       <Timeline />
+      <Toasts />
     </div>
   );
 }

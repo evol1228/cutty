@@ -20,7 +20,9 @@ pub fn generate_test_clip(name: &str, width: u32, height: u32, fps: u32, secs: u
             "testsrc2=size={width}x{height}:rate={fps}:duration={secs}"
         ))
         .args(["-f", "lavfi", "-i"])
-        .arg(format!("sine=frequency=440:sample_rate=48000:duration={secs}"))
+        .arg(format!(
+            "sine=frequency=440:sample_rate=48000:duration={secs}"
+        ))
         .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
         .args(["-c:a", "aac", "-b:a", "128k", "-shortest"])
         .arg(&file)

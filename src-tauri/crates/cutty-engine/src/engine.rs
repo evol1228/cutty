@@ -4,8 +4,8 @@
 use serde::Serialize;
 
 use crate::command::{
-    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, RippleDelete, RippleMove,
-    SplitClip, TrimClip,
+    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, RemoveMedia, RippleDelete,
+    RippleMove, SplitClip, TrimClip,
 };
 use crate::error::EngineError;
 use crate::model::{
@@ -151,7 +151,8 @@ impl Engine {
     ///
     /// Media registration is not a timeline mutation and is deliberately
     /// not undoable (matching every mainstream editor); clips referencing
-    /// the media are what undo tracks.
+    /// the media are what undo tracks. Removal is different — see
+    /// [`Engine::remove_media`].
     pub fn add_media(
         &mut self,
         path: impl Into<String>,
@@ -176,6 +177,31 @@ impl Engine {
         });
         self.emit_snapshot();
         Ok(id)
+    }
+
+    /// Remove a media file from the pool **and every clip referencing it**,
+    /// as a single undoable command. Unlike [`Engine::add_media`] this goes
+    /// through the command system: dropping timeline clips must be
+    /// reversible, so undo restores the media ref and all its clips
+    /// verbatim.
+    pub fn remove_media(&mut self, media_id: MediaId) -> Result<(), EngineError> {
+        let media = self
+            .project
+            .media(media_id)
+            .ok_or(EngineError::UnknownMedia(media_id))?
+            .clone();
+        let removed: Vec<_> = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| {
+                t.clips
+                    .iter()
+                    .filter(|c| c.media_id == media_id)
+                    .map(|c| (t.id, c.clone()))
+            })
+            .collect();
+        self.execute(Box::new(RemoveMedia { media, removed }))
     }
 
     // ------------------------------------------------------------------

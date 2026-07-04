@@ -8,7 +8,7 @@
 //! `x - a + a` float drift).
 
 use crate::error::EngineError;
-use crate::model::{Clip, ClipId, Project, TrackId};
+use crate::model::{Clip, ClipId, MediaRef, Project, TrackId};
 
 /// A reversible timeline mutation.
 ///
@@ -363,6 +363,72 @@ impl Command for RippleInsert {
 
     fn name(&self) -> &'static str {
         "RippleInsert"
+    }
+}
+
+/// Remove a media file from the pool together with every clip that
+/// references it — the one place a pool mutation is undoable, because
+/// silently dropping timeline clips must be reversible. Captures the
+/// media ref and all removed clips verbatim.
+#[derive(Debug, Clone)]
+pub struct RemoveMedia {
+    pub media: MediaRef,
+    /// Every removed clip with its host track.
+    pub removed: Vec<(TrackId, Clip)>,
+}
+
+impl Command for RemoveMedia {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        for (track_id, clip) in &self.removed {
+            take_clip(project, *track_id, clip.id)?;
+        }
+        let idx = project
+            .media
+            .iter()
+            .position(|m| m.id == self.media.id)
+            .ok_or(EngineError::UnknownMedia(self.media.id))?;
+        project.media.remove(idx);
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(RestoreMedia {
+            media: self.media.clone(),
+            removed: self.removed.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "RemoveMedia"
+    }
+}
+
+/// Re-register a media file and re-insert its clips — the inverse of
+/// [`RemoveMedia`], only ever constructed as such.
+#[derive(Debug, Clone)]
+pub struct RestoreMedia {
+    pub media: MediaRef,
+    pub removed: Vec<(TrackId, Clip)>,
+}
+
+impl Command for RestoreMedia {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        project.media.push(self.media.clone());
+        for (track_id, clip) in &self.removed {
+            insert_clip(project, *track_id, clip.clone())?;
+        }
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(RemoveMedia {
+            media: self.media.clone(),
+            removed: self.removed.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "RestoreMedia"
     }
 }
 

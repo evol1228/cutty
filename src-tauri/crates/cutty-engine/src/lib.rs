@@ -29,8 +29,8 @@ pub mod resolve;
 pub mod snap;
 
 pub use command::{
-    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, JoinClips, MoveClip, RippleDelete,
-    RippleInsert, RippleMove, SplitClip, TrimClip,
+    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, JoinClips, MoveClip, RemoveMedia,
+    RestoreMedia, RippleDelete, RippleInsert, RippleMove, SplitClip, TrimClip,
 };
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;

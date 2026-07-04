@@ -215,7 +215,9 @@ fn snap_clip_move_snaps_the_nearer_edge() {
     } = engine_with_media();
     // Dragged: 2s long. Anchor clip on the audio track at [5, 8).
     let dragged = engine.add_clip(video, media, 0.0, 0.0, 2.0).expect("drag");
-    engine.add_clip(audio, media, 5.0, 0.0, 3.0).expect("anchor");
+    engine
+        .add_clip(audio, media, 5.0, 0.0, 3.0)
+        .expect("anchor");
 
     // Start edge near 5.0 → snaps start to 5.0.
     let m = snap_clip_move(engine.project(), dragged, 4.92, 0.2, None).expect("snap");

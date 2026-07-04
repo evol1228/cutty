@@ -5,13 +5,24 @@
 // says they are.
 
 import type { Clip, Project, Track } from "../lib/engineIpc";
+import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
+import { requestDraw } from "./dirty";
 import { durationToPx, RULER_H, timeToX, TRACK_H, view, xToTime } from "./view";
+
+/** Ghost of a pool item being dragged over the timeline. */
+export interface DropPreview {
+  trackIndex: number;
+  inSec: number;
+  durSec: number;
+}
 
 /** Transient gesture state drawn on top of engine state. */
 export interface TimelineOverlay {
   /** Snap indicator line, seconds; null when not snapping. */
   snapLineSec: number | null;
+  /** Pool-drag drop preview; null when no drag is over the canvas. */
+  dropPreview: DropPreview | null;
 }
 
 const COLORS = {
@@ -28,10 +39,14 @@ const COLORS = {
   audioBorder: "#047857", // emerald-700
   selectedFill: { video: "#075985", audio: "#065f46" },
   selectedBorder: "#f59e0b", // amber-500
+  missingFill: "#450a0a", // red-950
+  missingBorder: "#b91c1c", // red-700
   clipLabel: "#e4e4e7", // zinc-200
   grip: "rgba(255,255,255,0.55)",
   playhead: "#ef4444", // red-500
   snapLine: "#fbbf24", // amber-400
+  dropFill: "rgba(14, 165, 233, 0.25)", // sky-500
+  dropBorder: "#38bdf8", // sky-400
   emptyHint: "#52525b", // zinc-600
 } as const;
 
@@ -163,13 +178,44 @@ function drawLanes(
   }
 }
 
+// Decoded thumbnail images by blob URL. Entries are tiny (320px JPEGs);
+// the cache lives for the session.
+const thumbCache = new Map<string, HTMLImageElement | null>();
+
+/** The decoded thumbnail for a blob URL, kicking off a load on first use. */
+function thumbImage(url: string): HTMLImageElement | null {
+  const cached = thumbCache.get(url);
+  if (cached !== undefined) return cached;
+  thumbCache.set(url, null);
+  const img = new Image();
+  img.onload = () => {
+    thumbCache.set(url, img);
+    requestDraw();
+  };
+  img.src = url;
+  return null;
+}
+
+/** media id → thumbnail blob URL for everything the pool has thumbnails for. */
+function mediaThumbMap(): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const item of useMediaStore.getState().items) {
+    if (item.mediaId !== null && item.thumbnailUrl) {
+      map.set(item.mediaId, item.thumbnailUrl);
+    }
+  }
+  return map;
+}
+
 function drawClip(
   ctx: CanvasRenderingContext2D,
   clip: Clip,
   track: Track,
   laneY: number,
   selected: boolean,
+  missing: boolean,
   mediaNames: Map<number, string>,
+  thumbs: Map<number, string>,
 ): void {
   const x = timeToX(clip.timelineIn);
   const w = Math.max(durationToPx(clip.timelineOut - clip.timelineIn), 2);
@@ -177,24 +223,48 @@ function drawClip(
   const h = TRACK_H - 9;
 
   const kind = track.kind;
-  ctx.fillStyle = selected
-    ? COLORS.selectedFill[kind]
-    : kind === "video"
-      ? COLORS.videoFill
-      : COLORS.audioFill;
+  ctx.fillStyle = missing
+    ? COLORS.missingFill
+    : selected
+      ? COLORS.selectedFill[kind]
+      : kind === "video"
+        ? COLORS.videoFill
+        : COLORS.audioFill;
   roundRectPath(ctx, x, y, w, h, 5);
   ctx.fill();
+
+  // Clip visuals v1: one representative thumbnail at the clip's left edge
+  // (full filmstrips are Phase 2). Missing media shows red, no stale frame.
+  let labelIndent = 0;
+  const thumbUrl = missing ? undefined : thumbs.get(clip.mediaId);
+  if (thumbUrl && w >= 40) {
+    const img = thumbImage(thumbUrl);
+    if (img) {
+      const thumbW = Math.min((h / img.naturalHeight) * img.naturalWidth, w - 4);
+      ctx.save();
+      roundRectPath(ctx, x, y, w, h, 5);
+      ctx.clip();
+      ctx.drawImage(img, x + 1, y + 1, thumbW, h - 2);
+      ctx.restore();
+      labelIndent = thumbW;
+    }
+  }
+
   ctx.lineWidth = selected ? 2 : 1;
   ctx.strokeStyle = selected
     ? COLORS.selectedBorder
-    : kind === "video"
-      ? COLORS.videoBorder
-      : COLORS.audioBorder;
+    : missing
+      ? COLORS.missingBorder
+      : kind === "video"
+        ? COLORS.videoBorder
+        : COLORS.audioBorder;
+  roundRectPath(ctx, x, y, w, h, 5);
   ctx.stroke();
   ctx.lineWidth = 1;
 
-  if (w >= 28) {
-    const label = mediaNames.get(clip.mediaId) ?? `clip ${clip.id}`;
+  if (w >= 28 + labelIndent) {
+    const name = mediaNames.get(clip.mediaId) ?? `clip ${clip.id}`;
+    const label = missing ? `⚠ ${name}` : name;
     ctx.save();
     roundRectPath(ctx, x + 2, y, w - 4, h, 5);
     ctx.clip();
@@ -202,7 +272,7 @@ function drawClip(
     ctx.font = "11px system-ui, sans-serif";
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
-    ctx.fillText(label, x + 7, y + 6);
+    ctx.fillText(label, x + labelIndent + 7, y + 6);
     ctx.restore();
   }
 
@@ -212,6 +282,23 @@ function drawClip(
     ctx.fillRect(x + 2.5, y + h / 2 - 7, 2, 14);
     ctx.fillRect(x + w - 4.5, y + h / 2 - 7, 2, 14);
   }
+}
+
+function drawDropPreview(
+  ctx: CanvasRenderingContext2D,
+  preview: DropPreview,
+): void {
+  const x = timeToX(preview.inSec);
+  const w = Math.max(durationToPx(preview.durSec), 2);
+  const y = RULER_H + preview.trackIndex * TRACK_H + 4;
+  const h = TRACK_H - 9;
+  ctx.fillStyle = COLORS.dropFill;
+  roundRectPath(ctx, x, y, w, h, 5);
+  ctx.fill();
+  ctx.strokeStyle = COLORS.dropBorder;
+  ctx.setLineDash([5, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 function drawPlayhead(
@@ -280,24 +367,35 @@ export function drawTimeline(
   if (project) {
     const selected = new Set(selection);
     const names = mediaNameMap(project);
+    const thumbs = mediaThumbMap();
+    const missingIds = useMediaStore.getState().missingMediaIds;
     const startSec = xToTime(-2);
     const endSec = xToTime(width + 2);
     let hasClips = false;
     project.tracks.forEach((track, i) => {
       const laneY = RULER_H + i * TRACK_H;
       for (const clip of visibleClips(track.clips, startSec, endSec)) {
-        drawClip(ctx, clip, track, laneY, selected.has(clip.id), names);
+        drawClip(
+          ctx,
+          clip,
+          track,
+          laneY,
+          selected.has(clip.id),
+          missingIds.has(clip.mediaId),
+          names,
+          thumbs,
+        );
       }
       hasClips = hasClips || track.clips.length > 0;
     });
 
-    if (!hasClips) {
+    if (!hasClips && !overlay.dropPreview) {
       ctx.fillStyle = COLORS.emptyHint;
       ctx.font = "12px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillText(
-        "Timeline is empty — use Seed 50 to add test clips",
+        "Timeline is empty — drag media here from the pool",
         width / 2,
         RULER_H + (height - RULER_H) / 2,
       );
@@ -305,6 +403,9 @@ export function drawTimeline(
     }
   }
 
+  if (overlay.dropPreview) {
+    drawDropPreview(ctx, overlay.dropPreview);
+  }
   if (overlay.snapLineSec !== null) {
     drawSnapLine(ctx, overlay.snapLineSec, height);
   }

@@ -64,8 +64,8 @@ impl PlaybackClock {
     /// Current playback position in seconds.
     pub fn position_secs(&self) -> f64 {
         let rate = f64::from(self.sample_rate);
-        let queued_frames = self.base_frames.load(Ordering::Acquire)
-            + self.frames_consumed.load(Ordering::Acquire);
+        let queued_frames =
+            self.base_frames.load(Ordering::Acquire) + self.frames_consumed.load(Ordering::Acquire);
         let queued = queued_frames as f64 / rate;
         if !self.playing.load(Ordering::Acquire) {
             return queued;
@@ -73,12 +73,10 @@ impl PlaybackClock {
         // The last callback's buffer has not played yet at the instant it
         // was queued — without subtracting it the clock reads one device
         // period ahead of the DAC.
-        let last_buffer =
-            self.last_buffer_frames.load(Ordering::Acquire) as f64 / rate;
+        let last_buffer = self.last_buffer_frames.load(Ordering::Acquire) as f64 / rate;
         let latency = self.latency_nanos.load(Ordering::Acquire) as f64 * 1e-9;
         let now = self.epoch.elapsed().as_nanos() as u64;
-        let since_cb =
-            now.saturating_sub(self.last_cb_nanos.load(Ordering::Acquire)) as f64 * 1e-9;
+        let since_cb = now.saturating_sub(self.last_cb_nanos.load(Ordering::Acquire)) as f64 * 1e-9;
         (queued - last_buffer - latency + since_cb).clamp(0.0, queued)
     }
 
@@ -182,10 +180,7 @@ mod tests {
         let pos = c.position_secs();
         // Expected ≈ 1.0 − 0.010 (unplayed buffer) − 0.020 (latency) = 0.97,
         // plus a few µs of since_cb.
-        assert!(
-            (0.965..=0.975).contains(&pos),
-            "expected ≈0.97, got {pos}"
-        );
+        assert!((0.965..=0.975).contains(&pos), "expected ≈0.97, got {pos}");
         // Never ahead of what was actually consumed.
         assert!(pos <= 1.0 + f64::EPSILON);
     }

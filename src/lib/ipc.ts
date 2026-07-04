@@ -54,6 +54,19 @@ export function generateProxy(
   return invoke<string>("generate_proxy", { path, durationHint });
 }
 
+/** Generate (or fetch cached) a media thumbnail; resolves with JPEG bytes. */
+export function mediaThumbnail(
+  path: string,
+  durationHint?: number,
+): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("media_thumbnail", { path, durationHint });
+}
+
+/** Which of the given source paths currently exist on disk. */
+export function pathsExist(paths: string[]): Promise<boolean[]> {
+  return invoke<boolean[]>("paths_exist", { paths });
+}
+
 // --- Player ---
 
 export interface PlayerInfo {

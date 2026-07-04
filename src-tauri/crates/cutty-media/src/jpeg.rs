@@ -23,7 +23,12 @@ impl JpegEncoder {
     }
 
     /// Compress a tightly-packed rgb24 buffer.
-    pub fn encode_rgb(&mut self, width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, MediaError> {
+    pub fn encode_rgb(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgb: &[u8],
+    ) -> Result<Vec<u8>, MediaError> {
         let image = turbojpeg::Image {
             pixels: rgb,
             width: width as usize,

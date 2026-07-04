@@ -68,7 +68,9 @@ fn keyframe_at_or_before(src: &Path, t: f64) -> Result<f64, MediaError> {
             pts.trim().parse::<f64>().ok()
         })
         .filter(|&pts| pts <= t + 0.001)
-        .fold(None::<f64>, |acc, pts| Some(acc.map_or(pts, |a| a.max(pts))));
+        .fold(None::<f64>, |acc, pts| {
+            Some(acc.map_or(pts, |a| a.max(pts)))
+        });
 
     Ok(best.unwrap_or(0.0))
 }

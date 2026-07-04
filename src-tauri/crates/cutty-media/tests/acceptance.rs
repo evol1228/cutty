@@ -183,7 +183,10 @@ fn phase0_acceptance() {
         player.seek(target);
         let f = recv_frame(&rx, Duration::from_secs(2)).expect("seek preview frame");
         let latency = t.elapsed();
-        println!("seek {label} → {target:5.1}s: {latency:8.1?} (pts {:.3})", f.pts);
+        println!(
+            "seek {label} → {target:5.1}s: {latency:8.1?} (pts {:.3})",
+            f.pts
+        );
         assert!(
             latency < Duration::from_millis(bound_ms),
             "{label} seek to {target}s took {latency:?} (≥{bound_ms}ms)"
@@ -207,17 +210,15 @@ fn phase0_acceptance() {
     // --- Frame stepping ---
     while rx.try_recv().is_ok() {}
     player.seek(10.0);
-    let mut last = recv_frame(&rx, Duration::from_secs(2)).expect("frame at 10s").pts;
+    let mut last = recv_frame(&rx, Duration::from_secs(2))
+        .expect("frame at 10s")
+        .pts;
     for dir in [1i64, 1, 1, -1, -1] {
         let t = Instant::now();
         player.step(dir);
         let f = recv_frame(&rx, Duration::from_secs(2)).expect("step frame");
         let delta = f.pts - last;
-        println!(
-            "step {dir:+}: Δ {:+.4}s in {:5.1?}",
-            delta,
-            t.elapsed()
-        );
+        println!("step {dir:+}: Δ {:+.4}s in {:5.1?}", delta, t.elapsed());
         assert!(
             (delta - dir as f64 * frame_dur).abs() < 0.005,
             "step {dir:+} moved {delta}s (expected {:.4})",

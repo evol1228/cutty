@@ -2,6 +2,7 @@
 
 import type { EngineSnapshot } from "../lib/engineIpc";
 import { engineGetState, onEngineState } from "../lib/engineIpc";
+import { useMediaStore } from "./mediaStore";
 import { useProjectStore } from "./projectStore";
 
 let started = false;
@@ -14,8 +15,12 @@ let started = false;
 export function startEngineSync(): void {
   if (started) return;
   started = true;
-  const apply = (s: EngineSnapshot) =>
+  const apply = (s: EngineSnapshot) => {
     useProjectStore.getState().applySnapshot(s);
+    // Reconcile pool items with the engine's media list (no-op unless the
+    // media set actually changed).
+    useMediaStore.getState().syncFromProject(s.project);
+  };
 
   void onEngineState(apply).catch((err: unknown) => {
     console.error("engine event subscription failed", err);

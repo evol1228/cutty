@@ -98,6 +98,11 @@ export function engineAddMedia(
   });
 }
 
+/** Remove a media file and every clip referencing it (one undo step). */
+export function engineRemoveMedia(mediaId: number): Promise<void> {
+  return invoke("engine_remove_media", { mediaId });
+}
+
 export function engineAddClip(
   trackId: number,
   mediaId: number,

@@ -450,7 +450,11 @@ mod tests {
         assert!(status.success(), "test clip generation failed");
 
         let info = probe(&file).unwrap();
-        assert!((info.duration_sec - 1.0).abs() < 0.3, "{}", info.duration_sec);
+        assert!(
+            (info.duration_sec - 1.0).abs() < 0.3,
+            "{}",
+            info.duration_sec
+        );
         let v = info.video.expect("video");
         assert_eq!((v.width, v.height), (320, 180));
         assert!((v.fps - 30.0).abs() < 0.5);

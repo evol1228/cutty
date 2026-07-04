@@ -25,9 +25,7 @@ use ringbuf::HeapRb;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{
-    FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType,
-};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
@@ -220,9 +218,7 @@ fn build_output_stream(
     clock: Arc<PlaybackClock>,
 ) -> Result<cpal::Stream, AudioError> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or(AudioError::NoDevice)?;
+    let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
 
     // cpal never resamples. The ALSA "default" plug layer (dmix or
     // pipewire-alsa on Arch) accepts any sane rate, so requesting the
@@ -330,8 +326,7 @@ fn run_decoder(
                 DecoderCmd::Stop => break 'outer,
                 DecoderCmd::Seek(secs) => {
                     // Presentation secs → track time (fold the priming in).
-                    let track_secs =
-                        secs + info.delay as f64 / f64::from(info.sample_rate);
+                    let track_secs = secs + info.delay as f64 / f64::from(info.sample_rate);
                     let Some(time) = Time::try_from_secs_f64(track_secs) else {
                         continue;
                     };

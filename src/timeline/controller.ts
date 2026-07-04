@@ -7,6 +7,7 @@
 
 import type { Clip, Track, TrimEdge } from "../lib/engineIpc";
 import {
+  engineAddClip,
   engineBeginTransaction,
   engineCommitTransaction,
   engineMoveClip,
@@ -15,7 +16,9 @@ import {
   engineSnapTime,
   engineTrimClip,
 } from "../lib/engineIpc";
+import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
+import { toast } from "../state/toastStore";
 import {
   deleteSelection,
   goToEnd,
@@ -27,6 +30,11 @@ import {
   undo,
 } from "./actions";
 import { requestDraw, setDrawCallback } from "./dirty";
+import {
+  setTimelineDropTarget,
+  type DragMedia,
+  type TimelineDropTarget,
+} from "./poolDrag";
 import { drawTimeline, type TimelineOverlay } from "./renderer";
 import {
   pxToDuration,
@@ -82,7 +90,7 @@ export function createTimelineController(
   const container: HTMLElement = maybeContainer;
   const ctx: CanvasRenderingContext2D = maybeCtx;
 
-  const overlay: TimelineOverlay = { snapLineSec: null };
+  const overlay: TimelineOverlay = { snapLineSec: null, dropPreview: null };
   let gesture: Gesture = { type: "idle" };
   let lastPointerX: number | null = null;
   let disposed = false;
@@ -201,6 +209,121 @@ export function createTimelineController(
     });
   }
 
+  // --- Pool-item drop target -------------------------------------------
+  //
+  // The media pool starts pointer drags (poolDrag.ts); this target turns
+  // them into a live drop preview and, on release, one AddClip command.
+  // Track choice is by media kind — video files land on the video track
+  // (carrying their own audio via clip volume), audio files on the audio
+  // track. Only the drop X matters.
+
+  function dropTrack(media: DragMedia): { track: Track; index: number } | null {
+    const project = useProjectStore.getState().project;
+    if (!project) return null;
+    const kind = media.hasVideo ? "video" : "audio";
+    const index = project.tracks.findIndex((t) => t.kind === kind);
+    if (index < 0) return null;
+    return { track: project.tracks[index], index };
+  }
+
+  /** Snap a prospective drop: both clip edges compete, like clip moves. */
+  async function snappedDropIn(
+    canvasX: number,
+    media: DragMedia,
+  ): Promise<{ inSec: number; snapPoint: number | null }> {
+    const desired = Math.max(0, xToTime(canvasX));
+    const { snapEnabled, playheadSec } = useProjectStore.getState();
+    if (!snapEnabled) return { inSec: desired, snapPoint: null };
+    const threshold = pxToDuration(SNAP_PX);
+    const [left, right] = await Promise.all([
+      engineSnapTime(desired, threshold, playheadSec, []),
+      engineSnapTime(desired + media.durationSec, threshold, playheadSec, []),
+    ]);
+    const candidates: Array<{ inSec: number; snapPoint: number; dist: number }> =
+      [];
+    if (left !== null) {
+      candidates.push({
+        inSec: left,
+        snapPoint: left,
+        dist: Math.abs(left - desired),
+      });
+    }
+    if (right !== null && right - media.durationSec >= 0) {
+      candidates.push({
+        inSec: right - media.durationSec,
+        snapPoint: right,
+        dist: Math.abs(right - (desired + media.durationSec)),
+      });
+    }
+    candidates.sort((a, b) => a.dist - b.dist);
+    const best = candidates[0];
+    return best
+      ? { inSec: Math.max(0, best.inSec), snapPoint: best.snapPoint }
+      : { inSec: desired, snapPoint: null };
+  }
+
+  function clearDropPreview(): void {
+    if (overlay.dropPreview !== null || overlay.snapLineSec !== null) {
+      overlay.dropPreview = null;
+      overlay.snapLineSec = null;
+      requestDraw();
+    }
+  }
+
+  const dropTarget: TimelineDropTarget = {
+    over: (clientX, clientY, media) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      if (x < 0 || y < 0 || x > rect.width || y > rect.height) {
+        clearDropPreview();
+        return;
+      }
+      const target = dropTrack(media);
+      if (!target) return;
+      coalesce(async () => {
+        const { inSec, snapPoint } = await snappedDropIn(x, media);
+        overlay.dropPreview = {
+          trackIndex: target.index,
+          inSec,
+          durSec: media.durationSec,
+        };
+        overlay.snapLineSec = snapPoint;
+        requestDraw();
+      });
+    },
+    drop: (clientX, clientY, media) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      const inside = x >= 0 && y >= 0 && x <= rect.width && y <= rect.height;
+      enqueue(async () => {
+        coalesced = null; // a stale preview update is superseded
+        clearDropPreview();
+        if (!inside) return;
+        const target = dropTrack(media);
+        if (!target) return;
+        const { inSec } = await snappedDropIn(x, media);
+        try {
+          const clipId = await engineAddClip(
+            target.track.id,
+            media.mediaId,
+            inSec,
+            0,
+            media.durationSec,
+          );
+          useProjectStore.getState().setSelection([clipId]);
+        } catch {
+          toast(
+            `No room for ${media.name} there — it would overlap another clip.`,
+            "error",
+          );
+        }
+      });
+    },
+    leave: clearDropPreview,
+  };
+
   // --- Hit testing -----------------------------------------------------
 
   function hitTest(x: number, y: number): Hit {
@@ -288,9 +411,22 @@ export function createTimelineController(
     lastPointerX = x;
 
     switch (gesture.type) {
-      case "idle":
-        canvas.style.cursor = cursorFor(hitTest(x, y));
+      case "idle": {
+        const hit = hitTest(x, y);
+        canvas.style.cursor = cursorFor(hit);
+        // Missing-media tooltip on hovered clips.
+        let title = "";
+        if (hit.region === "lane" && hit.clip) {
+          const mediaId = hit.clip.mediaId;
+          const media = useMediaStore.getState();
+          if (media.missingMediaIds.has(mediaId)) {
+            const item = media.items.find((i) => i.mediaId === mediaId);
+            title = `Missing media: ${item?.path ?? "source file not found"}`;
+          }
+        }
+        if (canvas.title !== title) canvas.title = title;
         return;
+      }
       case "pending": {
         const dx = x - gesture.startX;
         const dy = y - gesture.startY;
@@ -536,8 +672,11 @@ export function createTimelineController(
   armDprListener();
 
   // Any store change (engine snapshot, selection, playhead, zoom, snap
-  // toggle) marks the canvas dirty; nothing redraws while idle.
+  // toggle, thumbnails, missing-media flags) marks the canvas dirty;
+  // nothing redraws while idle.
   const unsubscribe = useProjectStore.subscribe(() => requestDraw());
+  const unsubscribeMedia = useMediaStore.subscribe(() => requestDraw());
+  setTimelineDropTarget(dropTarget);
 
   canvas.addEventListener("pointerdown", onPointerDown);
   canvas.addEventListener("pointermove", onPointerMove);
@@ -551,8 +690,10 @@ export function createTimelineController(
   return () => {
     disposed = true;
     setDrawCallback(null);
+    setTimelineDropTarget(null);
     resizeObserver.disconnect();
     unsubscribe();
+    unsubscribeMedia();
     canvas.removeEventListener("pointerdown", onPointerDown);
     canvas.removeEventListener("pointermove", onPointerMove);
     canvas.removeEventListener("pointerup", onPointerUp);

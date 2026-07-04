@@ -64,6 +64,32 @@ pub async fn generate_proxy(
     .map_err(|e| e.to_string())
 }
 
+/// Extract (or fetch from cache) the thumbnail for a media file and return
+/// the JPEG bytes directly (binary IPC, like frames — pixels never travel
+/// as JSON).
+#[tauri::command]
+pub async fn media_thumbnail(
+    path: String,
+    duration_hint: Option<f64>,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let thumb = cutty_media::generate_thumbnail(path.as_ref(), duration_hint)?;
+        std::fs::read(thumb).map_err(cutty_media::MediaError::from)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(tauri::ipc::Response::new)
+    .map_err(|e| e.to_string())
+}
+
+/// Which of the given source paths currently exist (missing-media checks).
+#[tauri::command]
+pub async fn paths_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || cutty_media::paths_exist(&paths))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Payload for `player://position` events.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

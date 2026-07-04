@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
 
+use crate::cache::{cache_dir, cache_entry_for};
 use crate::error::MediaError;
 use crate::tools::ensure_tools;
 
@@ -28,39 +29,12 @@ pub struct ProxyProgress {
 ///
 /// Returns `(final_path, exists)`.
 pub fn proxy_path_for(src: &Path) -> Result<(PathBuf, bool), MediaError> {
-    let meta = std::fs::metadata(src)?;
-    let mtime_nanos = meta
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file_name = proxy_cache_filename(&src.display().to_string(), meta.len(), mtime_nanos);
-    let path = proxy_cache_dir()?.join(file_name);
-    let exists = path.is_file();
-    Ok((path, exists))
+    cache_entry_for(src, "proxies", "mp4")
 }
 
 /// The proxy cache directory: `$XDG_CACHE_HOME/cutty/proxies`.
 pub fn proxy_cache_dir() -> Result<PathBuf, MediaError> {
-    let root = dirs::cache_dir().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "could not determine the XDG cache directory",
-        )
-    })?;
-    Ok(root.join("cutty").join("proxies"))
-}
-
-/// Deterministic cache file name for a source file's identity.
-///
-/// Keyed on path + size + mtime so a modified source invalidates its proxy.
-fn proxy_cache_filename(path: &str, size: u64, mtime_nanos: u128) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(path.as_bytes());
-    hasher.update(&size.to_le_bytes());
-    hasher.update(&mtime_nanos.to_le_bytes());
-    let hash = hasher.finalize().to_hex();
-    format!("{}.mp4", &hash.as_str()[..32])
+    cache_dir("proxies")
 }
 
 /// The ffmpeg argument list for encoding `src` into a 720p proxy at `dst`.
@@ -223,20 +197,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_filename_is_deterministic_and_keyed_on_identity() {
-        let a = proxy_cache_filename("/videos/a.mp4", 1000, 42);
-        let b = proxy_cache_filename("/videos/a.mp4", 1000, 42);
-        assert_eq!(a, b);
-        assert!(a.ends_with(".mp4"));
-        assert_eq!(a.len(), 32 + 4);
-
-        // Any identity component change yields a different proxy.
-        assert_ne!(a, proxy_cache_filename("/videos/b.mp4", 1000, 42));
-        assert_ne!(a, proxy_cache_filename("/videos/a.mp4", 1001, 42));
-        assert_ne!(a, proxy_cache_filename("/videos/a.mp4", 1000, 43));
-    }
-
-    #[test]
     fn proxy_args_shape() {
         let args = proxy_args(Path::new("/in.mp4"), Path::new("/out/proxy.mp4"));
         let joined = args.join(" ");
@@ -288,7 +248,12 @@ mod tests {
         // The proxy must fit 720p and stay decodable.
         let info = crate::probe(&proxy).unwrap();
         let v = info.video.expect("proxy has video");
-        assert!(v.width <= 1280 && v.height <= 720, "{}x{}", v.width, v.height);
+        assert!(
+            v.width <= 1280 && v.height <= 720,
+            "{}x{}",
+            v.width,
+            v.height
+        );
         assert_eq!(v.codec, "h264");
         assert!(info.audio.is_some(), "proxy keeps audio");
         assert!((info.duration_sec - 2.0).abs() < 0.3);

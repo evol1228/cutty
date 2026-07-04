@@ -727,3 +727,95 @@ fn loaded_project_continues_id_allocation_without_collision() {
         "new ids start above every persisted id"
     );
 }
+
+// ---------------------------------------------------------------------
+// RemoveMedia (pool item + all its clips, one undoable command)
+// ---------------------------------------------------------------------
+
+#[test]
+fn remove_media_removes_pool_entry_and_all_its_clips() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    let other = engine
+        .add_media("/tmp/other.mp4", MEDIA_DUR, true, true)
+        .expect("second media");
+    engine.add_clip(video, media, 0.0, 0.0, 2.0).expect("v1");
+    engine.add_clip(video, media, 5.0, 0.0, 2.0).expect("v2");
+    engine.add_clip(audio, media, 1.0, 0.0, 3.0).expect("a1");
+    let kept = engine.add_clip(video, other, 2.5, 0.0, 2.0).expect("kept");
+    let depth = engine.undo_depth();
+
+    engine.remove_media(media).expect("remove");
+
+    let project = engine.project();
+    assert!(project.media(media).is_none(), "pool entry gone");
+    assert!(project.media(other).is_some(), "other media kept");
+    let remaining: Vec<_> = project
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().map(|c| c.id))
+        .collect();
+    assert_eq!(remaining, vec![kept], "only the other media's clip is left");
+    assert_eq!(engine.undo_depth(), depth + 1, "exactly one undo entry");
+}
+
+#[test]
+fn remove_media_undo_redo_round_trips() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    engine.add_clip(video, media, 0.0, 0.0, 2.0).expect("v");
+    engine.add_clip(audio, media, 1.5, 2.0, 6.0).expect("a");
+    let before = serialized(&engine);
+
+    engine.remove_media(media).expect("remove");
+    let after = serialized(&engine);
+    assert_ne!(before, after);
+
+    assert!(engine.undo().expect("undo"));
+    assert_eq!(
+        serialized(&engine),
+        before,
+        "undo restores media and clips verbatim"
+    );
+
+    assert!(engine.redo().expect("redo"));
+    assert_eq!(serialized(&engine), after, "redo removes them again");
+}
+
+#[test]
+fn remove_media_without_clips_is_still_one_undoable_step() {
+    let Fixture {
+        mut engine, media, ..
+    } = engine_with_media();
+    engine.remove_media(media).expect("remove");
+    assert!(engine.project().media.is_empty());
+    assert!(engine.undo().expect("undo"));
+    assert!(engine.project().media(media).is_some(), "pool entry back");
+}
+
+#[test]
+fn remove_unknown_media_rejected_and_state_untouched() {
+    let Fixture {
+        mut engine, media, ..
+    } = engine_with_media();
+    let before = serialized(&engine);
+    let depth = engine.undo_depth();
+    engine.drain_events();
+
+    let err = engine
+        .remove_media(cutty_engine::MediaId(9999))
+        .unwrap_err();
+    assert!(matches!(err, EngineError::UnknownMedia(_)), "{err:?}");
+    assert_eq!(serialized(&engine), before);
+    assert_eq!(engine.undo_depth(), depth);
+    assert!(engine.drain_events().is_empty(), "failed op must not emit");
+    assert!(engine.project().media(media).is_some());
+}

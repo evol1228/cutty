@@ -14,6 +14,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::probe_media,
             commands::generate_proxy,
+            commands::media_thumbnail,
+            commands::paths_exist,
             commands::open_player,
             commands::close_player,
             commands::player_toggle,
@@ -24,6 +26,7 @@ pub fn run() {
             commands::export_trim,
             engine_ipc::engine_get_state,
             engine_ipc::engine_add_media,
+            engine_ipc::engine_remove_media,
             engine_ipc::engine_add_clip,
             engine_ipc::engine_move_clip,
             engine_ipc::engine_trim_clip,

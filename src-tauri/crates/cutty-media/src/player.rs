@@ -212,7 +212,11 @@ impl FreewheelClock {
     }
 
     fn is_playing(&self) -> bool {
-        self.state.lock().expect("freewheel poisoned").started.is_some()
+        self.state
+            .lock()
+            .expect("freewheel poisoned")
+            .started
+            .is_some()
     }
 }
 
@@ -406,9 +410,7 @@ impl Engine {
         if let Some(t) = &self.takeover {
             // Hand control back only on real forward progress past the
             // engage point (oscillation must not count as revival).
-            if !self.backend.audio_ended()
-                && backend_pos > t.backend_pos_at_engage + 0.05
-            {
+            if !self.backend.audio_ended() && backend_pos > t.backend_pos_at_engage + 0.05 {
                 self.takeover = None;
                 self.last_clock = (backend_pos, Instant::now());
                 return backend_pos;
