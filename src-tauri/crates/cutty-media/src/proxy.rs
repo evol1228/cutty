@@ -129,7 +129,14 @@ pub fn generate_proxy(
     }
 
     std::fs::create_dir_all(proxy_cache_dir()?)?;
-    let part_path = final_path.with_extension("part.mp4");
+    // Unique per invocation: concurrent generations for the same source
+    // must not scribble on each other's partial file (last rename wins).
+    static PART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let part_path = final_path.with_extension(format!(
+        "part-{}-{}.mp4",
+        std::process::id(),
+        PART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
 
     let mut child = FfmpegCommand::new()
         .args(proxy_args(src, &part_path).iter().map(String::as_str))

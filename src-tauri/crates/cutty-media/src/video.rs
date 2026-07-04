@@ -69,7 +69,11 @@ impl VideoDecoder {
                 FfmpegEvent::Log(LogLevel::Error | LogLevel::Fatal, msg) => {
                     eprintln!("cutty-media: video decode: {msg}");
                 }
-                FfmpegEvent::Done | FfmpegEvent::LogEOF => return None,
+                // NOTE: LogEOF (stderr closed) must NOT end the stream —
+                // the stdout frame reader can still be flushing the final
+                // frames. Done is sent by the stdout thread after the last
+                // frame; the iterator itself ends once all senders drop.
+                FfmpegEvent::Done => return None,
                 _ => {}
             }
         }

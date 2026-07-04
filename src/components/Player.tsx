@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   PLAYER_EOF_EVENT,
@@ -80,19 +80,29 @@ function Player() {
     };
   }, []);
 
-  // Keyboard transport: Space toggle, ←/→ frame step.
+  // Keyboard transport: Space toggle, ←/→ frame step. Steps are gated on
+  // the previous invoke resolving — OS key auto-repeat (~30 Hz) must not
+  // queue up ~110 ms cold-decode restarts faster than they complete.
+  const stepInFlight = useRef(false);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!usePlayerStore.getState().playerInfo) return;
+      // Don't hijack keys meant for a focused control (buttons activate
+      // on Space; inputs need their arrows).
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("button, input, select, textarea, [contenteditable]")) {
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         if (!e.repeat) void playerToggle();
-      } else if (e.code === "ArrowLeft") {
+      } else if (e.code === "ArrowLeft" || e.code === "ArrowRight") {
         e.preventDefault();
-        void playerStep(-1);
-      } else if (e.code === "ArrowRight") {
-        e.preventDefault();
-        void playerStep(1);
+        if (stepInFlight.current) return;
+        stepInFlight.current = true;
+        playerStep(e.code === "ArrowLeft" ? -1 : 1).finally(() => {
+          stepInFlight.current = false;
+        });
       }
     };
     window.addEventListener("keydown", onKey);
@@ -100,10 +110,13 @@ function Player() {
   }, []);
 
   // Slider seeks, throttled so scrubbing doesn't spam decoder restarts.
+  // While dragging, the slider shows the pointer value — in-flight frame
+  // messages must not yank it back to the old position.
+  const [scrubValue, setScrubValue] = useState<number | null>(null);
   const lastSeek = useRef(0);
   const pendingSeek = useRef<number | null>(null);
   function onScrub(value: number) {
-    usePlayerStore.getState().setPosition(value);
+    setScrubValue(value);
     const now = performance.now();
     if (now - lastSeek.current >= SEEK_THROTTLE_MS) {
       lastSeek.current = now;
@@ -120,6 +133,9 @@ function Player() {
     } else {
       pendingSeek.current = value;
     }
+  }
+  function endScrub() {
+    setScrubValue(null);
   }
 
   const fps = playerInfo?.fps ?? 30;
@@ -170,8 +186,10 @@ function Player() {
           min={0}
           max={duration}
           step={1 / fps}
-          value={positionSec}
+          value={scrubValue ?? positionSec}
           onChange={(e) => onScrub(Number(e.target.value))}
+          onPointerUp={endScrub}
+          onBlur={endScrub}
           className="min-w-0 flex-1 accent-sky-500"
         />
         <span className="font-mono text-zinc-600">

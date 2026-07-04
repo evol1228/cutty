@@ -37,6 +37,10 @@ pub enum MediaError {
         message: String,
     },
 
+    /// JPEG (turbojpeg) encoding failed.
+    #[error("JPEG encoding failed: {0}")]
+    Jpeg(String),
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -100,9 +100,12 @@ impl AudioPlayer {
             std::thread::Builder::new()
                 .name("cutty-audio-decoder".into())
                 .spawn(move || {
-                    if let Err(e) = run_decoder(format, info, producer, clock, cmd_rx) {
+                    if let Err(e) = run_decoder(format, info, producer, clock.clone(), cmd_rx) {
                         eprintln!("cutty-audio: decoder thread exited with error: {e}");
                     }
+                    // However the decoder exits, this clock is done
+                    // advancing — let the video side fall back.
+                    clock.set_ended(true);
                 })?
         };
 
@@ -137,6 +140,12 @@ impl AudioPlayer {
 
     pub fn position_secs(&self) -> f64 {
         self.clock.position_secs()
+    }
+
+    /// True when the audio stream is exhausted (or the decoder died) and
+    /// this clock will not advance until the next seek.
+    pub fn is_ended(&self) -> bool {
+        self.clock.is_ended()
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -245,18 +254,20 @@ fn build_output_stream(
             }
 
             // 2) Feed the device. Paused ⇒ silence without consuming.
+            let mut media_frames = 0u64;
             if cb_clock.is_playing() {
                 let n = consumer.pop_slice(data);
                 data[n..].fill(0.0);
-                cb_clock.advance((n / channels) as u64);
+                media_frames = (n / channels) as u64;
+                cb_clock.advance(media_frames);
             } else {
                 data.fill(0.0);
             }
 
-            // 3) Refresh the latency measurement every callback.
+            // 3) Refresh the latency/buffer measurement every callback.
             let ts = info.timestamp();
             let latency = ts.playback.duration_since(ts.callback);
-            cb_clock.record_callback(latency.as_nanos() as u64);
+            cb_clock.record_callback(latency.as_nanos() as u64, media_frames);
         },
         move |err: cpal::Error| {
             // Xrun = underrun; ALSA recovers automatically. Anything else
@@ -339,8 +350,26 @@ fn run_decoder(
                                 ts_to_frames(seeked.actual_ts, info.time_base, info.sample_rate);
                             discard_frames = req.saturating_sub(act);
                             at_eof = false;
+                            clock.set_ended(false);
                             // Presentation base = required track frames − priming.
                             clock.request_rebase(req.saturating_sub(info.delay));
+                            // Do NOT decode/push until the callback drains
+                            // the ring and applies the rebase — anything
+                            // pushed before that would be drained with the
+                            // stale audio, leaving a persistent A/V offset.
+                            // Bounded so a dead stream can't wedge us.
+                            let gate_deadline =
+                                std::time::Instant::now() + Duration::from_millis(250);
+                            while clock.rebase_pending()
+                                && std::time::Instant::now() < gate_deadline
+                            {
+                                if let Ok(cmd) = commands.try_recv() {
+                                    // A newer seek/stop supersedes this one.
+                                    pending_cmd = Some(cmd);
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
                         }
                         Err(e) => eprintln!("cutty-audio: seek failed: {e}"),
                     }
@@ -358,9 +387,14 @@ fn run_decoder(
             Ok(Some(p)) => p,
             Ok(None) => {
                 at_eof = true;
+                // Let the video side know this clock will stall here.
+                clock.set_ended(true);
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                clock.set_ended(true);
+                return Err(e);
+            }
         };
         if packet.track_id != info.track_id {
             continue;

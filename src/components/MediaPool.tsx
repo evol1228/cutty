@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
+  closePlayer,
   generateProxy,
   openPlayer,
   probeMedia,
@@ -32,7 +33,11 @@ function ProbeTester() {
 
   useEffect(() => {
     const unlisten = listen<ProxyProgressEvent>(PROXY_PROGRESS_EVENT, (e) => {
-      usePlayerStore.getState().setProxyProgress(e.payload.percent);
+      // Progress for some other (stale/concurrent) source must not move
+      // this file's bar.
+      const state = usePlayerStore.getState();
+      if (e.payload.srcPath !== state.media?.path) return;
+      state.setProxyProgress(e.payload.percent);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -48,6 +53,9 @@ function ProbeTester() {
     setBusy(true);
     setError(null);
     try {
+      // Tear down any running player first — otherwise its audio keeps
+      // playing with every control gone from the UI.
+      await closePlayer().catch(() => {});
       setMedia(await probeMedia(path));
     } catch (e) {
       setMedia(null);
@@ -59,11 +67,17 @@ function ProbeTester() {
 
   async function makeProxy() {
     if (!info) return;
+    const forPath = info.path;
     setError(null);
     setProxyProgress(0);
     try {
-      setProxyPath(await generateProxy(info.path, info.durationSec));
+      const proxyPath = await generateProxy(info.path, info.durationSec);
+      // The user may have switched files while this encoded — don't
+      // attach file A's proxy to file B.
+      if (usePlayerStore.getState().media?.path !== forPath) return;
+      setProxyPath(proxyPath);
     } catch (e) {
+      if (usePlayerStore.getState().media?.path !== forPath) return;
       setProxyProgress(null);
       setError(String(e));
     }
@@ -104,7 +118,12 @@ function ProbeTester() {
             <>
               <Row
                 k="Video"
-                v={`${info.video.codec} ${info.video.width}×${info.video.height}`}
+                v={
+                  `${info.video.codec} ${info.video.width}×${info.video.height}` +
+                  (info.video.rotation !== 0
+                    ? ` (rotated ${info.video.rotation}°)`
+                    : "")
+                }
               />
               <Row k="FPS" v={info.video.fps.toFixed(3)} />
             </>

@@ -8,6 +8,8 @@ export interface VideoStreamInfo {
   width: number;
   height: number;
   fps: number;
+  /** Display-matrix rotation in degrees; 0 when absent. */
+  rotation: number;
 }
 
 export interface AudioStreamInfo {

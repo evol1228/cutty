@@ -34,11 +34,17 @@ pub struct MediaInfo {
 #[serde(rename_all = "camelCase")]
 pub struct VideoStreamInfo {
     pub codec: String,
+    /// Stored dimensions. When `rotation` is ±90/±270 the *display*
+    /// dimensions are swapped (ffmpeg applies the rotation when
+    /// transcoding, so proxies come out already rotated).
     pub width: u32,
     pub height: u32,
     /// Average frame rate. Falls back to `r_frame_rate` when the average is
     /// unknown (e.g. some fragmented MP4s).
     pub fps: f64,
+    /// Display-matrix rotation in degrees (0 when absent) — phone footage
+    /// is commonly stored landscape with a ±90 rotation tag.
+    pub rotation: i32,
 }
 
 /// Properties of an audio stream.
@@ -118,6 +124,24 @@ struct RawStream {
     sample_rate: Option<String>,
     channels: Option<u32>,
     duration: Option<String>,
+    #[serde(default)]
+    disposition: RawDisposition,
+    #[serde(default)]
+    side_data_list: Vec<RawSideData>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDisposition {
+    /// 1 for cover-art streams (MP3/M4A album art) — decodable as video
+    /// but not *the* video stream.
+    #[serde(default)]
+    attached_pic: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSideData {
+    /// Present for Display Matrix entries; degrees, often negative.
+    rotation: Option<f64>,
 }
 
 /// Parse ffprobe `-print_format json` output into a [`MediaInfo`].
@@ -133,8 +157,13 @@ fn parse_probe_output(json: &str, path: &Path) -> Result<MediaInfo, MediaError> 
     let mut stream_duration: f64 = 0.0;
 
     for s in &raw.streams {
-        let kind = s.codec_type.clone().unwrap_or_else(|| "unknown".into());
+        let mut kind = s.codec_type.clone().unwrap_or_else(|| "unknown".into());
         let codec = s.codec_name.clone().unwrap_or_else(|| "unknown".into());
+        // Cover art (MP3/M4A album art) probes as a video stream but must
+        // never be selected as one.
+        if kind == "video" && s.disposition.attached_pic != 0 {
+            kind = "attached_pic".into();
+        }
         streams.push(StreamSummary {
             index: s.index,
             kind: kind.clone(),
@@ -152,12 +181,19 @@ fn parse_probe_output(json: &str, path: &Path) -> Result<MediaInfo, MediaError> 
                     .as_deref()
                     .and_then(parse_rate)
                     .or_else(|| s.r_frame_rate.as_deref().and_then(parse_rate));
+                let rotation = s
+                    .side_data_list
+                    .iter()
+                    .find_map(|d| d.rotation)
+                    .map(|r| r.round() as i32)
+                    .unwrap_or(0);
                 if let (Some(width), Some(height), Some(fps)) = (s.width, s.height, fps) {
                     video = Some(VideoStreamInfo {
                         codec,
                         width,
                         height,
                         fps,
+                        rotation,
                     });
                 }
             }
@@ -311,6 +347,62 @@ mod tests {
         let info = parse_probe_output(json, Path::new("song.mp3")).unwrap();
         assert!(info.video.is_none());
         assert_eq!(info.audio.unwrap().sample_rate, 44100);
+    }
+
+    #[test]
+    fn cover_art_is_not_the_video_stream() {
+        // An MP3 with embedded album art: ffprobe reports the art as a
+        // video stream with attached_pic disposition.
+        let json = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "mp3",
+                    "codec_type": "audio",
+                    "sample_rate": "44100",
+                    "channels": 2
+                },
+                {
+                    "index": 1,
+                    "codec_name": "mjpeg",
+                    "codec_type": "video",
+                    "width": 600,
+                    "height": 600,
+                    "r_frame_rate": "90000/1",
+                    "avg_frame_rate": "0/0",
+                    "disposition": { "attached_pic": 1 }
+                }
+            ],
+            "format": { "format_name": "mp3", "duration": "180.0" }
+        }"#;
+        let info = parse_probe_output(json, Path::new("song.mp3")).unwrap();
+        assert!(info.video.is_none(), "cover art must not become video");
+        assert!(info.audio.is_some());
+        assert_eq!(info.streams[1].kind, "attached_pic");
+    }
+
+    #[test]
+    fn display_matrix_rotation_is_reported() {
+        let json = r#"{
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_name": "h264",
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "avg_frame_rate": "30/1",
+                    "side_data_list": [
+                        { "side_data_type": "Display Matrix", "rotation": -90 }
+                    ]
+                }
+            ],
+            "format": { "format_name": "mp4", "duration": "10.0" }
+        }"#;
+        let info = parse_probe_output(json, Path::new("phone.mp4")).unwrap();
+        let v = info.video.unwrap();
+        assert_eq!(v.rotation, -90);
+        assert_eq!((v.width, v.height), (1920, 1080));
     }
 
     #[test]

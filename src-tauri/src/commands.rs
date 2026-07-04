@@ -95,8 +95,11 @@ pub async fn open_player(
 ) -> Result<PlayerInfo, String> {
     let state_player = state.player.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // One guard across replace-and-create: concurrent open_player
+        // calls serialize here instead of both installing a live player.
+        let mut guard = state_player.lock().expect("player state poisoned");
         // Drop any existing player first (joins its threads).
-        state_player.lock().expect("player state poisoned").take();
+        guard.take();
 
         let sink = Box::new(move |event: PlayerEvent| match event {
             PlayerEvent::Frame {
@@ -132,7 +135,7 @@ pub async fn open_player(
 
         let player = Player::open(path.as_ref(), sink).map_err(|e| e.to_string())?;
         let info = player.info().clone();
-        *state_player.lock().expect("player state poisoned") = Some(player);
+        *guard = Some(player);
         Ok(info)
     })
     .await

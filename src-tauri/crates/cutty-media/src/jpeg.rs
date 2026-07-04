@@ -36,10 +36,7 @@ impl JpegEncoder {
 }
 
 fn jpeg_err(e: turbojpeg::Error) -> MediaError {
-    MediaError::FfmpegFailed {
-        context: Some("JPEG encode".into()),
-        message: e.to_string(),
-    }
+    MediaError::Jpeg(e.to_string())
 }
 
 #[cfg(test)]
