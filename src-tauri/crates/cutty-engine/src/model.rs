@@ -1,0 +1,374 @@
+//! Project data model: media references, tracks, clips, and the invariants
+//! that hold across every mutation.
+//!
+//! All times are **seconds** as `f64`, matching the probe/proxy layer in
+//! `cutty-media`. Frame quantization is a presentation concern, not a model
+//! concern.
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::EngineError;
+
+/// Comparison tolerance for timeline math. Touching clip edges (`a.out ==
+/// b.in`) must not read as an overlap after f64 arithmetic.
+pub const EPS: f64 = 1e-9;
+
+/// Minimum clip duration in seconds. Trims and splits clamp/reject against
+/// this so no operation can produce a (near-)zero-length clip.
+pub const MIN_CLIP_DURATION: f64 = 1e-3;
+
+macro_rules! id_type {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(pub u64);
+    };
+}
+
+id_type!(
+    /// Identifier of an imported media file.
+    MediaId
+);
+id_type!(
+    /// Identifier of a track.
+    TrackId
+);
+id_type!(
+    /// Identifier of a clip.
+    ClipId
+);
+
+/// Project-level render settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSettings {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+        }
+    }
+}
+
+/// A media file registered in the project's media pool.
+///
+/// Only what the timeline model needs: duration for source-range clamping
+/// and stream presence for track-kind compatibility. Probe details
+/// (resolution, codecs) stay in `cutty-media`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaRef {
+    pub id: MediaId,
+    /// Absolute path of the original file.
+    pub path: String,
+    /// Duration in seconds.
+    pub duration: f64,
+    pub has_video: bool,
+    pub has_audio: bool,
+}
+
+/// Kind of a track. Phase 1 is exactly one `Video` + one `Audio` track;
+/// `Text` tracks arrive in Phase 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackKind {
+    Video,
+    Audio,
+}
+
+/// 2D placement of a clip in the frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    pub x: f64,
+    pub y: f64,
+    pub scale: f64,
+    pub rotation: f64,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            scale: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+/// A clip: a window into a media file, placed on the timeline.
+///
+/// Invariants (enforced by [`Project::validate`]):
+/// - `timeline_in < timeline_out`, both finite and `>= 0`
+/// - `0 <= source_in < source_out <= media.duration`
+/// - `(timeline_out - timeline_in) * speed == source_out - source_in`
+///   (within [`EPS`]) — `speed` is modeled but fixed at `1.0` in Phase 1
+/// - no overlap with other clips on the same track (touching edges are fine)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    pub id: ClipId,
+    pub media_id: MediaId,
+    /// Start position on the timeline, seconds (inclusive).
+    pub timeline_in: f64,
+    /// End position on the timeline, seconds (exclusive).
+    pub timeline_out: f64,
+    /// Start of the used range within the media, seconds.
+    pub source_in: f64,
+    /// End of the used range within the media, seconds.
+    pub source_out: f64,
+    pub transform: Transform,
+    /// 0.0..=1.0
+    pub opacity: f64,
+    /// Playback rate. Modeled now, fixed at 1.0 until Phase 3.
+    pub speed: f64,
+    /// Linear gain, `>= 0.0` (1.0 = unity).
+    pub volume: f64,
+}
+
+impl Clip {
+    /// Timeline duration in seconds.
+    pub fn duration(&self) -> f64 {
+        self.timeline_out - self.timeline_in
+    }
+}
+
+/// A horizontal lane of non-overlapping clips, kept sorted by
+/// `timeline_in`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub id: TrackId,
+    pub kind: TrackKind,
+    pub name: String,
+    pub locked: bool,
+    /// For audio tracks: silenced. For video tracks: hidden.
+    pub muted: bool,
+    pub clips: Vec<Clip>,
+}
+
+impl Track {
+    /// Look up a clip by id.
+    pub fn clip(&self, id: ClipId) -> Option<&Clip> {
+        self.clips.iter().find(|c| c.id == id)
+    }
+
+    pub(crate) fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
+        self.clips.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Restore the sorted-by-`timeline_in` ordering after a mutation.
+    pub(crate) fn sort_clips(&mut self) {
+        self.clips
+            .sort_by(|a, b| a.timeline_in.total_cmp(&b.timeline_in));
+    }
+}
+
+/// The whole editable state of a Cutty project. Owned exclusively by the
+/// Rust engine; the frontend only ever sees serialized snapshots of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub settings: ProjectSettings,
+    pub media: Vec<MediaRef>,
+    pub tracks: Vec<Track>,
+}
+
+impl Project {
+    /// An empty project with the Phase 1 track layout: one video track and
+    /// one audio track. The caller supplies the track ids so that all id
+    /// allocation stays in one place (the engine).
+    pub fn new(settings: ProjectSettings, video_track: TrackId, audio_track: TrackId) -> Self {
+        Self {
+            settings,
+            media: Vec::new(),
+            tracks: vec![
+                Track {
+                    id: video_track,
+                    kind: TrackKind::Video,
+                    name: "V1".to_string(),
+                    locked: false,
+                    muted: false,
+                    clips: Vec::new(),
+                },
+                Track {
+                    id: audio_track,
+                    kind: TrackKind::Audio,
+                    name: "A1".to_string(),
+                    locked: false,
+                    muted: false,
+                    clips: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    /// Look up a media reference by id.
+    pub fn media(&self, id: MediaId) -> Option<&MediaRef> {
+        self.media.iter().find(|m| m.id == id)
+    }
+
+    /// Look up a track by id.
+    pub fn track(&self, id: TrackId) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.id == id)
+    }
+
+    pub(crate) fn track_mut(&mut self, id: TrackId) -> Option<&mut Track> {
+        self.tracks.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Find the track holding a clip, together with the clip.
+    pub fn find_clip(&self, id: ClipId) -> Option<(&Track, &Clip)> {
+        self.tracks.iter().find_map(|t| t.clip(id).map(|c| (t, c)))
+    }
+
+    /// The largest id used anywhere in the project. Used to seed the
+    /// engine's id counter when loading a saved project.
+    pub fn max_id(&self) -> u64 {
+        let media = self.media.iter().map(|m| m.id.0);
+        let tracks = self.tracks.iter().map(|t| t.id.0);
+        let clips = self
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.id.0));
+        media.chain(tracks).chain(clips).max().unwrap_or(0)
+    }
+
+    /// Check every model invariant. Called by the engine after each command
+    /// application; a violation aborts the command and leaves the previous
+    /// state in place.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        self.validate_unique_ids()?;
+        for track in &self.tracks {
+            for clip in &track.clips {
+                self.validate_clip(track, clip)?;
+            }
+            // Clips are sorted, so overlap is a neighbor-only check.
+            for pair in track.clips.windows(2) {
+                if pair[1].timeline_in < pair[0].timeline_out - EPS {
+                    return Err(EngineError::ClipOverlap {
+                        track: track.id,
+                        a: pair[0].id,
+                        b: pair[1].id,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_clip(&self, track: &Track, clip: &Clip) -> Result<(), EngineError> {
+        let times = [
+            clip.timeline_in,
+            clip.timeline_out,
+            clip.source_in,
+            clip.source_out,
+        ];
+        if times.iter().any(|t| !t.is_finite())
+            || clip.timeline_in < 0.0
+            || clip.timeline_out <= clip.timeline_in
+        {
+            return Err(EngineError::InvalidTimeRange {
+                clip: clip.id,
+                timeline_in: clip.timeline_in,
+                timeline_out: clip.timeline_out,
+            });
+        }
+
+        let media = self
+            .media(clip.media_id)
+            .ok_or(EngineError::UnknownMedia(clip.media_id))?;
+        let compatible = match track.kind {
+            TrackKind::Video => media.has_video,
+            TrackKind::Audio => media.has_audio,
+        };
+        if !compatible {
+            return Err(EngineError::IncompatibleMedia {
+                track: track.id,
+                media: media.id,
+            });
+        }
+        if clip.source_in < -EPS
+            || clip.source_out <= clip.source_in
+            || clip.source_out > media.duration + EPS
+        {
+            return Err(EngineError::SourceOutOfBounds {
+                clip: clip.id,
+                source_in: clip.source_in,
+                source_out: clip.source_out,
+                media_duration: media.duration,
+            });
+        }
+
+        if !clip.speed.is_finite() || clip.speed <= 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip.id,
+                property: "speed",
+                value: clip.speed,
+            });
+        }
+        let timeline_span = clip.duration();
+        let source_span = clip.source_out - clip.source_in;
+        // Tolerance scales with span so long clips don't trip on f64 noise.
+        let tolerance = EPS * timeline_span.max(1.0);
+        if (timeline_span * clip.speed - source_span).abs() > tolerance {
+            return Err(EngineError::SpeedMismatch {
+                clip: clip.id,
+                timeline_span,
+                source_span,
+                speed: clip.speed,
+            });
+        }
+
+        if !clip.opacity.is_finite() || !(0.0..=1.0).contains(&clip.opacity) {
+            return Err(EngineError::InvalidProperty {
+                clip: clip.id,
+                property: "opacity",
+                value: clip.opacity,
+            });
+        }
+        if !clip.volume.is_finite() || clip.volume < 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip.id,
+                property: "volume",
+                value: clip.volume,
+            });
+        }
+        let t = &clip.transform;
+        for (property, value) in [
+            ("transform.x", t.x),
+            ("transform.y", t.y),
+            ("transform.scale", t.scale),
+            ("transform.rotation", t.rotation),
+        ] {
+            if !value.is_finite() {
+                return Err(EngineError::InvalidProperty {
+                    clip: clip.id,
+                    property,
+                    value,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_unique_ids(&self) -> Result<(), EngineError> {
+        let mut seen = std::collections::HashSet::new();
+        let media = self.media.iter().map(|m| m.id.0);
+        let tracks = self.tracks.iter().map(|t| t.id.0);
+        let clips = self
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.id.0));
+        for id in media.chain(tracks).chain(clips) {
+            if !seen.insert(id) {
+                return Err(EngineError::DuplicateId(id));
+            }
+        }
+        Ok(())
+    }
+}
