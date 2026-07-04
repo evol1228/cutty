@@ -4,6 +4,9 @@
 //! via the current zoom, gathers candidates (clip edges + playhead), and
 //! calls [`snap`]. The engine performs no pixel math.
 
+use serde::Serialize;
+
+use crate::error::EngineError;
 use crate::model::{ClipId, Project};
 
 /// Snap `t` to the nearest candidate within `threshold` seconds.
@@ -31,6 +34,72 @@ pub fn snap(t: f64, candidates: &[f64], threshold: f64) -> Option<f64> {
         }
     }
     best
+}
+
+/// Snap a single time against the standard project candidates (clip edges
+/// plus the optional playhead), excluding the clips in `exclude`. Returns
+/// `None` when nothing is within `threshold` seconds.
+///
+/// This is the one-shot form of [`snap_candidates`] + [`snap`] used by
+/// trim gestures and playhead scrubbing.
+pub fn snap_time(
+    project: &Project,
+    t: f64,
+    threshold: f64,
+    playhead: Option<f64>,
+    exclude: &[ClipId],
+) -> Option<f64> {
+    snap(t, &snap_candidates(project, playhead, exclude), threshold)
+}
+
+/// Result of snapping a clip-move gesture: the `timeline_in` to request
+/// from `MoveClip`, and the candidate time that matched (where the UI
+/// draws its snap indicator), if any.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnappedMove {
+    pub timeline_in: f64,
+    pub snap_point: Option<f64>,
+}
+
+/// Snap a clip-move gesture: both the clip's would-be start *and* end edge
+/// compete for the nearest candidate (the dragged clip's own edges are
+/// excluded), and the closer match wins. Returns the resulting
+/// `timeline_in` (unchanged if nothing is within `threshold`) plus the
+/// matched candidate for the UI's indicator line.
+pub fn snap_clip_move(
+    project: &Project,
+    clip_id: ClipId,
+    desired_in: f64,
+    threshold: f64,
+    playhead: Option<f64>,
+) -> Result<SnappedMove, EngineError> {
+    let (_, clip) = project
+        .find_clip(clip_id)
+        .ok_or(EngineError::UnknownClip(clip_id))?;
+    let duration = clip.duration();
+    let desired_out = desired_in + duration;
+    let candidates = snap_candidates(project, playhead, &[clip_id]);
+
+    let start = snap(desired_in, &candidates, threshold);
+    let end = snap(desired_out, &candidates, threshold);
+    let (timeline_in, snap_point) = match (start, end) {
+        (Some(s), Some(e)) => {
+            // Ties go to the start edge, matching snap()'s determinism.
+            if (s - desired_in).abs() <= (e - desired_out).abs() {
+                (s, Some(s))
+            } else {
+                (e - duration, Some(e))
+            }
+        }
+        (Some(s), None) => (s, Some(s)),
+        (None, Some(e)) => (e - duration, Some(e)),
+        (None, None) => (desired_in, None),
+    };
+    Ok(SnappedMove {
+        timeline_in,
+        snap_point,
+    })
 }
 
 /// Collect the standard snap candidates from a project: every clip edge on

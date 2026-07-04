@@ -3,7 +3,9 @@
 mod common;
 
 use common::{engine_with_media, Fixture};
-use cutty_engine::{resolve, snap, snap_candidates, TrackKind};
+use cutty_engine::{
+    resolve, snap, snap_candidates, snap_clip_move, snap_time, ClipId, EngineError, TrackKind,
+};
 
 // ---------------------------------------------------------------------
 // Resolver
@@ -178,4 +180,82 @@ fn snap_candidates_collects_edges_and_playhead_excluding_dragged_clip() {
     // Video other: 4, 8 · audio: 4, 7 · playhead: 9.5 — sorted, deduped,
     // and none of the dragged clip's own edges.
     assert_eq!(candidates, vec![4.0, 7.0, 8.0, 9.5]);
+}
+
+#[test]
+fn snap_time_composes_candidates_and_snap() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        ..
+    } = engine_with_media();
+    let clip = engine.add_clip(video, media, 4.0, 0.0, 2.0).expect("add");
+
+    // Near the clip's start edge.
+    assert_eq!(snap_time(engine.project(), 3.9, 0.2, None, &[]), Some(4.0));
+    // Playhead is a candidate too.
+    assert_eq!(
+        snap_time(engine.project(), 1.05, 0.2, Some(1.0), &[]),
+        Some(1.0)
+    );
+    // Excluding the clip removes its edges.
+    assert_eq!(snap_time(engine.project(), 3.9, 0.2, None, &[clip]), None);
+    // Out of range.
+    assert_eq!(snap_time(engine.project(), 2.0, 0.2, None, &[]), None);
+}
+
+#[test]
+fn snap_clip_move_snaps_the_nearer_edge() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    // Dragged: 2s long. Anchor clip on the audio track at [5, 8).
+    let dragged = engine.add_clip(video, media, 0.0, 0.0, 2.0).expect("drag");
+    engine.add_clip(audio, media, 5.0, 0.0, 3.0).expect("anchor");
+
+    // Start edge near 5.0 → snaps start to 5.0.
+    let m = snap_clip_move(engine.project(), dragged, 4.92, 0.2, None).expect("snap");
+    assert_eq!(m.timeline_in, 5.0);
+    assert_eq!(m.snap_point, Some(5.0));
+
+    // End edge near 5.0 (start would be 2.95, end 4.95) → end snaps to
+    // 5.0, so the clip lands at 3.0.
+    let m = snap_clip_move(engine.project(), dragged, 2.95, 0.2, None).expect("snap");
+    assert_eq!(m.timeline_in, 3.0);
+    assert_eq!(m.snap_point, Some(5.0));
+
+    // Both edges in range of different candidates (start near 5.0, end
+    // near 8.0): 5.95 → start dist 0.95 vs end dist 0.05 — end wins.
+    let m = snap_clip_move(engine.project(), dragged, 5.95, 1.0, None).expect("snap");
+    assert_eq!(m.timeline_in, 6.0);
+    assert_eq!(m.snap_point, Some(8.0));
+
+    // Nothing in range: position passes through untouched.
+    let m = snap_clip_move(engine.project(), dragged, 20.0, 0.2, None).expect("snap");
+    assert_eq!(m.timeline_in, 20.0);
+    assert_eq!(m.snap_point, None);
+}
+
+#[test]
+fn snap_clip_move_ignores_own_edges_and_rejects_unknown_clips() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        ..
+    } = engine_with_media();
+    let only = engine.add_clip(video, media, 3.0, 0.0, 2.0).expect("add");
+
+    // The only candidates would be the dragged clip's own edges — excluded.
+    let m = snap_clip_move(engine.project(), only, 3.05, 0.2, None).expect("snap");
+    assert_eq!(m.snap_point, None, "must not snap to itself");
+
+    assert_eq!(
+        snap_clip_move(engine.project(), ClipId(999), 0.0, 0.2, None),
+        Err(EngineError::UnknownClip(ClipId(999)))
+    );
 }

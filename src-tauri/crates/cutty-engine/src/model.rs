@@ -65,6 +65,7 @@ impl Default for ProjectSettings {
 /// and stream presence for track-kind compatibility. Probe details
 /// (resolution, codecs) stay in `cutty-media`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaRef {
     pub id: MediaId,
     /// Absolute path of the original file.
@@ -78,6 +79,7 @@ pub struct MediaRef {
 /// Kind of a track. Phase 1 is exactly one `Video` + one `Audio` track;
 /// `Text` tracks arrive in Phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TrackKind {
     Video,
     Audio,
@@ -112,6 +114,7 @@ impl Default for Transform {
 ///   (within [`EPS`]) — `speed` is modeled but fixed at `1.0` in Phase 1
 /// - no overlap with other clips on the same track (touching edges are fine)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Clip {
     pub id: ClipId,
     pub media_id: MediaId,

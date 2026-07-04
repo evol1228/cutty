@@ -39,4 +39,4 @@ pub use model::{
     Transform, EPS, MIN_CLIP_DURATION,
 };
 pub use resolve::{resolve, ActiveClip};
-pub use snap::{snap, snap_candidates};
+pub use snap::{snap, snap_candidates, snap_clip_move, snap_time, SnappedMove};
