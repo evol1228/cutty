@@ -819,3 +819,88 @@ fn remove_unknown_media_rejected_and_state_untouched() {
     assert!(engine.drain_events().is_empty(), "failed op must not emit");
     assert!(engine.project().media(media).is_some());
 }
+
+// ---------------------------------------------------------------------
+// SetClipVolume
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_clip_volume_applies_and_undo_restores_exact_value() {
+    let Fixture {
+        mut engine,
+        media,
+        audio,
+        ..
+    } = engine_with_media();
+    let id = engine.add_clip(audio, media, 0.0, 0.0, 4.0).expect("add");
+
+    engine.set_clip_volume(id, 0.35).expect("set volume");
+    let (_, clip) = engine.project().find_clip(id).expect("clip");
+    assert_eq!(clip.volume, 0.35);
+
+    // Volume 0 (mute) and >1 (boost) are both valid gains.
+    engine.set_clip_volume(id, 0.0).expect("mute");
+    engine.set_clip_volume(id, 2.0).expect("boost");
+
+    assert!(engine.undo().expect("undo boost"));
+    assert!(engine.undo().expect("undo mute"));
+    let (_, clip) = engine.project().find_clip(id).expect("clip");
+    assert_eq!(clip.volume, 0.35, "undo restores the exact prior gain");
+    assert!(engine.redo().expect("redo mute"));
+    let (_, clip) = engine.project().find_clip(id).expect("clip");
+    assert_eq!(clip.volume, 0.0);
+}
+
+#[test]
+fn set_clip_volume_rejects_invalid_gains_and_unknown_clips() {
+    let Fixture {
+        mut engine,
+        media,
+        audio,
+        ..
+    } = engine_with_media();
+    let id = engine.add_clip(audio, media, 0.0, 0.0, 4.0).expect("add");
+    let before = serialized(&engine);
+    let depth = engine.undo_depth();
+    engine.drain_events();
+
+    for bad in [-0.1, f64::NAN, f64::INFINITY] {
+        let err = engine.set_clip_volume(id, bad).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidProperty { .. }), "{err:?}");
+    }
+    let err = engine.set_clip_volume(ClipId(9999), 0.5).unwrap_err();
+    assert!(matches!(err, EngineError::UnknownClip(_)), "{err:?}");
+
+    assert_eq!(serialized(&engine), before);
+    assert_eq!(engine.undo_depth(), depth);
+    assert!(engine.drain_events().is_empty(), "failed op must not emit");
+}
+
+#[test]
+fn set_clip_volume_inside_transaction_is_one_undo_entry() {
+    let Fixture {
+        mut engine,
+        media,
+        audio,
+        ..
+    } = engine_with_media();
+    let id = engine.add_clip(audio, media, 0.0, 0.0, 4.0).expect("add");
+    let depth = engine.undo_depth();
+
+    // A volume-slider drag from unity down to 0.25: many transient
+    // updates, one undo entry.
+    engine.begin_transaction().expect("begin");
+    for step in 1..=15 {
+        engine
+            .set_clip_volume(id, 1.0 - f64::from(step) * 0.05)
+            .expect("transient");
+    }
+    engine.commit_transaction().expect("commit");
+
+    let (_, clip) = engine.project().find_clip(id).expect("clip");
+    assert_eq!(clip.volume, 0.25);
+    assert_eq!(engine.undo_depth(), depth + 1, "gesture = one entry");
+    assert!(engine.undo().expect("undo"));
+    let (_, clip) = engine.project().find_clip(id).expect("clip");
+    assert_eq!(clip.volume, 1.0, "back to pre-gesture volume");
+}

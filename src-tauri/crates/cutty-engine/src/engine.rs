@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::command::{
     AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, RemoveMedia, RippleDelete,
-    RippleMove, SplitClip, TrimClip,
+    RippleMove, SetClipVolume, SplitClip, TrimClip,
 };
 use crate::error::EngineError;
 use crate::model::{
@@ -378,6 +378,29 @@ impl Engine {
             right,
         }))?;
         Ok(right_id)
+    }
+
+    /// Set a clip's audio gain (linear; 1.0 = unity, 0.0 = silent). The
+    /// mixer applies this both in preview and in export, so it is the one
+    /// per-clip audio control of Phase 1.
+    pub fn set_clip_volume(&mut self, clip_id: ClipId, volume: f64) -> Result<(), EngineError> {
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if !volume.is_finite() || volume < 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "volume",
+                value: volume,
+            });
+        }
+        self.execute(Box::new(SetClipVolume {
+            track_id: track.id,
+            clip_id,
+            old: clip.volume,
+            new: volume,
+        }))
     }
 
     /// Remove a clip from its track, leaving a gap.

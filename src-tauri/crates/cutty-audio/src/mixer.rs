@@ -38,7 +38,7 @@ const RING_SECONDS: f64 = 0.25;
 
 /// Frames rendered per block. Blocks are also the command-response
 /// granularity of the render thread (~11 ms at 48 kHz).
-const BLOCK_FRAMES: usize = 512;
+pub(crate) const BLOCK_FRAMES: usize = 512;
 
 /// Poll cadence while the ring is full / a rebase is pending.
 const IDLE_POLL: Duration = Duration::from_millis(3);
@@ -70,13 +70,13 @@ pub struct MixerTimeline {
 
 /// A segment with its boundaries rounded to output frames. Rounding once
 /// keeps touching clips exactly gapless.
-struct PlacedSegment {
+pub(crate) struct PlacedSegment {
     seg: AudioSegment,
     start_frame: i64,
     end_frame: i64,
 }
 
-fn place(timeline: MixerTimeline, out_rate: u32) -> Vec<PlacedSegment> {
+pub(crate) fn place(timeline: MixerTimeline, out_rate: u32) -> Vec<PlacedSegment> {
     let rate = f64::from(out_rate);
     timeline
         .segments
@@ -103,7 +103,7 @@ fn place(timeline: MixerTimeline, out_rate: u32) -> Vec<PlacedSegment> {
 /// Pulls source samples for one segment and accumulates them into output
 /// blocks: mixdown to stereo, linear resample to the output rate, scale by
 /// clip volume. Past source EOF it contributes silence.
-struct ClipReader {
+pub(crate) struct ClipReader {
     source: Box<dyn AudioSource>,
     src_rate: f64,
     src_channels: usize,
@@ -239,7 +239,8 @@ impl ClipReader {
 
 /// Factory used by the renderer to open a segment's source (injectable
 /// for tests).
-type OpenSource<'a> = &'a mut dyn FnMut(&AudioSegment) -> Result<Box<dyn AudioSource>, AudioError>;
+pub(crate) type OpenSource<'a> =
+    &'a mut dyn FnMut(&AudioSegment) -> Result<Box<dyn AudioSource>, AudioError>;
 
 /// Render one block starting at timeline frame `head` into `out`
 /// (stereo interleaved, zeroed and summed here). The block is split at
@@ -248,7 +249,7 @@ type OpenSource<'a> = &'a mut dyn FnMut(&AudioSegment) -> Result<Box<dyn AudioSo
 /// `readers` caches open readers by segment index; `None` marks a segment
 /// that failed to open/decode (renders as silence, reported once via
 /// `on_error`).
-fn render_block(
+pub(crate) fn render_block(
     segments: &[PlacedSegment],
     readers: &mut HashMap<usize, Option<ClipReader>>,
     open: OpenSource<'_>,

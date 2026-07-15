@@ -89,23 +89,23 @@ Dark theme by default. Panel layout matching CapCut:
 ### Phase 0 — Pipeline spike (1–2 weeks)
 Kill the biggest risk before building any editor UI.
 
-- [ ] Tauri 2 app boots with static panel layout shell (no functionality)
-- [ ] Probe media files (duration, streams, resolution, fps)
-- [ ] Background 720p proxy generation with progress events
-- [ ] Play video with synced audio in the player canvas; seek slider; frame stepping
-- [ ] Export a trim via ffmpeg stream copy
+- [x] Tauri 2 app boots with static panel layout shell (no functionality)
+- [x] Probe media files (duration, streams, resolution, fps)
+- [x] Background 720p proxy generation with progress events
+- [x] Play video with synced audio in the player canvas; seek slider; frame stepping
+- [x] Export a trim via ffmpeg stream copy
 
 **Acceptance:** a 4K source plays smoothly ≥30fps via proxy · seek responds <100ms · A/V drift <40ms over 60s · trimmed export opens correctly in mpv.
 
 ### Phase 1 — MVP editor (3–5 weeks)
 
-- [ ] Media pool with import + thumbnails, drag to timeline
-- [ ] One video track + one audio track
-- [ ] Split, trim (drag handles), move, delete, ripple delete, snapping
-- [ ] Undo/redo (command system)
-- [ ] Player synced to timeline
-- [ ] Export dialog: resolution/fps/bitrate presets incl. **1080×1920 TikTok/Shorts preset**, hardware encode detection
-- [ ] Project save/load (`.cutty`), autosave, crash recovery
+- [x] Media pool with import + thumbnails, drag to timeline
+- [x] One video track + one audio track
+- [x] Split, trim (drag handles), move, delete, ripple delete, snapping
+- [x] Undo/redo (command system)
+- [x] Player synced to timeline
+- [x] Export dialog: resolution/fps/bitrate presets incl. **1080×1920 TikTok/Shorts preset**, hardware encode detection
+- [x] Project save/load (`.cutty`), autosave, crash recovery
 
 **Acceptance:** cut a 10-minute screen recording into a 60s short and export it · timeline stays 60fps with 50 clips · no data loss on kill -9 (autosave).
 

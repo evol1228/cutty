@@ -207,6 +207,17 @@ pub fn engine_ripple_delete(
     mutate(&app, &state, |e| e.ripple_delete(ClipId(clip_id)))
 }
 
+/// Set a clip's audio gain (linear; 1.0 = unity, 0.0 = silent).
+#[tauri::command]
+pub fn engine_set_clip_volume(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    volume: f64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| e.set_clip_volume(ClipId(clip_id), volume))
+}
+
 /// Undo the most recent command; `false` when there was nothing to undo.
 #[tauri::command]
 pub fn engine_undo(app: AppHandle, state: State<'_, EngineHandle>) -> Result<bool, String> {

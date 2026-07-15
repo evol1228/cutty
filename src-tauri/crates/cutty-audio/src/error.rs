@@ -28,6 +28,16 @@ pub enum AudioError {
     #[error("unsupported audio output configuration: {0}")]
     UnsupportedDevice(String),
 
+    /// A clip failed to open or decode during an offline render. Unlike
+    /// live playback (which degrades to silence), offline rendering fails
+    /// loudly — exported audio must never be silently wrong.
+    #[error("offline render of {path}: {message}")]
+    OfflineRender { path: String, message: String },
+
+    /// An offline render was cancelled by the caller.
+    #[error("render cancelled")]
+    Cancelled,
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -9,6 +9,7 @@ import {
   saveProject,
   saveProjectAs,
 } from "../lib/projectActions";
+import { useExportStore } from "../state/exportStore";
 import { useSessionStore } from "../state/sessionStore";
 
 /** "just now" / "42s ago" / "3m ago" / "2h ago". */
@@ -183,15 +184,36 @@ function TopBar() {
         )}
         <SaveIndicator />
       </div>
-      <button
-        id="export-button"
-        disabled
-        title="The export dialog lands later in Phase 1"
-        className="rounded-md bg-sky-600 px-4 py-1.5 font-medium text-white hover:bg-sky-500 disabled:opacity-40"
-      >
-        Export
-      </button>
+      <ExportButton />
     </header>
+  );
+}
+
+/** Export entry point; shows live progress while a job runs (the export
+ * continues in the background — clicking reopens the dialog). */
+function ExportButton() {
+  const phase = useExportStore((s) => s.phase);
+  const percent = useExportStore((s) => s.percent);
+  const openDialog = useExportStore((s) => s.openDialog);
+
+  const running = phase === "running";
+  return (
+    <button
+      id="export-button"
+      onClick={openDialog}
+      title={running ? "Show export progress" : "Export the timeline"}
+      className="relative min-w-24 overflow-hidden rounded-md bg-sky-600 px-4 py-1.5 font-medium text-white hover:bg-sky-500"
+    >
+      {running && (
+        <span
+          className="absolute inset-y-0 left-0 bg-sky-400/40 transition-[width] duration-300"
+          style={{ width: `${percent}%` }}
+        />
+      )}
+      <span className="relative">
+        {running ? `${percent.toFixed(0)}%` : "Export"}
+      </span>
+    </button>
   );
 }
 

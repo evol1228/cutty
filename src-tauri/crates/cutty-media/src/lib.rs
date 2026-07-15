@@ -8,6 +8,7 @@
 
 pub(crate) mod cache;
 pub mod decode;
+pub mod encoders;
 pub mod error;
 pub mod export;
 pub mod files;
@@ -16,17 +17,23 @@ pub mod jpeg;
 pub mod playback;
 pub mod probe;
 pub mod proxy;
+pub mod render;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod thumbnail;
 pub mod tools;
 
 pub use decode::{FrameView, SourceDecoder};
+pub use encoders::{detected_h264_encoder, start_encoder_detection, H264Encoder};
 pub use error::MediaError;
 pub use export::{export_trim, TrimResult};
 pub use files::paths_exist;
 pub use playback::{PlayerEvent, TimelinePlayer};
 pub use probe::{probe, AudioStreamInfo, MediaInfo, StreamSummary, VideoStreamInfo};
 pub use proxy::{generate_proxy, proxy_path_for, ProxyProgress};
+pub use render::{
+    run_export, CancelToken, ExportProgress, ExportQuality, ExportSpec, ExportStage,
+    ExportSummary,
+};
 pub use thumbnail::{generate_thumbnail, thumbnail_path_for};
 pub use tools::ensure_tools;

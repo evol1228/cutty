@@ -432,6 +432,42 @@ impl Command for RestoreMedia {
     }
 }
 
+/// Change a clip's audio gain. Old and new values are captured verbatim,
+/// so undo restores the exact float.
+#[derive(Debug, Clone)]
+pub struct SetClipVolume {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub old: f64,
+    pub new: f64,
+}
+
+impl Command for SetClipVolume {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let track = project
+            .track_mut(self.track_id)
+            .ok_or(EngineError::UnknownTrack(self.track_id))?;
+        let clip = track
+            .clip_mut(self.clip_id)
+            .ok_or(EngineError::UnknownClip(self.clip_id))?;
+        clip.volume = self.new;
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(SetClipVolume {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            old: self.new,
+            new: self.old,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "SetClipVolume"
+    }
+}
+
 /// The single undo entry produced by committing a transaction (e.g. a drag
 /// gesture of many transient micro-moves). Snapshot-based: projects are
 /// small, and a verbatim before/after pair is exactly reversible by

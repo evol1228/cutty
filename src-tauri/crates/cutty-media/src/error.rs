@@ -41,6 +41,20 @@ pub enum MediaError {
     #[error("JPEG encoding failed: {0}")]
     Jpeg(String),
 
+    /// The project cannot be exported yet (e.g. empty timeline, proxies
+    /// still generating). The message is user-actionable.
+    #[error("{message}")]
+    ExportNotReady { message: String },
+
+    /// The export was cancelled by the user. Not a failure — callers
+    /// clean up and report "cancelled", never "error".
+    #[error("export cancelled")]
+    ExportCancelled,
+
+    /// Offline audio rendering failed.
+    #[error("audio render failed: {0}")]
+    Audio(#[from] cutty_audio::AudioError),
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

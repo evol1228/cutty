@@ -3,6 +3,7 @@
 
 mod commands;
 mod engine_ipc;
+mod export_ipc;
 mod project_ipc;
 
 use tauri::{Emitter, Manager};
@@ -18,11 +19,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(commands::AppState::default())
         .manage(engine)
         .manage(session)
+        .manage(export_ipc::ExportState::default())
         .setup(|app| {
             project_ipc::start_autosaver(app.handle());
+            // Warm the encoder-detection cache so the export dialog opens
+            // with the answer in hand (functional ffmpeg probes take a
+            // few hundred ms — never on the startup path).
+            cutty_media::start_encoder_detection();
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -58,6 +65,7 @@ pub fn run() {
             engine_ipc::engine_split_clip,
             engine_ipc::engine_delete_clip,
             engine_ipc::engine_ripple_delete,
+            engine_ipc::engine_set_clip_volume,
             engine_ipc::engine_undo,
             engine_ipc::engine_redo,
             engine_ipc::engine_begin_transaction,
@@ -65,6 +73,9 @@ pub fn run() {
             engine_ipc::engine_rollback_transaction,
             engine_ipc::engine_snap_time,
             engine_ipc::engine_snap_clip_move,
+            export_ipc::export_detect_encoder,
+            export_ipc::export_start,
+            export_ipc::export_cancel,
             project_ipc::project_meta,
             project_ipc::project_save,
             project_ipc::project_load,

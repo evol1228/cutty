@@ -6,12 +6,15 @@ import Inspector from "./components/Inspector";
 import Timeline from "./components/Timeline";
 import Toasts from "./components/Toasts";
 import ProjectDialogs from "./components/ProjectDialogs";
+import ExportDialog from "./components/ExportDialog";
 import StartOverlay from "./components/StartOverlay";
 import { startSessionSync } from "./lib/projectActions";
+import { startExportSync } from "./state/exportStore";
 
 function App() {
   useEffect(() => {
     startSessionSync();
+    startExportSync();
   }, []);
 
   return (
@@ -26,6 +29,7 @@ function App() {
       <Timeline />
       <Toasts />
       <ProjectDialogs />
+      <ExportDialog />
     </div>
   );
 }

@@ -148,6 +148,14 @@ export function engineRippleDelete(clipId: number): Promise<void> {
   return invoke("engine_ripple_delete", { clipId });
 }
 
+/** Set a clip's audio gain (linear; 1.0 = unity, 0.0 = silent). */
+export function engineSetClipVolume(
+  clipId: number,
+  volume: number,
+): Promise<void> {
+  return invoke("engine_set_clip_volume", { clipId, volume });
+}
+
 export function engineUndo(): Promise<boolean> {
   return invoke<boolean>("engine_undo");
 }
