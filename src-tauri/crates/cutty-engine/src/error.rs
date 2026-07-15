@@ -76,6 +76,17 @@ pub enum EngineError {
     #[error("split point {at} is outside clip {clip:?} (must be strictly inside)")]
     SplitOutOfRange { clip: ClipId, at: f64 },
 
+    /// The operation targets a locked track. `name` is carried so the UI
+    /// can say which track without a second lookup.
+    #[error("track \"{name}\" is locked — unlock it to edit")]
+    TrackLocked { track: TrackId, name: String },
+
+    /// Removing this track would leave the project without any track of
+    /// its kind (the editor always keeps at least one video and one
+    /// audio lane).
+    #[error("cannot remove the last {kind} track")]
+    LastTrackOfKind { track: TrackId, kind: &'static str },
+
     /// An id appears more than once in the project.
     #[error("duplicate id {0} in project")]
     DuplicateId(u64),

@@ -22,6 +22,18 @@ export interface MediaRef {
 
 export type TrackKind = "video" | "audio";
 
+/** Per-track toggle switches (mirrors the engine's TrackFlag). */
+export type TrackFlag = "locked" | "muted" | "hidden";
+
+export const BLEND_MODES = [
+  "normal",
+  "multiply",
+  "screen",
+  "overlay",
+  "add",
+] as const;
+export type BlendMode = (typeof BLEND_MODES)[number];
+
 export interface Transform {
   x: number;
   y: number;
@@ -38,6 +50,7 @@ export interface Clip {
   sourceOut: number;
   transform: Transform;
   opacity: number;
+  blendMode: BlendMode;
   speed: number;
   volume: number;
 }
@@ -46,8 +59,12 @@ export interface Track {
   id: number;
   kind: TrackKind;
   name: string;
+  /** Rejects edits (the engine enforces; the UI also pre-checks). */
   locked: boolean;
+  /** Audio silenced (audio tracks and video clips' embedded audio). */
   muted: boolean;
+  /** Video track excluded from the composite (preview and export). */
+  hidden: boolean;
   clips: Clip[];
 }
 
@@ -154,6 +171,67 @@ export function engineSetClipVolume(
   volume: number,
 ): Promise<void> {
   return invoke("engine_set_clip_volume", { clipId, volume });
+}
+
+/** Set a clip's 2D placement (position/scale/rotation). */
+export function engineSetClipTransform(
+  clipId: number,
+  transform: Transform,
+): Promise<void> {
+  return invoke("engine_set_clip_transform", { clipId, transform });
+}
+
+/** Set a clip's opacity (0.0 transparent .. 1.0 opaque). */
+export function engineSetClipOpacity(
+  clipId: number,
+  opacity: number,
+): Promise<void> {
+  return invoke("engine_set_clip_opacity", { clipId, opacity });
+}
+
+/** Set how a clip blends with the layers below it. */
+export function engineSetClipBlendMode(
+  clipId: number,
+  mode: BlendMode,
+): Promise<void> {
+  return invoke("engine_set_clip_blend_mode", { clipId, mode });
+}
+
+/** Move a clip onto another track (and position) in one step. */
+export function engineMoveClipToTrack(
+  clipId: number,
+  trackId: number,
+  timelineIn: number,
+): Promise<void> {
+  return invoke("engine_move_clip_to_track", { clipId, trackId, timelineIn });
+}
+
+/** Insert a new empty track at panel index (0 = top; engine clamps).
+ * Returns the new track's id. */
+export function engineAddTrack(
+  kind: TrackKind,
+  index: number,
+): Promise<number> {
+  return invoke<number>("engine_add_track", { kind, index });
+}
+
+/** Remove a track with all its clips (one undo step). */
+export function engineRemoveTrack(trackId: number): Promise<void> {
+  return invoke("engine_remove_track", { trackId });
+}
+
+/** Move a track to another panel position (restacks the composite). */
+export function engineMoveTrack(trackId: number, to: number): Promise<void> {
+  return invoke("engine_move_track", { trackId, to });
+}
+
+/** Flip a per-track flag (lock / mute / hide). */
+export function engineSetTrackFlag(
+  trackId: number,
+  flag: TrackFlag,
+  value: boolean,
+): Promise<void> {
+  return invoke("engine_set_track_flag", { trackId, flag, value });
 }
 
 export function engineUndo(): Promise<boolean> {

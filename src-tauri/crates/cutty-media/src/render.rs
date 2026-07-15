@@ -224,26 +224,26 @@ fn visually_default(clip: &cutty_engine::Clip) -> bool {
     clip.transform.is_identity() && clip.opacity == 1.0 && clip.blend_mode == BlendMode::Normal
 }
 
-/// The single unmuted video track carrying clips, if the project has
+/// The single visible video track carrying clips, if the project has
 /// exactly one (the shape the per-segment fast path can encode).
 fn sole_video_track(project: &Project) -> Option<&cutty_engine::Track> {
     let mut tracks = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Video && !t.muted && !t.clips.is_empty());
+        .filter(|t| t.kind == TrackKind::Video && !t.hidden && !t.clips.is_empty());
     let first = tracks.next()?;
     tracks.next().is_none().then_some(first)
 }
 
 /// Whether the Phase 1 per-segment pipeline renders this project exactly:
-/// nothing to composite (at most one unmuted video track holding clips)
+/// nothing to composite (at most one visible video track holding clips)
 /// and every clip visually default. Everything else goes through the GPU
 /// compositor.
 pub(crate) fn fast_path_eligible(project: &Project) -> bool {
     let mut tracks = project
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Video && !t.muted && !t.clips.is_empty());
+        .filter(|t| t.kind == TrackKind::Video && !t.hidden && !t.clips.is_empty());
     let Some(track) = tracks.next() else {
         return true; // no video at all: black frames + the audio mix
     };
@@ -1239,17 +1239,27 @@ mod tests {
     }
 
     #[test]
-    fn muted_video_track_plans_black() {
+    fn hidden_video_track_plans_black() {
         let mut p = project_with(&[(0.0, 0.0, 2.0)]);
         for t in &mut p.tracks {
             if t.kind == TrackKind::Video {
-                t.muted = true;
+                t.hidden = true;
             }
         }
         let segs = plan_video_segments(&p, 30.0);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].source, SegmentSource::Black);
         assert_eq!(segs[0].frames(), 60);
+
+        // Muting, by contrast, silences audio only — the picture plans
+        // as usual.
+        let mut p = project_with(&[(0.0, 0.0, 2.0)]);
+        for t in &mut p.tracks {
+            t.muted = true;
+        }
+        let segs = plan_video_segments(&p, 30.0);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(segs[0].source, SegmentSource::Clip { .. }));
     }
 
     #[test]
@@ -1351,8 +1361,11 @@ mod tests {
         track.clips[0].id = cutty_engine::ClipId(998);
         multi.tracks.insert(0, track);
         assert!(!fast_path_eligible(&multi));
-        // …unless it is muted (hidden ⇒ nothing to composite).
+        // …unless it is hidden (⇒ nothing to composite). Muted alone
+        // doesn't help — a muted track still shows its picture.
         multi.tracks[0].muted = true;
+        assert!(!fast_path_eligible(&multi));
+        multi.tracks[0].hidden = true;
         assert!(fast_path_eligible(&multi));
 
         // No video clips at all (audio-only timeline): eligible.

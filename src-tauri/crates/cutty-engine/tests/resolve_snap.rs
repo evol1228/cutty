@@ -98,7 +98,7 @@ fn resolver_returns_all_tracks_in_order() {
 }
 
 #[test]
-fn resolver_skips_muted_tracks() {
+fn resolver_skips_muted_audio_and_hidden_video_tracks() {
     let Fixture {
         mut engine,
         media,
@@ -108,23 +108,41 @@ fn resolver_skips_muted_tracks() {
     engine.add_clip(video, media, 0.0, 0.0, 4.0).expect("v");
     engine.add_clip(audio, media, 0.0, 0.0, 4.0).expect("a");
 
-    // Mute the audio track directly on a copy of the state — track
-    // mute/lock toggles get their own commands in a later prompt.
+    // A muted audio track contributes nothing perceivable.
     let mut project = engine.project().clone();
-    let audio_track = project
+    project
         .tracks
         .iter_mut()
         .find(|t| t.kind == TrackKind::Audio)
-        .expect("audio track");
-    audio_track.muted = true;
-
+        .expect("audio track")
+        .muted = true;
     let active = resolve(&project, 1.0);
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].track_id, video);
+
+    // A muted *video* track still shows its picture (mute = audio only);
+    // hiding it is what removes the layer.
+    let mut project = engine.project().clone();
+    let video_track = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == TrackKind::Video)
+        .expect("video track");
+    video_track.muted = true;
+    assert_eq!(resolve(&project, 1.0).len(), 2, "muted video stays visible");
+    project
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == TrackKind::Video)
+        .expect("video track")
+        .hidden = true;
+    let active = resolve(&project, 1.0);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].track_id, audio);
 }
 
 #[test]
-fn video_layers_stack_bottom_to_top_and_skip_audio_gaps_and_muted() {
+fn video_layers_stack_bottom_to_top_and_skip_audio_gaps_and_hidden() {
     let Fixture {
         mut engine,
         media,
@@ -157,6 +175,7 @@ fn video_layers_stack_bottom_to_top_and_skip_audio_gaps_and_muted() {
                 name: name.into(),
                 locked: false,
                 muted: false,
+                hidden: false,
                 clips: Vec::new(),
             },
         );
@@ -199,14 +218,20 @@ fn video_layers_stack_bottom_to_top_and_skip_audio_gaps_and_muted() {
     assert_eq!(layers[1].clip_id, ClipId(200));
     assert_eq!(layers[2].clip_id, ClipId(201));
 
-    // Muting the top track removes only its layer.
+    // Muting a video track silences its audio but never touches the
+    // picture — all three layers stay.
     project.tracks[0].muted = true;
+    assert_eq!(resolve_video_layers(&project, 3.5).len(), 3);
+    project.tracks[0].muted = false;
+
+    // Hiding the top track removes only its layer.
+    project.tracks[0].hidden = true;
     let layers = resolve_video_layers(&project, 3.5);
     assert_eq!(layers.len(), 2);
     assert_eq!(layers[1].clip_id, ClipId(200));
 
-    // Muted base video track hides it; non-finite times resolve to nothing.
-    project.tracks.iter_mut().for_each(|t| t.muted = true);
+    // All video tracks hidden → empty; non-finite times resolve to nothing.
+    project.tracks.iter_mut().for_each(|t| t.hidden = true);
     assert!(resolve_video_layers(&project, 3.5).is_empty());
     assert!(resolve_video_layers(&project, f64::NAN).is_empty());
 }

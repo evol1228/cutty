@@ -8,7 +8,15 @@ import type { Clip, Project, Track } from "../lib/engineIpc";
 import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { requestDraw } from "./dirty";
-import { durationToPx, RULER_H, timeToX, TRACK_H, view, xToTime } from "./view";
+import {
+  durationToPx,
+  laneHeight,
+  laneTop,
+  RULER_H,
+  timeToX,
+  view,
+  xToTime,
+} from "./view";
 
 /** Ghost of a pool item being dragged over the timeline. */
 export interface DropPreview {
@@ -23,12 +31,18 @@ export interface TimelineOverlay {
   snapLineSec: number | null;
   /** Pool-drag drop preview; null when no drag is over the canvas. */
   dropPreview: DropPreview | null;
+  /** Lane a drag is hovering but may not drop into (locked/incompatible);
+   * tinted red. Null when no invalid hover. */
+  invalidLaneIndex: number | null;
 }
 
 const COLORS = {
   background: "#09090b", // zinc-950
   laneEven: "#0d0d10",
   laneSeparator: "#27272a", // zinc-800
+  laneLockHatch: "rgba(255,255,255,0.05)",
+  laneInvalidFill: "rgba(239,68,68,0.10)", // red-500
+  laneInvalidBorder: "rgba(239,68,68,0.55)",
   ruler: "#18181b", // zinc-900
   rulerTick: "#3f3f46", // zinc-700
   rulerMinorTick: "#27272a",
@@ -49,6 +63,11 @@ const COLORS = {
   dropBorder: "#38bdf8", // sky-400
   emptyHint: "#52525b", // zinc-600
 } as const;
+
+/** Hidden tracks keep their clips visible but faded. */
+const HIDDEN_TRACK_ALPHA = 0.35;
+/** Locked tracks dim slightly under the hatch. */
+const LOCKED_TRACK_ALPHA = 0.6;
 
 /** Major-tick ladder, seconds. Picks the first step wide enough on screen. */
 const TICK_STEPS = [
@@ -159,23 +178,66 @@ function drawRuler(ctx: CanvasRenderingContext2D, width: number): void {
   }
 }
 
+/** Lane y in canvas space (content position minus vertical scroll). */
+function laneCanvasY(tracks: readonly Track[], index: number): number {
+  return RULER_H + laneTop(tracks, index) - view.scrollYPx;
+}
+
 function drawLanes(
   ctx: CanvasRenderingContext2D,
   width: number,
-  trackCount: number,
+  tracks: readonly Track[],
 ): void {
-  for (let i = 0; i < trackCount; i++) {
-    const y = RULER_H + i * TRACK_H;
+  tracks.forEach((track, i) => {
+    const y = laneCanvasY(tracks, i);
+    const h = laneHeight(track.kind);
     if (i % 2 === 0) {
       ctx.fillStyle = COLORS.laneEven;
-      ctx.fillRect(0, y, width, TRACK_H);
+      ctx.fillRect(0, y, width, h);
     }
     ctx.strokeStyle = COLORS.laneSeparator;
     ctx.beginPath();
-    ctx.moveTo(0, y + TRACK_H - 0.5);
-    ctx.lineTo(width, y + TRACK_H - 0.5);
+    ctx.moveTo(0, y + h - 0.5);
+    ctx.lineTo(width, y + h - 0.5);
+    ctx.stroke();
+  });
+}
+
+/** Diagonal hatch across a locked lane — visible "no edits" texture. */
+function drawLockHatch(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  y: number,
+  h: number,
+): void {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, y, width, h);
+  ctx.clip();
+  ctx.strokeStyle = COLORS.laneLockHatch;
+  ctx.lineWidth = 1;
+  const step = 8;
+  for (let x = -h; x < width + h; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x, y + h);
+    ctx.lineTo(x + h, y);
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+function drawInvalidLane(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  y: number,
+  h: number,
+): void {
+  ctx.fillStyle = COLORS.laneInvalidFill;
+  ctx.fillRect(0, y, width, h);
+  ctx.strokeStyle = COLORS.laneInvalidBorder;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeRect(0.5, y + 1.5, width - 1, h - 3);
+  ctx.setLineDash([]);
 }
 
 // Decoded thumbnail images by blob URL. Entries are tiny (320px JPEGs);
@@ -212,6 +274,7 @@ function drawClip(
   clip: Clip,
   track: Track,
   laneY: number,
+  laneH: number,
   selected: boolean,
   missing: boolean,
   mediaNames: Map<number, string>,
@@ -220,7 +283,7 @@ function drawClip(
   const x = timeToX(clip.timelineIn);
   const w = Math.max(durationToPx(clip.timelineOut - clip.timelineIn), 2);
   const y = laneY + 4;
-  const h = TRACK_H - 9;
+  const h = laneH - 9;
 
   const kind = track.kind;
   ctx.fillStyle = missing
@@ -237,7 +300,7 @@ function drawClip(
   // (full filmstrips are Phase 2). Missing media shows red, no stale frame.
   let labelIndent = 0;
   const thumbUrl = missing ? undefined : thumbs.get(clip.mediaId);
-  if (thumbUrl && w >= 40) {
+  if (thumbUrl && w >= 40 && kind === "video") {
     const img = thumbImage(thumbUrl);
     if (img) {
       const thumbW = Math.min((h / img.naturalHeight) * img.naturalWidth, w - 4);
@@ -272,7 +335,7 @@ function drawClip(
     ctx.font = "11px system-ui, sans-serif";
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
-    ctx.fillText(label, x + labelIndent + 7, y + 6);
+    ctx.fillText(label, x + labelIndent + 7, y + 5);
     ctx.restore();
   }
 
@@ -287,11 +350,13 @@ function drawClip(
 function drawDropPreview(
   ctx: CanvasRenderingContext2D,
   preview: DropPreview,
+  tracks: readonly Track[],
 ): void {
+  if (preview.trackIndex >= tracks.length) return;
   const x = timeToX(preview.inSec);
   const w = Math.max(durationToPx(preview.durSec), 2);
-  const y = RULER_H + preview.trackIndex * TRACK_H + 4;
-  const h = TRACK_H - 9;
+  const y = laneCanvasY(tracks, preview.trackIndex) + 4;
+  const h = laneHeight(tracks[preview.trackIndex].kind) - 9;
   ctx.fillStyle = COLORS.dropFill;
   roundRectPath(ctx, x, y, w, h, 5);
   ctx.fill();
@@ -360,9 +425,16 @@ export function drawTimeline(
   ctx.fillStyle = COLORS.background;
   ctx.fillRect(0, 0, width, height);
 
-  const trackCount = project?.tracks.length ?? 2;
-  drawLanes(ctx, width, trackCount);
-  drawRuler(ctx, width);
+  const tracks = project?.tracks ?? [];
+
+  // Everything lane-space (lanes, clips, previews) clips against the
+  // area below the ruler so vertical scroll never paints over it.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, RULER_H, width, Math.max(0, height - RULER_H));
+  ctx.clip();
+
+  drawLanes(ctx, width, tracks);
 
   if (project) {
     const selected = new Set(selection);
@@ -373,20 +445,32 @@ export function drawTimeline(
     const endSec = xToTime(width + 2);
     let hasClips = false;
     project.tracks.forEach((track, i) => {
-      const laneY = RULER_H + i * TRACK_H;
+      const laneY = laneCanvasY(tracks, i);
+      const laneH = laneHeight(track.kind);
+      hasClips = hasClips || track.clips.length > 0;
+      if (laneY + laneH < RULER_H || laneY > height) return; // scrolled out
+
+      const dim = track.hidden
+        ? HIDDEN_TRACK_ALPHA
+        : track.locked
+          ? LOCKED_TRACK_ALPHA
+          : 1;
+      if (dim !== 1) ctx.globalAlpha = dim;
       for (const clip of visibleClips(track.clips, startSec, endSec)) {
         drawClip(
           ctx,
           clip,
           track,
           laneY,
+          laneH,
           selected.has(clip.id),
           missingIds.has(clip.mediaId),
           names,
           thumbs,
         );
       }
-      hasClips = hasClips || track.clips.length > 0;
+      ctx.globalAlpha = 1;
+      if (track.locked) drawLockHatch(ctx, width, laneY, laneH);
     });
 
     if (!hasClips && !overlay.dropPreview) {
@@ -403,9 +487,20 @@ export function drawTimeline(
     }
   }
 
-  if (overlay.dropPreview) {
-    drawDropPreview(ctx, overlay.dropPreview);
+  if (overlay.invalidLaneIndex !== null && overlay.invalidLaneIndex < tracks.length) {
+    drawInvalidLane(
+      ctx,
+      width,
+      laneCanvasY(tracks, overlay.invalidLaneIndex),
+      laneHeight(tracks[overlay.invalidLaneIndex].kind),
+    );
   }
+  if (overlay.dropPreview) {
+    drawDropPreview(ctx, overlay.dropPreview, tracks);
+  }
+  ctx.restore();
+
+  drawRuler(ctx, width);
   if (overlay.snapLineSec !== null) {
     drawSnapLine(ctx, overlay.snapLineSec, height);
   }

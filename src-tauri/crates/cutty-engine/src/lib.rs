@@ -40,8 +40,10 @@ pub use autosave::{
     RecoveryCandidate,
 };
 pub use command::{
-    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, JoinClips, MoveClip, RemoveMedia,
-    RestoreMedia, RippleDelete, RippleInsert, RippleMove, SplitClip, TrimClip,
+    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, DeleteClip, JoinClips, MoveClip,
+    MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RestoreMedia, RippleDelete, RippleInsert,
+    RippleMove, SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag,
+    SplitClip, TrackFlag, TrimClip,
 };
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;

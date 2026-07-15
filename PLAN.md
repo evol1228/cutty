@@ -111,7 +111,7 @@ Kill the biggest risk before building any editor UI.
 
 ### Phase 2 — The CapCut feel (4–6 weeks)
 
-- [ ] Multi-track video with compositing (opacity, blend modes)
+- [x] Multi-track video with compositing (opacity, blend modes)
 - [ ] Transitions: fade/dissolve + ~15 ported gl-transitions; drag onto cut points; duration handle
 - [ ] Text clips: font, size, color, stroke, shadow, position; a few text style presets
 - [ ] Multiple audio tracks, volume keyframes, fade in/out, extract-audio-from-video

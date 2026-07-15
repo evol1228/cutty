@@ -12,7 +12,9 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cutty_engine::{Engine, MediaId, Project, ProjectSettings, TrackId, TrackKind};
+use cutty_engine::{
+    Engine, MediaId, Project, ProjectSettings, TrackFlag, TrackId, TrackKind, Transform,
+};
 use cutty_media::{generate_proxy, PlayerEvent, TimelinePlayer};
 
 const FPS: f64 = 30.0;
@@ -320,46 +322,32 @@ fn three_track_composite_playback_sustains_30fps() {
     let video = track_of(&engine, TrackKind::Video);
     engine.add_clip(video, base, 0.0, 0.0, PLAY_SECS).unwrap();
 
-    // Two overlay tracks above the base, both transformed + translucent
-    // (manual construction until the AddTrack command lands).
-    let mut project = engine.project().clone();
-    let overlay =
-        |track_id: u64, clip_id: u64, media, x: f64, scale: f64, rotation: f64, opacity: f64| {
-            cutty_engine::Track {
-                id: cutty_engine::TrackId(track_id),
-                kind: TrackKind::Video,
-                name: format!("V{track_id}"),
-                locked: false,
-                muted: false,
-                clips: vec![cutty_engine::Clip {
-                    id: cutty_engine::ClipId(clip_id),
-                    media_id: media,
-                    timeline_in: 0.0,
-                    timeline_out: PLAY_SECS,
-                    source_in: 0.5,
-                    source_out: 0.5 + PLAY_SECS,
-                    transform: cutty_engine::Transform {
-                        x,
-                        y: -80.0,
-                        scale,
-                        rotation,
-                    },
-                    opacity,
-                    blend_mode: cutty_engine::BlendMode::Normal,
-                    speed: 1.0,
-                    volume: 0.0,
-                }],
-            }
-        };
-    project
-        .tracks
-        .insert(0, overlay(300, 301, mid, -320.0, 0.45, 0.0, 0.7));
-    project
-        .tracks
-        .insert(0, overlay(302, 303, top, 320.0, 0.35, 20.0, 0.5));
-    project.validate().expect("fixture is valid");
+    // Two overlay tracks above the base, both transformed + translucent —
+    // built through the real track/property commands, exactly as the UI
+    // drives them.
+    for (media, x, scale, rotation, opacity) in
+        [(mid, -320.0, 0.45, 0.0, 0.7), (top, 320.0, 0.35, 20.0, 0.5)]
+    {
+        let track = engine.add_track(TrackKind::Video, 0).unwrap();
+        let clip = engine
+            .add_clip(track, media, 0.0, 0.5, 0.5 + PLAY_SECS)
+            .unwrap();
+        engine
+            .set_clip_transform(
+                clip,
+                Transform {
+                    x,
+                    y: -80.0,
+                    scale,
+                    rotation,
+                },
+            )
+            .unwrap();
+        engine.set_clip_opacity(clip, opacity).unwrap();
+        engine.set_clip_volume(clip, 0.0).unwrap();
+    }
 
-    let (player, rx) = open_player(project);
+    let (player, rx) = open_player(engine.project().clone());
     let first = recv_frame(&rx, Duration::from_secs(10)).expect("preview frame");
     assert_ne!(first.color, "black", "three layers must composite");
 
@@ -585,6 +573,96 @@ fn paused_scrubbing_shows_the_correct_frame_within_budget() {
     println!("warm re-scrub → {warm:?}");
     assert_eq!(f.color, "green");
     assert!(warm < Duration::from_millis(50), "warm scrub took {warm:?}");
+}
+
+/// Phase 2 acceptance: editing transform/opacity while paused
+/// re-composites the shown frame immediately (<100 ms median) — the
+/// player gizmo's live-feedback path. A red overlay covers a green base;
+/// shrinking it must reveal the green underneath, proving the frame was
+/// re-rendered with the new transform rather than re-presented from
+/// cache. Hide is exercised through the same path.
+#[test]
+fn paused_transform_edit_recomposites_live() {
+    let _serial = serial();
+    let red = color_source("red", 300);
+    let green = color_source("green", 440);
+    for src in [&red, &green] {
+        generate_proxy(src, Some(10.0), |_| {}).expect("proxy");
+    }
+
+    let mut engine = Engine::new(ProjectSettings::default());
+    let r = engine
+        .add_media(red.display().to_string(), 10.0, true, true)
+        .unwrap();
+    let g = engine
+        .add_media(green.display().to_string(), 10.0, true, true)
+        .unwrap();
+    let base_track = track_of(&engine, TrackKind::Video);
+    let top_track = engine.add_track(TrackKind::Video, 0).unwrap();
+    engine.add_clip(base_track, g, 0.0, 0.0, 3.0).unwrap();
+    let top_clip = engine.add_clip(top_track, r, 0.0, 0.0, 3.0).unwrap();
+
+    let (player, rx) = open_player(engine.project().clone());
+    let first = recv_frame(&rx, Duration::from_secs(10)).expect("preview");
+    assert_eq!(first.color, "red", "fullscreen top layer covers the base");
+
+    // A gizmo drag: transient transform steps stream in while paused;
+    // every snapshot must re-composite the paused frame.
+    let mut latencies = Vec::new();
+    let mut last_color = first.color;
+    for scale in [0.8, 0.6, 0.4, 0.25, 0.15] {
+        engine
+            .set_clip_transform(
+                top_clip,
+                Transform {
+                    x: 0.0,
+                    y: 0.0,
+                    scale,
+                    rotation: 0.0,
+                },
+            )
+            .unwrap();
+        while rx.try_recv().is_ok() {} // drain stale frames
+        let t0 = Instant::now();
+        player.set_project(engine.project().clone());
+        let f = recv_frame(&rx, Duration::from_secs(2)).expect("recomposited frame");
+        let latency = t0.elapsed();
+        latencies.push(latency);
+        last_color = f.color;
+        println!("scale {scale:.2} → {latency:?} ({})", f.color);
+    }
+    // At 0.15× the red overlay covers ~2% of the frame: green dominates.
+    assert_eq!(
+        last_color, "green",
+        "the recomposite must reflect the new transform"
+    );
+    latencies.sort();
+    let median = latencies[latencies.len() / 2];
+    assert!(
+        median < Duration::from_millis(100),
+        "median edit→frame latency {median:?} ≥ 100 ms"
+    );
+
+    // Opacity through the same live path: fading the (restored) overlay
+    // to zero leaves pure green.
+    engine
+        .set_clip_transform(top_clip, Transform::default())
+        .unwrap();
+    engine.set_clip_opacity(top_clip, 0.0).unwrap();
+    while rx.try_recv().is_ok() {}
+    player.set_project(engine.project().clone());
+    let f = recv_frame(&rx, Duration::from_secs(2)).expect("opacity frame");
+    assert_eq!(f.color, "green", "opacity 0 hides the top layer");
+
+    // And hide: the hidden track drops out of the preview composite.
+    engine.set_clip_opacity(top_clip, 1.0).unwrap();
+    engine
+        .set_track_flag(top_track, TrackFlag::Hidden, true)
+        .unwrap();
+    while rx.try_recv().is_ok() {}
+    player.set_project(engine.project().clone());
+    let f = recv_frame(&rx, Duration::from_secs(2)).expect("hidden-track frame");
+    assert_eq!(f.color, "green", "hidden track is excluded from preview");
 }
 
 /// Pause mid-clip, then frame-step across a cut boundary: each step

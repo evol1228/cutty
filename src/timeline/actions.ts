@@ -8,6 +8,7 @@ import type { Clip, Project, Track, TrimEdge } from "../lib/engineIpc";
 import {
   engineAddClip,
   engineAddMedia,
+  engineAddTrack,
   engineBeginTransaction,
   engineCommitTransaction,
   engineDeleteClip,
@@ -246,32 +247,47 @@ export async function seedCutTimeline(): Promise<void> {
 }
 
 /**
- * Add 50 dummy clips (25 video + 25 audio) after any existing content, as
- * a single undo step. Dev tool for the Phase 1 performance acceptance —
- * real import lands in another prompt.
+ * Seed the Phase 2 performance-acceptance layout as one undo step: 3
+ * video lanes × 20 clips plus 20 audio clips, creating the extra video
+ * tracks when needed. Dev tool — real import lands elsewhere.
  */
 export async function seedDummyClips(): Promise<void> {
   const { project } = useProjectStore.getState();
-  const videoTrack = project?.tracks.find((t) => t.kind === "video");
   const audioTrack = project?.tracks.find((t) => t.kind === "audio");
-  if (!videoTrack || !audioTrack) return;
+  if (!project || !audioTrack) return;
 
   const rng = mulberry32(0xc0ffee);
   await engineBeginTransaction();
   try {
+    const videoTrackIds = project.tracks
+      .filter((t) => t.kind === "video" && !t.locked)
+      .map((t) => t.id);
+    while (videoTrackIds.length < 3) {
+      videoTrackIds.push(await engineAddTrack("video", 0));
+    }
+
     const mediaIds: number[] = [];
     for (const def of DUMMY_MEDIA) {
       mediaIds.push(await engineAddMedia(def.path, def.duration, true, true));
     }
+
+    // Existing clip ends per track, so reseeding appends instead of failing.
+    const endOf = (id: number): number => {
+      const track = useProjectStore
+        .getState()
+        .project?.tracks.find((t) => t.id === id);
+      return track ? trackEnd(track) + (track.clips.length > 0 ? 0.5 : 0) : 0;
+    };
+
     let n = 0;
-    for (const track of [videoTrack, audioTrack]) {
-      let t = trackEnd(track) + (track.clips.length > 0 ? 0.5 : 0);
-      for (let i = 0; i < 25; i++) {
+    for (const trackId of [...videoTrackIds.slice(0, 3), audioTrack.id]) {
+      let t = endOf(trackId);
+      for (let i = 0; i < 20; i++) {
         const mediaIndex = n % DUMMY_MEDIA.length;
         const duration = 1.5 + rng() * 4;
         const sourceIn = rng() * (DUMMY_MEDIA[mediaIndex].duration - duration);
         await engineAddClip(
-          track.id,
+          trackId,
           mediaIds[mediaIndex],
           t,
           sourceIn,

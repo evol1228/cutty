@@ -186,12 +186,12 @@ struct UpcomingClip {
     source_in: f64,
 }
 
-/// Video clips on unmuted tracks starting in `(t, t + horizon]`.
+/// Video clips on visible tracks starting in `(t, t + horizon]`.
 fn upcoming_video_starts(project: &Project, t: f64, horizon: f64) -> Vec<UpcomingClip> {
     let mut upcoming: Vec<UpcomingClip> = project
         .tracks
         .iter()
-        .filter(|track| track.kind == TrackKind::Video && !track.muted)
+        .filter(|track| track.kind == TrackKind::Video && !track.hidden)
         .flat_map(|track| {
             track
                 .clips
@@ -1220,10 +1220,13 @@ mod tests {
         assert_eq!(up[0].source_in, 5.0);
         // Nothing within half a second of 1.5.
         assert!(upcoming_video_starts(&p, 1.5, 0.5).is_empty());
-        // Muted tracks contribute nothing.
+        // Hidden tracks contribute nothing; muted (audio-off) ones still do.
         let mut muted = p.clone();
         muted.tracks.iter_mut().for_each(|t| t.muted = true);
-        assert!(upcoming_video_starts(&muted, 0.6, 0.5).is_empty());
+        assert_eq!(upcoming_video_starts(&muted, 0.6, 0.5).len(), 1);
+        let mut hidden = p.clone();
+        hidden.tracks.iter_mut().for_each(|t| t.hidden = true);
+        assert!(upcoming_video_starts(&hidden, 0.6, 0.5).is_empty());
     }
 
     #[test]
@@ -1283,6 +1286,11 @@ mod tests {
         p.tracks[0].muted = true;
         assert!(mixer_timeline(&p, &sources).segments.is_empty());
         p.tracks[0].muted = false;
+
+        // Hiding a video track removes its picture, not its audio.
+        p.tracks[0].hidden = true;
+        assert_eq!(mixer_timeline(&p, &sources).segments.len(), 1);
+        p.tracks[0].hidden = false;
 
         // Proxy pending → no segments (silence until refresh).
         sources.map.insert(media_id, SourceFiles::ProxyPending);

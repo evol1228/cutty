@@ -4,13 +4,14 @@
 use serde::Serialize;
 
 use crate::command::{
-    AddClip, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, RemoveMedia, RippleDelete,
-    RippleMove, SetClipVolume, SplitClip, TrimClip,
+    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, MoveClipToTrack,
+    MoveTrack, RemoveMedia, RemoveTrack, RippleDelete, RippleMove, SetClipBlendMode,
+    SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag, SplitClip, TrackFlag, TrimClip,
 };
 use crate::error::EngineError;
 use crate::model::{
-    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TrackId, Transform, EPS,
-    MIN_CLIP_DURATION,
+    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId,
+    TrackKind, Transform, EPS, MIN_CLIP_DURATION,
 };
 
 /// Which clip edge a trim operation drags.
@@ -190,6 +191,13 @@ impl Engine {
             .media(media_id)
             .ok_or(EngineError::UnknownMedia(media_id))?
             .clone();
+        // Removal deletes clips, and deleting from a locked track is an
+        // edit like any other — unlock first.
+        for track in &self.project.tracks {
+            if track.clips.iter().any(|c| c.media_id == media_id) {
+                Self::require_track_unlocked(track)?;
+            }
+        }
         let removed: Vec<_> = self
             .project
             .tracks
@@ -202,6 +210,141 @@ impl Engine {
             })
             .collect();
         self.execute(Box::new(RemoveMedia { media, removed }))
+    }
+
+    // ------------------------------------------------------------------
+    // Track management (all routed through the command system)
+    // ------------------------------------------------------------------
+
+    /// The track holding `clip_id` must not be locked. Every public clip
+    /// mutation calls this first; `Command::apply` itself never checks, so
+    /// undo/redo can restore state on locked tracks.
+    fn require_clip_unlocked(&self, clip_id: ClipId) -> Result<(), EngineError> {
+        let (track, _) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        Self::require_track_unlocked(track)
+    }
+
+    fn require_track_unlocked(track: &Track) -> Result<(), EngineError> {
+        if track.locked {
+            return Err(EngineError::TrackLocked {
+                track: track.id,
+                name: track.name.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Auto-name for a new track: `V<n>`/`A<n>`, one past the highest
+    /// existing number of that kind (so removals never cause collisions).
+    fn next_track_name(&self, kind: TrackKind) -> String {
+        let prefix = match kind {
+            TrackKind::Video => 'V',
+            TrackKind::Audio => 'A',
+        };
+        let max_n = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.kind == kind)
+            .filter_map(|t| {
+                t.name
+                    .strip_prefix(prefix)
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        format!("{prefix}{}", max_n + 1)
+    }
+
+    /// Insert a new empty track at panel `index` (0 = top; clamped to the
+    /// track list). Returns the new track's id. Undoable.
+    pub fn add_track(&mut self, kind: TrackKind, index: usize) -> Result<TrackId, EngineError> {
+        let id = TrackId(self.next_id());
+        let track = Track::new(id, kind, self.next_track_name(kind));
+        let index = index.min(self.project.tracks.len());
+        self.execute(Box::new(AddTrack { index, track }))?;
+        Ok(id)
+    }
+
+    /// Remove a track with all its clips (undo restores everything).
+    /// Rejected on a locked track and for the last track of its kind —
+    /// the editor always keeps at least one video and one audio lane.
+    pub fn remove_track(&mut self, track_id: TrackId) -> Result<(), EngineError> {
+        let index = self
+            .project
+            .tracks
+            .iter()
+            .position(|t| t.id == track_id)
+            .ok_or(EngineError::UnknownTrack(track_id))?;
+        let track = &self.project.tracks[index];
+        Self::require_track_unlocked(track)?;
+        let siblings = self
+            .project
+            .tracks
+            .iter()
+            .filter(|t| t.kind == track.kind)
+            .count();
+        if siblings <= 1 {
+            return Err(EngineError::LastTrackOfKind {
+                track: track_id,
+                kind: match track.kind {
+                    TrackKind::Video => "video",
+                    TrackKind::Audio => "audio",
+                },
+            });
+        }
+        self.execute(Box::new(RemoveTrack {
+            index,
+            track: track.clone(),
+        }))
+    }
+
+    /// Move a track to panel position `to` (clamped). Render order follows
+    /// panel order, so this restacks the video composite. Locked tracks
+    /// may be reordered — lock protects content, not placement.
+    pub fn move_track(&mut self, track_id: TrackId, to: usize) -> Result<(), EngineError> {
+        let from = self
+            .project
+            .tracks
+            .iter()
+            .position(|t| t.id == track_id)
+            .ok_or(EngineError::UnknownTrack(track_id))?;
+        let to = to.min(self.project.tracks.len().saturating_sub(1));
+        if from == to {
+            return Ok(());
+        }
+        self.execute(Box::new(MoveTrack { track_id, from, to }))
+    }
+
+    /// Flip a per-track flag (lock / mute / hide). Always allowed — this
+    /// is how a locked track gets unlocked.
+    pub fn set_track_flag(
+        &mut self,
+        track_id: TrackId,
+        flag: TrackFlag,
+        value: bool,
+    ) -> Result<(), EngineError> {
+        let track = self
+            .project
+            .track(track_id)
+            .ok_or(EngineError::UnknownTrack(track_id))?;
+        let old = match flag {
+            TrackFlag::Locked => track.locked,
+            TrackFlag::Muted => track.muted,
+            TrackFlag::Hidden => track.hidden,
+        };
+        if old == value {
+            return Ok(());
+        }
+        self.execute(Box::new(SetTrackFlag {
+            track_id,
+            flag,
+            old,
+            new: value,
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -222,9 +365,11 @@ impl Engine {
         self.project
             .media(media_id)
             .ok_or(EngineError::UnknownMedia(media_id))?;
-        if self.project.track(track_id).is_none() {
-            return Err(EngineError::UnknownTrack(track_id));
-        }
+        let track = self
+            .project
+            .track(track_id)
+            .ok_or(EngineError::UnknownTrack(track_id))?;
+        Self::require_track_unlocked(track)?;
         let speed = 1.0;
         let id = ClipId(self.next_id());
         let clip = Clip {
@@ -247,6 +392,7 @@ impl Engine {
     /// Move a clip to a new timeline position (clamped to `>= 0`); duration
     /// and source range are unchanged. Fails on overlap.
     pub fn move_clip(&mut self, clip_id: ClipId, timeline_in: f64) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)
@@ -269,6 +415,49 @@ impl Engine {
         }))
     }
 
+    /// Move a clip onto another track (and to a new timeline position in
+    /// the same step — a vertical drag moves on both axes). Duration and
+    /// source range are unchanged. Fails on overlap, on a kind-incompatible
+    /// target (video clip on an audio track), and when either track is
+    /// locked. Same-track calls degrade to a plain move.
+    pub fn move_clip_to_track(
+        &mut self,
+        clip_id: ClipId,
+        track_id: TrackId,
+        timeline_in: f64,
+    ) -> Result<(), EngineError> {
+        let (source, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if source.id == track_id {
+            return self.move_clip(clip_id, timeline_in);
+        }
+        Self::require_track_unlocked(source)?;
+        let target = self
+            .project
+            .track(track_id)
+            .ok_or(EngineError::UnknownTrack(track_id))?;
+        Self::require_track_unlocked(target)?;
+        if !timeline_in.is_finite() {
+            return Err(EngineError::InvalidTimeRange {
+                clip: clip_id,
+                timeline_in,
+                timeline_out: timeline_in,
+            });
+        }
+        let new_in = timeline_in.max(0.0);
+        self.execute(Box::new(MoveClipToTrack {
+            clip_id,
+            old_track: source.id,
+            new_track: track_id,
+            old_timeline_in: clip.timeline_in,
+            old_timeline_out: clip.timeline_out,
+            new_timeline_in: new_in,
+            new_timeline_out: new_in + clip.duration(),
+        }))
+    }
+
     /// Drag one edge of a clip to (approximately) timeline time `to`,
     /// adjusting the source range correspondingly. The requested time is
     /// clamped to media bounds and to [`MIN_CLIP_DURATION`]; the clamped
@@ -280,6 +469,7 @@ impl Engine {
         edge: TrimEdge,
         to: f64,
     ) -> Result<f64, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)
@@ -348,6 +538,7 @@ impl Engine {
     /// inside the clip (at least [`MIN_CLIP_DURATION`] from each edge) —
     /// splitting at an exact clip edge is rejected.
     pub fn split_clip(&mut self, clip_id: ClipId, at: f64) -> Result<ClipId, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)
@@ -385,6 +576,7 @@ impl Engine {
     /// mixer applies this both in preview and in export, so it is the one
     /// per-clip audio control of Phase 1.
     pub fn set_clip_volume(&mut self, clip_id: ClipId, volume: f64) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)
@@ -404,8 +596,91 @@ impl Engine {
         }))
     }
 
+    /// Set a clip's 2D placement (position/scale/rotation, static values —
+    /// keyframes are Phase 3). The compositor consumes this identically in
+    /// preview and export.
+    pub fn set_clip_transform(
+        &mut self,
+        clip_id: ClipId,
+        transform: Transform,
+    ) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        for (property, value) in [
+            ("transform.x", transform.x),
+            ("transform.y", transform.y),
+            ("transform.rotation", transform.rotation),
+        ] {
+            if !value.is_finite() {
+                return Err(EngineError::InvalidProperty {
+                    clip: clip_id,
+                    property,
+                    value,
+                });
+            }
+        }
+        if !transform.scale.is_finite() || transform.scale <= 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "transform.scale",
+                value: transform.scale,
+            });
+        }
+        self.execute(Box::new(SetClipTransform {
+            track_id: track.id,
+            clip_id,
+            old: clip.transform.clone(),
+            new: transform,
+        }))
+    }
+
+    /// Set a clip's opacity (0.0 = transparent, 1.0 = opaque).
+    pub fn set_clip_opacity(&mut self, clip_id: ClipId, opacity: f64) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "opacity",
+                value: opacity,
+            });
+        }
+        self.execute(Box::new(SetClipOpacity {
+            track_id: track.id,
+            clip_id,
+            old: clip.opacity,
+            new: opacity,
+        }))
+    }
+
+    /// Set how a clip blends with the layers below it.
+    pub fn set_clip_blend_mode(
+        &mut self,
+        clip_id: ClipId,
+        mode: BlendMode,
+    ) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        self.execute(Box::new(SetClipBlendMode {
+            track_id: track.id,
+            clip_id,
+            old: clip.blend_mode,
+            new: mode,
+        }))
+    }
+
     /// Remove a clip from its track, leaving a gap.
     pub fn delete_clip(&mut self, clip_id: ClipId) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)
@@ -420,6 +695,7 @@ impl Engine {
     /// the removed clip's duration (gaps between later clips are
     /// preserved).
     pub fn ripple_delete(&mut self, clip_id: ClipId) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
             .project
             .find_clip(clip_id)

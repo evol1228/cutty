@@ -100,6 +100,7 @@ fn fixture_project() -> (Project, i64) {
             name: "V2".into(),
             locked: false,
             muted: false,
+            hidden: false,
             clips: Vec::new(),
         },
     );
@@ -360,34 +361,85 @@ fn preview_renderer_throughput_probe() {
     );
 }
 
-/// Muted overlay tracks drop out of the composite (the resolver's
-/// full-track-order contract, observed through pixels).
+/// Hidden overlay tracks drop out of the composite in BOTH frontends
+/// (hide is a resolver-level exclusion, so preview and export respect it
+/// via the same code path — observed here through pixels). Muting, by
+/// contrast, only silences audio: the picture must not change.
 #[test]
-fn muted_overlay_track_is_invisible() {
+fn hidden_overlay_track_is_invisible_in_both_frontends() {
     if !gpu_available() {
         return;
     }
     let (project, _) = fixture_project();
     let mut renderer = TimelineRenderer::new(OUT_W, OUT_H, false).expect("gpu");
-    let t_probe = 0.75;
+    // On the output frame grid (the export loop renders grid frames only),
+    // inside the first overlay window.
+    let probe_frame: i64 = 22;
+    let t_probe = probe_frame as f64 / FPS;
     let resolver = originals_resolver(&project);
-
-    let mut base_only = project.clone();
-    base_only.tracks[0].muted = true;
-    let muted_hash = renderer
-        .render_with(&base_only, t_probe, &resolver, |frame| hash_frame(&frame))
-        .expect("renders");
 
     let with_overlay = renderer
         .render_with(&project, t_probe, &resolver, |frame| hash_frame(&frame))
         .expect("renders");
-    assert_ne!(muted_hash, with_overlay, "overlay must be visible");
 
-    // The muted composite equals a project that never had the track.
+    // Muted ≠ hidden: the muted composite is pixel-identical to the full one.
+    let mut muted = project.clone();
+    muted.tracks[0].muted = true;
+    let muted_hash = renderer
+        .render_with(&muted, t_probe, &resolver, |frame| hash_frame(&frame))
+        .expect("renders");
+    assert_eq!(muted_hash, with_overlay, "mute must not change the picture");
+
+    let mut base_only = project.clone();
+    base_only.tracks[0].hidden = true;
+    let hidden_hash = renderer
+        .render_with(&base_only, t_probe, &resolver, |frame| hash_frame(&frame))
+        .expect("renders");
+    assert_ne!(hidden_hash, with_overlay, "overlay must be visible");
+
+    // The hidden composite equals a project that never had the track.
     let mut without = project.clone();
     without.tracks.remove(0);
     let without_hash = renderer
         .render_with(&without, t_probe, &resolver, |frame| hash_frame(&frame))
         .expect("renders");
-    assert_eq!(muted_hash, without_hash);
+    assert_eq!(hidden_hash, without_hash);
+
+    // And the export frontend agrees frame-for-frame: the hidden-track
+    // project renders bit-identically to the track-less one at the probe
+    // frame through the literal export loop.
+    let export_hash_of = |p: &Project| {
+        let mut hash = None;
+        for_each_composited_frame(
+            p,
+            OUT_W,
+            OUT_H,
+            FPS,
+            probe_frame + 1,
+            &|| false,
+            &mut |idx, data, stride| {
+                if idx == probe_frame {
+                    hash = Some(hash_frame(&FrameSlice {
+                        width: OUT_W,
+                        height: OUT_H,
+                        stride,
+                        data,
+                    }));
+                }
+                Ok(())
+            },
+        )
+        .expect("export frames render");
+        hash.expect("probe frame rendered")
+    };
+    assert_eq!(
+        export_hash_of(&base_only),
+        export_hash_of(&without),
+        "export must exclude hidden tracks exactly like preview"
+    );
+    assert_eq!(
+        export_hash_of(&base_only),
+        hidden_hash,
+        "preview and export agree on the hidden composite"
+    );
 }

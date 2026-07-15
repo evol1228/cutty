@@ -20,6 +20,7 @@ import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
 import { timelineEndSec } from "../timeline/actions";
 import { ensureVisible } from "../timeline/view";
+import PlayerGizmo from "./PlayerGizmo";
 
 /** HH:MM:SS:FF timecode. */
 function timecode(sec: number, fps: number): string {
@@ -41,6 +42,7 @@ let attachStarted = false;
 
 function Player() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const attached = usePlayerStore((s) => s.attached);
   const playing = usePlayerStore((s) => s.playing);
   const playheadSec = useProjectStore((s) => s.playheadSec);
@@ -123,7 +125,10 @@ function Player() {
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-zinc-950">
-      <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+      <div
+        ref={stageRef}
+        className="relative flex min-h-0 flex-1 items-center justify-center p-4"
+      >
         <canvas
           id="player-canvas"
           ref={canvasRef}
@@ -131,6 +136,7 @@ function Player() {
           width={canvasW}
           height={canvasH}
         />
+        <PlayerGizmo canvasRef={canvasRef} containerRef={stageRef} />
       </div>
       <div className="flex h-12 shrink-0 items-center justify-center gap-3 border-t border-zinc-800 bg-zinc-900 px-4">
         <span className="font-mono text-zinc-400" title="playhead">

@@ -342,6 +342,15 @@ export const useMediaStore = create<MediaState>((set, get) => {
             });
             return;
           }
+          // Re-probe for the full stream info (source dimensions drive
+          // the player gizmo's box) — engine registration already stands.
+          void probeMedia(m.path)
+            .then((info) => {
+              if (get().items.some((i) => i.path === m.path)) {
+                patchItem(set, m.path, { info });
+              }
+            })
+            .catch(() => undefined);
           await runDerivedJobs(m.path, m.duration, m.hasVideo);
           void get().checkMissing();
         })();

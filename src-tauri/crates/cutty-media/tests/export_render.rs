@@ -427,6 +427,7 @@ fn export_composited_timeline_end_to_end() {
             name: "V2".into(),
             locked: false,
             muted: false,
+            hidden: false,
             clips: vec![cutty_engine::Clip {
                 id: cutty_engine::ClipId(501),
                 media_id: overlay,

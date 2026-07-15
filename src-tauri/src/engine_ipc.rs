@@ -5,7 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use cutty_engine::{
-    ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove, TrackId, TrimEdge,
+    BlendMode, ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove, TrackFlag, TrackId,
+    TrackKind, Transform, TrimEdge,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -216,6 +217,107 @@ pub fn engine_set_clip_volume(
     volume: f64,
 ) -> Result<(), String> {
     mutate(&app, &state, |e| e.set_clip_volume(ClipId(clip_id), volume))
+}
+
+/// Set a clip's 2D placement (position/scale/rotation).
+#[tauri::command]
+pub fn engine_set_clip_transform(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    transform: Transform,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.set_clip_transform(ClipId(clip_id), transform)
+    })
+}
+
+/// Set a clip's opacity (0.0 transparent .. 1.0 opaque).
+#[tauri::command]
+pub fn engine_set_clip_opacity(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    opacity: f64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.set_clip_opacity(ClipId(clip_id), opacity)
+    })
+}
+
+/// Set how a clip blends with the layers below it.
+#[tauri::command]
+pub fn engine_set_clip_blend_mode(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    mode: BlendMode,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.set_clip_blend_mode(ClipId(clip_id), mode)
+    })
+}
+
+/// Move a clip onto another track (and position) in one step.
+#[tauri::command]
+pub fn engine_move_clip_to_track(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    track_id: u64,
+    timeline_in: f64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.move_clip_to_track(ClipId(clip_id), TrackId(track_id), timeline_in)
+    })
+}
+
+/// Insert a new empty track at panel `index` (0 = top; clamped). Returns
+/// the new track's id.
+#[tauri::command]
+pub fn engine_add_track(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    kind: TrackKind,
+    index: usize,
+) -> Result<u64, String> {
+    mutate(&app, &state, |e| e.add_track(kind, index).map(|t| t.0))
+}
+
+/// Remove a track with all its clips (one undo step). Rejected for the
+/// last track of a kind and for locked tracks.
+#[tauri::command]
+pub fn engine_remove_track(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    track_id: u64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| e.remove_track(TrackId(track_id)))
+}
+
+/// Move a track to another panel position (restacks the composite).
+#[tauri::command]
+pub fn engine_move_track(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    track_id: u64,
+    to: usize,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| e.move_track(TrackId(track_id), to))
+}
+
+/// Flip a per-track flag: "locked" | "muted" | "hidden".
+#[tauri::command]
+pub fn engine_set_track_flag(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    track_id: u64,
+    flag: TrackFlag,
+    value: bool,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.set_track_flag(TrackId(track_id), flag, value)
+    })
 }
 
 /// Undo the most recent command; `false` when there was nothing to undo.

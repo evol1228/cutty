@@ -303,6 +303,7 @@ fn phase2_compositor_export_acceptance() {
             name: format!("V{track_id}"),
             locked: false,
             muted: false,
+            hidden: false,
             clips: vec![cutty_engine::Clip {
                 id: cutty_engine::ClipId(clip_id),
                 media_id: rec,

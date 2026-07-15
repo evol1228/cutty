@@ -10,7 +10,7 @@ import {
   engineAddClip,
   engineBeginTransaction,
   engineCommitTransaction,
-  engineMoveClip,
+  engineMoveClipToTrack,
   engineRollbackTransaction,
   engineSnapClipMove,
   engineSnapTime,
@@ -38,10 +38,12 @@ import {
 } from "./poolDrag";
 import { drawTimeline, type TimelineOverlay } from "./renderer";
 import {
+  canvasYToContentY,
+  laneIndexAtY,
   pxToDuration,
   RULER_H,
+  scrollTracksBy,
   timeToX,
-  TRACK_H,
   view,
   xToTime,
   zoomBy,
@@ -71,7 +73,17 @@ type Gesture =
       zone: Zone;
       grabOffsetSec: number;
     }
-  | { type: "move"; clipId: number; grabOffsetSec: number; cancelled: boolean }
+  | {
+      type: "move";
+      clipId: number;
+      grabOffsetSec: number;
+      cancelled: boolean;
+      /** Last lane the drag could actually move the clip to. */
+      targetTrackId: number;
+      /** Name of the locked/incompatible lane under the pointer, for
+       * rejection feedback on release. Null while over a valid lane. */
+      blockedLaneName: string | null;
+    }
   | { type: "trim"; clipId: number; edge: TrimEdge; cancelled: boolean }
   | { type: "pan"; lastClientX: number }
   | { type: "scrub" };
@@ -91,7 +103,11 @@ export function createTimelineController(
   const container: HTMLElement = maybeContainer;
   const ctx: CanvasRenderingContext2D = maybeCtx;
 
-  const overlay: TimelineOverlay = { snapLineSec: null, dropPreview: null };
+  const overlay: TimelineOverlay = {
+    snapLineSec: null,
+    dropPreview: null,
+    invalidLaneIndex: null,
+  };
   let gesture: Gesture = { type: "idle" };
   let lastPointerX: number | null = null;
   let disposed = false;
@@ -143,8 +159,13 @@ export function createTimelineController(
 
   // --- Gesture command bodies ----------------------------------------
 
-  /** One transient move step; overlap rejections are expected mid-drag. */
-  async function applyMove(clipId: number, desiredIn: number): Promise<void> {
+  /** One transient move step (time and/or lane); overlap rejections are
+   * expected mid-drag. */
+  async function applyMove(
+    clipId: number,
+    desiredIn: number,
+    trackId: number,
+  ): Promise<void> {
     const { snapEnabled, playheadSec } = useProjectStore.getState();
     let target = desiredIn;
     let snapPoint: number | null = null;
@@ -159,12 +180,48 @@ export function createTimelineController(
       snapPoint = snapped.snapPoint;
     }
     try {
-      await engineMoveClip(clipId, target);
+      await engineMoveClipToTrack(clipId, trackId, target);
     } catch {
       // Would overlap a neighbor — the clip stays at its last valid spot.
     }
     overlay.snapLineSec = snapPoint;
     requestDraw();
+  }
+
+  /**
+   * Where a mid-drag pointer y would take the dragged clip: the hovered
+   * lane when it can accept it, otherwise the last valid lane plus which
+   * lane refused (locked, or the wrong kind) for the red tint + toast.
+   */
+  function resolveMoveLane(
+    canvasY: number,
+    clipId: number,
+    lastValid: number,
+  ): { trackId: number; invalidIndex: number | null; blockedName: string | null } {
+    const project = useProjectStore.getState().project;
+    if (!project) {
+      return { trackId: lastValid, invalidIndex: null, blockedName: null };
+    }
+    const current = project.tracks.find((t) =>
+      t.clips.some((c) => c.id === clipId),
+    );
+    const hoverIndex = laneIndexAtY(project.tracks, canvasYToContentY(canvasY));
+    if (current === undefined || hoverIndex === null) {
+      return { trackId: lastValid, invalidIndex: null, blockedName: null };
+    }
+    const hovered = project.tracks[hoverIndex];
+    if (hovered.id === current.id) {
+      return { trackId: hovered.id, invalidIndex: null, blockedName: null };
+    }
+    if (hovered.kind === current.kind && !hovered.locked) {
+      return { trackId: hovered.id, invalidIndex: null, blockedName: null };
+    }
+    // Locked or kind-incompatible lane: the clip stays where it is.
+    return {
+      trackId: lastValid,
+      invalidIndex: hoverIndex,
+      blockedName: hovered.locked ? hovered.name : null,
+    };
   }
 
   /** One transient trim step; the engine clamps to media/duration bounds. */
@@ -197,6 +254,7 @@ export function createTimelineController(
       if (finalStep) await finalStep();
       await engineCommitTransaction();
       overlay.snapLineSec = null;
+      overlay.invalidLaneIndex = null;
       requestDraw();
     });
   }
@@ -206,6 +264,7 @@ export function createTimelineController(
       coalesced = null;
       await engineRollbackTransaction();
       overlay.snapLineSec = null;
+      overlay.invalidLaneIndex = null;
       requestDraw();
     });
   }
@@ -214,15 +273,26 @@ export function createTimelineController(
   //
   // The media pool starts pointer drags (poolDrag.ts); this target turns
   // them into a live drop preview and, on release, one AddClip command.
-  // Track choice is by media kind — video files land on the video track
-  // (carrying their own audio via clip volume), audio files on the audio
-  // track. Only the drop X matters.
+  // Track choice is by media kind — video files land on video tracks
+  // (carrying their own audio via clip volume), audio files on audio
+  // tracks. The hovered lane wins when it matches and is unlocked;
+  // otherwise the first unlocked track of the kind takes the drop.
 
-  function dropTrack(media: DragMedia): { track: Track; index: number } | null {
+  function dropTrack(
+    media: DragMedia,
+    canvasY: number,
+  ): { track: Track; index: number } | null {
     const project = useProjectStore.getState().project;
     if (!project) return null;
     const kind = media.hasVideo ? "video" : "audio";
-    const index = project.tracks.findIndex((t) => t.kind === kind);
+    const hoverIndex = laneIndexAtY(project.tracks, canvasYToContentY(canvasY));
+    if (hoverIndex !== null) {
+      const hovered = project.tracks[hoverIndex];
+      if (hovered.kind === kind && !hovered.locked) {
+        return { track: hovered, index: hoverIndex };
+      }
+    }
+    const index = project.tracks.findIndex((t) => t.kind === kind && !t.locked);
     if (index < 0) return null;
     return { track: project.tracks[index], index };
   }
@@ -280,7 +350,7 @@ export function createTimelineController(
         clearDropPreview();
         return;
       }
-      const target = dropTrack(media);
+      const target = dropTrack(media, y);
       if (!target) return;
       coalesce(async () => {
         const { inSec, snapPoint } = await snappedDropIn(x, media);
@@ -302,7 +372,7 @@ export function createTimelineController(
         coalesced = null; // a stale preview update is superseded
         clearDropPreview();
         if (!inside) return;
-        const target = dropTrack(media);
+        const target = dropTrack(media, y);
         if (!target) return;
         const { inSec } = await snappedDropIn(x, media);
         try {
@@ -331,8 +401,8 @@ export function createTimelineController(
     const project = useProjectStore.getState().project;
     if (y < RULER_H) return { region: "ruler" };
     if (!project) return { region: "outside" };
-    const trackIndex = Math.floor((y - RULER_H) / TRACK_H);
-    if (trackIndex < 0 || trackIndex >= project.tracks.length) {
+    const trackIndex = laneIndexAtY(project.tracks, canvasYToContentY(y));
+    if (trackIndex === null) {
       return { region: "outside" };
     }
     const track = project.tracks[trackIndex];
@@ -350,6 +420,7 @@ export function createTimelineController(
 
   function cursorFor(hit: Hit): string {
     if (hit.region !== "lane" || !hit.clip) return "default";
+    if (hit.track.locked) return "not-allowed";
     return hit.zone === "body" ? "grab" : "ew-resize";
   }
 
@@ -407,6 +478,12 @@ export function createTimelineController(
       if (!store.selection.includes(hit.clip.id)) {
         store.setSelection([hit.clip.id]);
       }
+      // Selecting on a locked track is fine (inspect in the Inspector);
+      // dragging is not — don't even arm the gesture.
+      if (hit.track.locked) {
+        toast(`Track "${hit.track.name}" is locked — unlock it to edit.`);
+        return;
+      }
       gesture = {
         type: "pending",
         startX: x,
@@ -450,11 +527,17 @@ export function createTimelineController(
         const { clip, zone, grabOffsetSec } = gesture;
         enqueue(() => engineBeginTransaction());
         if (zone === "body") {
+          const project = useProjectStore.getState().project;
+          const homeTrack = project?.tracks.find((t) =>
+            t.clips.some((c) => c.id === clip.id),
+          );
           gesture = {
             type: "move",
             clipId: clip.id,
             grabOffsetSec,
             cancelled: false,
+            targetTrackId: homeTrack?.id ?? -1,
+            blockedLaneName: null,
           };
           canvas.style.cursor = "grabbing";
         } else {
@@ -468,9 +551,17 @@ export function createTimelineController(
         return;
       }
       case "move": {
-        const { clipId, grabOffsetSec } = gesture;
+        const { clipId, grabOffsetSec, targetTrackId } = gesture;
         const desiredIn = xToTime(x) - grabOffsetSec;
-        coalesce(() => applyMove(clipId, desiredIn));
+        const lane = resolveMoveLane(y, clipId, targetTrackId);
+        gesture.targetTrackId = lane.trackId;
+        gesture.blockedLaneName = lane.blockedName;
+        if (overlay.invalidLaneIndex !== lane.invalidIndex) {
+          overlay.invalidLaneIndex = lane.invalidIndex;
+          requestDraw();
+        }
+        const trackId = lane.trackId;
+        coalesce(() => applyMove(clipId, desiredIn, trackId));
         return;
       }
       case "trim": {
@@ -493,13 +584,20 @@ export function createTimelineController(
   }
 
   function onPointerUp(e: PointerEvent): void {
-    const { x } = canvasPos(e);
+    const { x, y } = canvasPos(e);
     switch (gesture.type) {
       case "move": {
-        const { clipId, grabOffsetSec, cancelled } = gesture;
+        const { clipId, grabOffsetSec, cancelled, targetTrackId } = gesture;
         if (!cancelled) {
           const desiredIn = xToTime(x) - grabOffsetSec;
-          finishGesture(() => applyMove(clipId, desiredIn));
+          const lane = resolveMoveLane(y, clipId, targetTrackId);
+          if (lane.blockedName !== null) {
+            toast(
+              `Track "${lane.blockedName}" is locked — the clip stays put.`,
+              "error",
+            );
+          }
+          finishGesture(() => applyMove(clipId, desiredIn, lane.trackId));
         }
         break;
       }
@@ -532,6 +630,10 @@ export function createTimelineController(
     if (e.ctrlKey || e.metaKey) {
       // Zoom around the cursor; deltaY < 0 (scroll up / pinch out) zooms in.
       zoomBy(Math.exp(-e.deltaY * 0.0015), x);
+    } else if (e.altKey) {
+      // Alt+wheel scrolls the track lanes vertically (the header column
+      // also scrolls on plain wheel).
+      scrollTracksBy(e.deltaY);
     } else {
       // Plain and Shift+wheel both pan horizontally.
       const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY;
@@ -652,6 +754,7 @@ export function createTimelineController(
     const width = container.clientWidth;
     const height = container.clientHeight;
     view.widthPx = width;
+    view.heightPx = height;
     const deviceW = Math.max(1, Math.round(width * dpr));
     const deviceH = Math.max(1, Math.round(height * dpr));
     if (canvas.width !== deviceW || canvas.height !== deviceH) {

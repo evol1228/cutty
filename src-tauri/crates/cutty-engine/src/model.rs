@@ -195,13 +195,37 @@ pub struct Track {
     pub id: TrackId,
     pub kind: TrackKind,
     pub name: String,
+    /// Rejects edits: every clip mutation targeting this track fails with
+    /// [`EngineError::TrackLocked`]. Enforced at the engine's public
+    /// operations, not in `Command::apply` — undo/redo must be able to
+    /// restore state on a locked track.
     pub locked: bool,
-    /// For audio tracks: silenced. For video tracks: hidden.
+    /// Audio silenced. Applies to audio tracks and to the embedded audio
+    /// of clips on video tracks; it never affects the picture.
     pub muted: bool,
+    /// Excluded from the video composite (preview and export take the
+    /// same `resolve_video_layers` path, so both respect it). Meaningful
+    /// on video tracks only. Additive schema field: pre-Phase 2 files
+    /// load as `false`.
+    #[serde(default)]
+    pub hidden: bool,
     pub clips: Vec<Clip>,
 }
 
 impl Track {
+    /// An empty, unlocked, audible, visible track.
+    pub fn new(id: TrackId, kind: TrackKind, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind,
+            name: name.into(),
+            locked: false,
+            muted: false,
+            hidden: false,
+            clips: Vec::new(),
+        }
+    }
+
     /// Look up a clip by id.
     pub fn clip(&self, id: ClipId) -> Option<&Clip> {
         self.clips.iter().find(|c| c.id == id)
@@ -241,22 +265,8 @@ impl Project {
             settings,
             media: Vec::new(),
             tracks: vec![
-                Track {
-                    id: video_track,
-                    kind: TrackKind::Video,
-                    name: "V1".to_string(),
-                    locked: false,
-                    muted: false,
-                    clips: Vec::new(),
-                },
-                Track {
-                    id: audio_track,
-                    kind: TrackKind::Audio,
-                    name: "A1".to_string(),
-                    locked: false,
-                    muted: false,
-                    clips: Vec::new(),
-                },
+                Track::new(video_track, TrackKind::Video, "V1"),
+                Track::new(audio_track, TrackKind::Audio, "A1"),
             ],
         }
     }
@@ -406,6 +416,15 @@ impl Project {
                     value,
                 });
             }
+        }
+        // Zero/negative scale would collapse or mirror the quad — no UI
+        // produces it, so it's a model violation rather than a clamp.
+        if t.scale <= 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip.id,
+                property: "transform.scale",
+                value: t.scale,
+            });
         }
         Ok(())
     }

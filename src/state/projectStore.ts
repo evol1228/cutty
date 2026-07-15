@@ -18,6 +18,9 @@ interface ProjectState {
   snapEnabled: boolean;
   /** Timeline zoom, CSS pixels per second (mirrored by the canvas view). */
   pxPerSec: number;
+  /** Vertical track scroll, CSS pixels (mirrored by the canvas view; the
+   * React header column translates by this). */
+  trackScrollPx: number;
 
   applySnapshot: (snapshot: EngineSnapshot) => void;
   setSelection: (ids: number[]) => void;
@@ -25,6 +28,7 @@ interface ProjectState {
   setPlayhead: (sec: number) => void;
   setSnapEnabled: (enabled: boolean) => void;
   setPxPerSec: (pxPerSec: number) => void;
+  setTrackScrollPx: (px: number) => void;
 }
 
 export const useProjectStore = create<ProjectState>((set) => ({
@@ -35,6 +39,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
   playheadSec: 0,
   snapEnabled: true,
   pxPerSec: 60,
+  trackScrollPx: 0,
 
   applySnapshot: (snapshot) =>
     set((state) => {
@@ -65,4 +70,5 @@ export const useProjectStore = create<ProjectState>((set) => ({
     set({ playheadSec: Math.max(0, playheadSec) }),
   setSnapEnabled: (snapEnabled) => set({ snapEnabled }),
   setPxPerSec: (pxPerSec) => set({ pxPerSec }),
+  setTrackScrollPx: (trackScrollPx) => set({ trackScrollPx }),
 }));
