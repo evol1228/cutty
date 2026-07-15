@@ -82,7 +82,9 @@ fn list_encoders() -> Vec<String> {
         .stdin(Stdio::null())
         .output();
     match output {
-        Ok(out) if out.status.success() => parse_encoder_list(&String::from_utf8_lossy(&out.stdout)),
+        Ok(out) if out.status.success() => {
+            parse_encoder_list(&String::from_utf8_lossy(&out.stdout))
+        }
         _ => Vec::new(),
     }
 }
@@ -149,7 +151,10 @@ fn detect() -> H264Encoder {
         }
     }
     if has("h264_nvenc") && probe_encoder(&H264Encoder::Nvenc) {
-        eprintln!("cutty-media: export encoder: {}", H264Encoder::Nvenc.label());
+        eprintln!(
+            "cutty-media: export encoder: {}",
+            H264Encoder::Nvenc.label()
+        );
         return H264Encoder::Nvenc;
     }
     // Silent fallback per the plan: libx264 always works where ffmpeg does.

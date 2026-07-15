@@ -8,7 +8,10 @@
 //! (proxies are `-g 30`), landing well under the budget.
 //!
 //! Decoding and pixel conversion happen here; everything downstream
-//! (compositing, JPEG) reads the RGB frame zero-copy via [`FrameView`].
+//! (compositing, JPEG) reads the RGBA frame zero-copy via [`FrameView`].
+//! Output is RGBA (not RGB) because the compositor uploads frames as
+//! `Rgba8Unorm` textures — the alpha channel costs nothing extra in
+//! swscale and saves a repack on the GPU upload path.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -45,14 +48,15 @@ fn ff_err(path: &Path, context: &str, e: ffmpeg::Error) -> MediaError {
     }
 }
 
-/// A decoded RGB24 frame, borrowed from the decoder's reusable buffer.
-/// Valid until the next decoder call.
+/// A decoded RGBA frame, borrowed from the decoder's reusable buffer.
+/// Valid until the next decoder call. Alpha is always 255 for video
+/// sources.
 pub struct FrameView<'a> {
     /// Presentation time within the source, seconds.
     pub pts_sec: f64,
     pub width: u32,
     pub height: u32,
-    /// Bytes per row (≥ `width * 3`; libav aligns rows).
+    /// Bytes per row (≥ `width * 4`; libav aligns rows).
     pub stride: usize,
     pub data: &'a [u8],
 }
@@ -78,9 +82,9 @@ pub struct SourceDecoder {
     /// (including `Eof`), so successful frames are swapped into
     /// `decoded` to survive the drain.
     incoming: ffmpeg::frame::Video,
-    /// Last successfully decoded frame + reusable RGB conversion target.
+    /// Last successfully decoded frame + reusable RGBA conversion target.
     decoded: ffmpeg::frame::Video,
-    rgb: ffmpeg::frame::Video,
+    rgba: ffmpeg::frame::Video,
     /// End-of-file was signalled to the decoder (drain mode).
     eof_sent: bool,
     /// The decoder is fully drained; only a seek revives the session.
@@ -150,7 +154,7 @@ impl SourceDecoder {
             decoder.format(),
             width,
             height,
-            Pixel::RGB24,
+            Pixel::RGBA,
             width,
             height,
             scaling::Flags::BILINEAR,
@@ -169,7 +173,7 @@ impl SourceDecoder {
             height,
             incoming: ffmpeg::frame::Video::empty(),
             decoded: ffmpeg::frame::Video::empty(),
-            rgb: ffmpeg::frame::Video::empty(),
+            rgba: ffmpeg::frame::Video::empty(),
             eof_sent: false,
             exhausted: false,
             has_decoded: false,
@@ -258,18 +262,40 @@ impl SourceDecoder {
         self.decoded.timestamp().or(self.decoded.pts()).unwrap_or(0) as f64 * self.tb
     }
 
-    /// Convert the current decoded frame to RGB and hand out a view.
+    /// Convert the current decoded frame to RGBA and hand out a view.
     fn view(&mut self) -> Result<FrameView<'_>, MediaError> {
         self.scaler
-            .run(&self.decoded, &mut self.rgb)
-            .map_err(|e| ff_err(&self.path, "converting to RGB", e))?;
+            .run(&self.decoded, &mut self.rgba)
+            .map_err(|e| ff_err(&self.path, "converting to RGBA", e))?;
         Ok(FrameView {
             pts_sec: self.current_pts(),
             width: self.width,
             height: self.height,
-            stride: self.rgb.stride(0),
-            data: self.rgb.data(0),
+            stride: self.rgba.stride(0),
+            data: self.rgba.data(0),
         })
+    }
+
+    /// Presentation time of the frame currently held in the decode
+    /// buffer, if any frame has been decoded since open/seek.
+    pub fn current_pts_sec(&self) -> Option<f64> {
+        self.has_decoded.then(|| self.current_pts())
+    }
+
+    /// Whether the stream has been fully drained (only a seek revives it).
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Re-view the currently held frame without advancing the stream —
+    /// used when a prefetched decoder (positioned on its first frame) is
+    /// installed and that frame must be uploaded. `None` if nothing has
+    /// been decoded yet.
+    pub fn current_frame(&mut self) -> Result<Option<FrameView<'_>>, MediaError> {
+        if !self.has_decoded {
+            return Ok(None);
+        }
+        self.view().map(Some)
     }
 
     /// Decode and return the next frame in stream order. `Ok(None)` = end
@@ -354,7 +380,7 @@ mod tests {
         let mut last = f64::NEG_INFINITY;
         while let Some(frame) = dec.next_frame().unwrap() {
             assert!(frame.pts_sec > last, "pts must increase");
-            assert!(frame.stride >= 320 * 3);
+            assert!(frame.stride >= 320 * 4);
             assert_eq!(frame.data.len(), frame.stride * 180);
             last = frame.pts_sec;
             count += 1;

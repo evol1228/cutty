@@ -50,6 +50,26 @@ impl JpegEncoder {
         };
         self.compressor.compress_to_vec(image).map_err(jpeg_err)
     }
+
+    /// Compress an rgba buffer whose rows are `pitch` bytes apart (both
+    /// decoded frames and GPU readbacks are RGBA with row padding; alpha
+    /// is ignored by the encoder).
+    pub fn encode_rgba_strided(
+        &mut self,
+        width: u32,
+        height: u32,
+        pitch: usize,
+        rgba: &[u8],
+    ) -> Result<Vec<u8>, MediaError> {
+        let image = turbojpeg::Image {
+            pixels: rgba,
+            width: width as usize,
+            pitch,
+            height: height as usize,
+            format: turbojpeg::PixelFormat::RGBA,
+        };
+        self.compressor.compress_to_vec(image).map_err(jpeg_err)
+    }
 }
 
 fn jpeg_err(e: turbojpeg::Error) -> MediaError {

@@ -133,20 +133,51 @@ fn rms(samples: &[f32], rate: u32, from_sec: f64, to_sec: f64) -> f64 {
     let e = ((to_sec * f64::from(rate)) as usize * 2).min(samples.len());
     assert!(e > s, "window [{from_sec}, {to_sec}] out of range");
     let win = &samples[s..e];
-    (win.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>() / win.len() as f64).sqrt()
+    (win.iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        / win.len() as f64)
+        .sqrt()
 }
 
 /// Mean RGB value (0–255) of the exported frame at `t`, decoded with the
-/// app's own decoder.
+/// app's own decoder (RGBA frames — alpha is skipped).
 fn mean_luma_at(path: &Path, t: f64) -> f64 {
     let mut dec = SourceDecoder::open(path).expect("open exported video");
     let frame = dec.seek_to(t).expect("seek").expect("frame");
     let mut sum = 0u64;
     let mut count = 0u64;
     for row in 0..frame.height as usize {
-        let line = &frame.data[row * frame.stride..row * frame.stride + frame.width as usize * 3];
-        sum += line.iter().map(|&b| u64::from(b)).sum::<u64>();
-        count += line.len() as u64;
+        let line = &frame.data[row * frame.stride..row * frame.stride + frame.width as usize * 4];
+        for px in line.chunks_exact(4) {
+            sum += u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]);
+            count += 3;
+        }
+    }
+    sum as f64 / count as f64
+}
+
+/// Mean RGB inside a centered box covering `frac` of each dimension.
+fn mean_luma_in_center(path: &Path, t: f64, frac: f64) -> f64 {
+    let mut dec = SourceDecoder::open(path).expect("open exported video");
+    let frame = dec.seek_to(t).expect("seek").expect("frame");
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let (x0, x1) = (
+        (w as f64 * (0.5 - frac / 2.0)) as usize,
+        (w as f64 * (0.5 + frac / 2.0)) as usize,
+    );
+    let (y0, y1) = (
+        (h as f64 * (0.5 - frac / 2.0)) as usize,
+        (h as f64 * (0.5 + frac / 2.0)) as usize,
+    );
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for row in y0..y1 {
+        let line = &frame.data[row * frame.stride..row * frame.stride + w * 4];
+        for px in line[x0 * 4..x1 * 4].chunks_exact(4) {
+            sum += u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]);
+            count += 3;
+        }
     }
     sum as f64 / count as f64
 }
@@ -269,13 +300,18 @@ fn export_mixed_sources_end_to_end() {
     .expect("export succeeds");
 
     println!(
-        "exported {} via {} (hardware: {})",
+        "exported {} via {} (hardware: {}, renderer: {})",
         summary.path.display(),
         summary.encoder,
-        summary.hardware_encode
+        summary.hardware_encode,
+        summary.renderer
     );
     assert_eq!(summary.path, dst);
     assert!((summary.duration_sec - 3.0).abs() < 1e-9);
+    assert_eq!(
+        summary.renderer, "segment-concat",
+        "a plain single-track timeline must take the fast path"
+    );
     assert!(stages.contains(&ExportStage::Audio));
     assert!(stages.contains(&ExportStage::Video));
     assert!(stages.contains(&ExportStage::Finalize));
@@ -344,6 +380,137 @@ fn export_mixed_sources_end_to_end() {
         !dst.with_extension("mp4.part").exists(),
         "no .part litter next to the output"
     );
+}
+
+/// The compositor path end-to-end: a second video track with a
+/// transformed, half-opacity overlay forces the GPU pipeline, which must
+/// produce a correct container (duration/fps/resolution/frame count),
+/// video where the overlay is visibly composited, and the same audio mix
+/// structure as the fast path.
+#[test]
+fn export_composited_timeline_end_to_end() {
+    let _guard = serial();
+
+    // Base: dark-ish testsrc2. Overlay: white frames scaled to the
+    // center at 50% opacity → the center of the composite brightens.
+    let src_base = make_clip("export-comp-base.mp4", "640x360", 30, 3, 440);
+    let src_overlay = {
+        let file = test_dir().join("export-comp-overlay.mp4");
+        if !file.is_file() {
+            let status = Command::new(ffmpeg_path())
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("color=c=white:size=320x180:rate=30:duration=3")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
+                .arg(&file)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        file
+    };
+
+    let mut engine = Engine::new(ProjectSettings::default());
+    let base = add_media(&mut engine, &src_base);
+    let overlay = add_media(&mut engine, &src_overlay);
+    let tracks = track_ids(&engine);
+    engine.add_clip(tracks.video, base, 0.0, 0.0, 2.0).unwrap();
+
+    // Second video track above the base, with a transformed overlay —
+    // multi-track construction is manual until the AddTrack command
+    // lands (Phase 2, later prompt).
+    let mut project = engine.project().clone();
+    project.tracks.insert(
+        0,
+        cutty_engine::Track {
+            id: cutty_engine::TrackId(500),
+            kind: TrackKind::Video,
+            name: "V2".into(),
+            locked: false,
+            muted: false,
+            clips: vec![cutty_engine::Clip {
+                id: cutty_engine::ClipId(501),
+                media_id: overlay,
+                timeline_in: 0.5,
+                timeline_out: 1.5,
+                source_in: 0.0,
+                source_out: 1.0,
+                transform: cutty_engine::Transform {
+                    x: 0.0,
+                    y: 0.0,
+                    scale: 0.4,
+                    rotation: 0.0,
+                },
+                opacity: 0.5,
+                blend_mode: cutty_engine::BlendMode::Normal,
+                speed: 1.0,
+                volume: 1.0,
+            }],
+        },
+    );
+    project.validate().expect("fixture is valid");
+
+    let dst = test_dir().join("export-comp-out.mp4");
+    let _ = std::fs::remove_file(&dst);
+    let spec = ExportSpec {
+        width: 1280,
+        height: 720,
+        fps: 30.0,
+        quality: ExportQuality::Medium,
+        dst: dst.clone(),
+    };
+    let cancel = CancelToken::new();
+    let mut stages = Vec::new();
+    let summary = run_export(&project, &spec, &cancel, &mut |p| {
+        stages.push(p.stage);
+        assert!((0.0..=100.0).contains(&p.percent));
+    })
+    .expect("compositor export succeeds");
+
+    assert_eq!(
+        summary.renderer, "gpu-compositor",
+        "transforms/opacity/multi-track must take the compositor path"
+    );
+    assert!(stages.contains(&ExportStage::Audio));
+    assert!(stages.contains(&ExportStage::Video));
+    assert!(stages.contains(&ExportStage::Finalize));
+
+    // Container shape.
+    let info = ffprobe_json(&dst);
+    let duration: f64 = info["format"]["duration"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((duration - 2.0).abs() < 0.05, "duration {duration} ≠ 2.0");
+    let streams = info["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .expect("video stream");
+    assert_eq!(video["codec_name"], "h264");
+    assert_eq!(video["width"], 1280);
+    assert_eq!(video["height"], 720);
+    assert_eq!(video["r_frame_rate"], "30/1");
+    let frames: u64 = video["nb_read_frames"].as_str().unwrap().parse().unwrap();
+    assert_eq!(frames, 60, "exactly 2.0s × 30fps frames");
+    assert!(
+        streams.iter().any(|s| s["codec_type"] == "audio"),
+        "audio mix must be muxed in"
+    );
+
+    // Picture: during the overlay window the center is brighter than the
+    // same region before the overlay starts (white at 50% over the base).
+    let before = mean_luma_in_center(&dst, 0.25, 0.3);
+    let during = mean_luma_in_center(&dst, 1.0, 0.3);
+    println!("center luma before overlay {before:.1} | during {during:.1}");
+    assert!(
+        during > before + 25.0,
+        "overlay must brighten the center (before {before:.1}, during {during:.1})"
+    );
+
+    // Hygiene.
+    assert!(our_ffmpeg_children().is_empty(), "no ffmpeg left behind");
+    assert!(!dst.with_extension("mp4.part").exists());
 }
 
 /// Cancel mid-encode: the export returns `ExportCancelled` promptly, the

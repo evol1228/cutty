@@ -114,7 +114,12 @@ pub fn export_start(
         }
     }
 
-    let project = engine.0.lock().expect("engine state poisoned").project().clone();
+    let project = engine
+        .0
+        .lock()
+        .expect("engine state poisoned")
+        .project()
+        .clone();
     let spec = ExportSpec {
         width: request.width,
         height: request.height,

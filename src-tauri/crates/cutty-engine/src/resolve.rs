@@ -13,14 +13,17 @@ pub struct ActiveClip {
     pub source_time: f64,
 }
 
-/// Resolve timeline time `t` to the set of active clips, in project track
-/// order (top video track first).
+/// Resolve timeline time `t` to the set of active clips (at most one per
+/// track), in project track order (index 0 first).
 ///
 /// Clip ranges are half-open `[timeline_in, timeline_out)`, so at an exact
 /// cut point between two adjacent clips only the *right* clip is active —
 /// a frame request at the cut shows the incoming clip, and the end of the
-/// timeline resolves to nothing. Muted tracks are skipped (muted means
-/// hidden for video tracks, silent for audio tracks).
+/// timeline resolves to nothing. Adjacent clips may overlap by float dust
+/// (within the model's `EPS` "touching" tolerance); the **incoming** clip
+/// wins there too, which is why matching scans from the back of the
+/// sorted clip list. Muted tracks are skipped (muted means hidden for
+/// video tracks, silent for audio tracks).
 pub fn resolve(project: &Project, t: f64) -> Vec<ActiveClip> {
     if !t.is_finite() {
         return Vec::new();
@@ -29,11 +32,11 @@ pub fn resolve(project: &Project, t: f64) -> Vec<ActiveClip> {
         .tracks
         .iter()
         .filter(|track| !track.muted)
-        .flat_map(|track| {
+        .filter_map(|track| {
             track
                 .clips
                 .iter()
-                .filter(|clip| clip.timeline_in <= t && t < clip.timeline_out)
+                .rfind(|clip| clip.timeline_in <= t && t < clip.timeline_out)
                 .map(|clip| ActiveClip {
                     track_id: track.id,
                     clip_id: clip.id,
@@ -43,27 +46,40 @@ pub fn resolve(project: &Project, t: f64) -> Vec<ActiveClip> {
         .collect()
 }
 
-/// The clip the player shows at time `t`: the first hit in track order
-/// (top video track wins), `None` in gaps and past the end.
-pub fn active_video_clip(project: &Project, t: f64) -> Option<ActiveClip> {
+/// The video layer stack at time `t`, in **compositing order: bottom
+/// layer first**. Tracks are stored in visual order (index 0 = top of the
+/// timeline panel), so this walks video tracks in reverse — the last
+/// video track is the base layer, earlier tracks paint over it. Muted
+/// (hidden) tracks are skipped; gaps contribute nothing. Empty in gaps
+/// across all tracks and past the end.
+///
+/// Both render frontends (preview and export) consume exactly this — the
+/// output frame at `t` is defined as these layers composited bottom→top
+/// over black.
+pub fn resolve_video_layers(project: &Project, t: f64) -> Vec<ActiveClip> {
     if !t.is_finite() {
-        return None;
+        return Vec::new();
     }
     project
         .tracks
         .iter()
+        .rev()
         .filter(|track| track.kind == TrackKind::Video && !track.muted)
-        .find_map(|track| {
+        .filter_map(|track| {
+            // `rfind`: at a cut instant (including float-dust overlaps
+            // inside the model's touching tolerance) the incoming clip
+            // wins — see `resolve`.
             track
                 .clips
                 .iter()
-                .find(|clip| clip.timeline_in <= t && t < clip.timeline_out)
+                .rfind(|clip| clip.timeline_in <= t && t < clip.timeline_out)
                 .map(|clip| ActiveClip {
                     track_id: track.id,
                     clip_id: clip.id,
                     source_time: clip.source_in + (t - clip.timeline_in) * clip.speed,
                 })
         })
+        .collect()
 }
 
 /// End of the timeline: the latest `timeline_out` across all tracks

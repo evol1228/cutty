@@ -1,10 +1,11 @@
 //! LRU-ish cache of encoded preview frames.
 //!
-//! Keyed by `(media id, source frame index)` — source-relative, so cached
-//! frames stay valid across timeline edits and serve any clip that shows
-//! the same source content. Seeks into visited content come from here in
-//! well under a millisecond; cold seeks pay the in-process decode cost
-//! (tens of ms).
+//! Keyed by **output frame index** on the project's frame grid. A cached
+//! frame is the fully composited output (all layers, transforms, blends),
+//! so any project mutation invalidates the lot — the player clears the
+//! cache on every project snapshot/refresh. Within an editing pause,
+//! scrubbing back into visited frames comes from here in well under a
+//! millisecond; cold frames pay the decode + composite cost (tens of ms).
 //!
 //! Eviction is insertion-ordered (oldest decoded first), which for video
 //! playback approximates LRU: the most recently played region stays hot.
@@ -17,14 +18,12 @@ use std::collections::{HashMap, VecDeque};
 /// idle-RAM budget alongside decode buffers.
 pub const DEFAULT_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cache key: (media id, source frame index).
-pub type FrameKey = (u64, i64);
+/// Cache key: output frame index (`floor(t * project_fps)`).
+pub type FrameKey = i64;
 
-/// A cached, encoded frame.
+/// A cached, encoded output frame.
 #[derive(Clone)]
 pub struct CachedFrame {
-    /// Presentation time within the *source*, seconds.
-    pub source_pts_sec: f64,
     pub width: u32,
     pub height: u32,
     pub jpeg: Vec<u8>,
@@ -71,6 +70,14 @@ impl FrameCache {
         }
     }
 
+    /// Drop everything (the project changed — every composited frame is
+    /// stale).
+    pub fn clear(&mut self) {
+        self.frames.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
@@ -90,7 +97,6 @@ mod tests {
 
     fn frame(bytes: usize) -> CachedFrame {
         CachedFrame {
-            source_pts_sec: 0.0,
             width: 2,
             height: 2,
             jpeg: vec![0u8; bytes],
@@ -98,24 +104,23 @@ mod tests {
     }
 
     #[test]
-    fn stores_and_returns_frames_per_media() {
+    fn stores_and_returns_frames_by_index() {
         let mut c = FrameCache::new(1000);
-        c.insert((1, 5), frame(100));
-        assert!(c.get((1, 5)).is_some());
-        assert!(c.get((1, 6)).is_none());
-        assert!(c.get((2, 5)).is_none(), "media id is part of the key");
+        c.insert(5, frame(100));
+        assert!(c.get(5).is_some());
+        assert!(c.get(6).is_none());
         assert_eq!(c.bytes(), 100);
     }
 
     #[test]
     fn evicts_oldest_when_over_budget() {
         let mut c = FrameCache::new(250);
-        c.insert((1, 1), frame(100));
-        c.insert((1, 2), frame(100));
-        c.insert((1, 3), frame(100)); // 300 > 250: evict frame 1
-        assert!(c.get((1, 1)).is_none());
-        assert!(c.get((1, 2)).is_some());
-        assert!(c.get((1, 3)).is_some());
+        c.insert(1, frame(100));
+        c.insert(2, frame(100));
+        c.insert(3, frame(100)); // 300 > 250: evict frame 1
+        assert!(c.get(1).is_none());
+        assert!(c.get(2).is_some());
+        assert!(c.get(3).is_some());
         assert_eq!(c.bytes(), 200);
         assert_eq!(c.len(), 2);
     }
@@ -123,8 +128,8 @@ mod tests {
     #[test]
     fn reinserting_a_frame_replaces_it_without_leaking_bytes() {
         let mut c = FrameCache::new(1000);
-        c.insert((1, 1), frame(100));
-        c.insert((1, 1), frame(300));
+        c.insert(1, frame(100));
+        c.insert(1, frame(300));
         assert_eq!(c.bytes(), 300);
         assert_eq!(c.len(), 1);
     }
@@ -132,11 +137,22 @@ mod tests {
     #[test]
     fn oversized_single_frame_does_not_wedge_the_cache() {
         let mut c = FrameCache::new(50);
-        c.insert((1, 1), frame(100)); // bigger than the whole budget
+        c.insert(1, frame(100)); // bigger than the whole budget
         assert!(c.is_empty());
         assert_eq!(c.bytes(), 0);
         // And the cache still works afterwards.
-        c.insert((1, 2), frame(40));
-        assert!(c.get((1, 2)).is_some());
+        c.insert(2, frame(40));
+        assert!(c.get(2).is_some());
+    }
+
+    #[test]
+    fn clear_empties_everything() {
+        let mut c = FrameCache::new(1000);
+        c.insert(1, frame(100));
+        c.insert(2, frame(100));
+        c.clear();
+        assert!(c.is_empty());
+        assert_eq!(c.bytes(), 0);
+        assert!(c.get(1).is_none());
     }
 }

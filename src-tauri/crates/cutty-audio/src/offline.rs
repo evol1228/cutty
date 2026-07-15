@@ -65,7 +65,15 @@ pub(crate) fn render_timeline_to_wav_with(
     on_progress: &mut dyn FnMut(u64, u64),
     open: crate::mixer::OpenSource<'_>,
 ) -> Result<(), AudioError> {
-    let result = write_wav(timeline, out_rate, total_frames, dst, cancel, on_progress, open);
+    let result = write_wav(
+        timeline,
+        out_rate,
+        total_frames,
+        dst,
+        cancel,
+        on_progress,
+        open,
+    );
     if result.is_err() {
         let _ = std::fs::remove_file(dst);
     }

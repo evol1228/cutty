@@ -58,7 +58,10 @@ fn screen_recording() -> PathBuf {
 }
 
 fn music_bed() -> PathBuf {
-    let path = env_path("CUTTY_MUSIC", "/home/love/Videos/cutty-test-media/music-bed.mp3");
+    let path = env_path(
+        "CUTTY_MUSIC",
+        "/home/love/Videos/cutty-test-media/music-bed.mp3",
+    );
     assert!(path.is_file(), "missing music bed {}", path.display());
     path
 }
@@ -105,7 +108,10 @@ fn rms_envelope(samples: &[f32], rate: u32, bin_secs: f64) -> Vec<f64> {
     samples
         .chunks(bin_frames * 2)
         .map(|bin| {
-            (bin.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / bin.len() as f64)
+            (bin.iter()
+                .map(|&s| f64::from(s) * f64::from(s))
+                .sum::<f64>()
+                / bin.len() as f64)
                 .sqrt()
         })
         .collect()
@@ -121,7 +127,9 @@ fn our_ffmpeg_children() -> Vec<u32> {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        let Some(close) = stat.rfind(')') else { continue };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
         let comm = &stat[stat.find('(').map(|i| i + 1).unwrap_or(0)..close];
         let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
         let ppid: u32 = rest.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -205,12 +213,8 @@ fn build_short(recording: &Path, music: &Path) -> cutty_engine::Project {
             .unwrap();
     }
     // Music bed (30 s file) looped twice across the short, ducked to 0.5.
-    let m1 = engine
-        .add_clip(audio_track, mus, 0.0, 0.0, 29.9)
-        .unwrap();
-    let m2 = engine
-        .add_clip(audio_track, mus, 29.9, 0.0, 29.9)
-        .unwrap();
+    let m1 = engine.add_clip(audio_track, mus, 0.0, 0.0, 29.9).unwrap();
+    let m2 = engine.add_clip(audio_track, mus, 29.9, 0.0, 29.9).unwrap();
     engine.set_clip_volume(m1, 0.5).unwrap();
     engine.set_clip_volume(m2, 0.5).unwrap();
 
@@ -249,6 +253,150 @@ fn preview_mix_timeline(project: &cutty_engine::Project) -> MixerTimeline {
         }
     }
     MixerTimeline { segments }
+}
+
+/// Phase 2 acceptance: a 3-video-track project (opacity + transforms)
+/// exports correctly through the GPU compositor at 1080p and 4K.
+/// 1080p must hold the ≥1×-realtime budget when hardware encode is
+/// available; readback throughput is printed for the session summary.
+#[test]
+#[ignore = "heavy: full compositor exports at 1080p and 4K; run with --ignored"]
+fn phase2_compositor_export_acceptance() {
+    let recording = screen_recording();
+    let rec_info = probe(&recording).expect("probe recording");
+
+    const LEN: f64 = 20.0;
+    let mut engine = Engine::new(ProjectSettings::default());
+    let rec = engine
+        .add_media(
+            recording.display().to_string(),
+            rec_info.duration_sec,
+            true,
+            rec_info.audio.is_some(),
+        )
+        .unwrap();
+    let video_track = engine
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .unwrap()
+        .id;
+    engine
+        .add_clip(video_track, rec, 0.0, 30.0, 30.0 + LEN)
+        .unwrap();
+
+    // Two overlay tracks: the same recording at different offsets,
+    // scaled/positioned/rotated with opacity — a picture-in-picture stack.
+    let mut project = engine.project().clone();
+    let overlay = |track_id: u64,
+                   clip_id: u64,
+                   source_in: f64,
+                   x: f64,
+                   y: f64,
+                   scale: f64,
+                   rotation: f64,
+                   opacity: f64| {
+        cutty_engine::Track {
+            id: cutty_engine::TrackId(track_id),
+            kind: TrackKind::Video,
+            name: format!("V{track_id}"),
+            locked: false,
+            muted: false,
+            clips: vec![cutty_engine::Clip {
+                id: cutty_engine::ClipId(clip_id),
+                media_id: rec,
+                timeline_in: 0.0,
+                timeline_out: LEN,
+                source_in,
+                source_out: source_in + LEN,
+                transform: cutty_engine::Transform {
+                    x,
+                    y,
+                    scale,
+                    rotation,
+                },
+                opacity,
+                blend_mode: cutty_engine::BlendMode::Normal,
+                speed: 1.0,
+                volume: 0.0,
+            }],
+        }
+    };
+    project
+        .tracks
+        .insert(0, overlay(700, 701, 120.0, -480.0, -270.0, 0.3, 0.0, 0.85));
+    project
+        .tracks
+        .insert(0, overlay(702, 703, 240.0, 480.0, 270.0, 0.25, 12.0, 0.6));
+    project.validate().expect("fixture is valid");
+
+    for (label, w, h, realtime_gate) in
+        [("1080p", 1920u32, 1080u32, true), ("4K", 3840, 2160, false)]
+    {
+        let dst = std::env::temp_dir().join(format!("cutty-media-tests/phase2-{label}.mp4"));
+        let _ = std::fs::remove_file(&dst);
+        let spec = ExportSpec {
+            width: w,
+            height: h,
+            fps: FPS,
+            quality: ExportQuality::Medium,
+            dst: dst.clone(),
+        };
+        let cancel = CancelToken::new();
+        let t0 = Instant::now();
+        let summary = run_export(&project, &spec, &cancel, &mut |_| {}).expect("compositor export");
+        let wall = t0.elapsed();
+        let speed = LEN / wall.as_secs_f64();
+        println!(
+            "{label}: {wall:.1?} for {LEN:.0}s ({speed:.2}x realtime) via {} — renderer {}",
+            summary.encoder, summary.renderer
+        );
+        assert_eq!(summary.renderer, "gpu-compositor");
+        if realtime_gate && summary.hardware_encode {
+            assert!(
+                speed >= 1.0,
+                "{label} compositor export below realtime: {speed:.2}x"
+            );
+        }
+
+        let info = ffprobe_json(&dst);
+        let duration: f64 = info["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((duration - LEN).abs() < 0.05, "{label} duration {duration}");
+        let streams = info["streams"].as_array().unwrap();
+        let video = streams
+            .iter()
+            .find(|s| s["codec_type"] == "video")
+            .expect("video stream");
+        assert_eq!(video["width"], w);
+        assert_eq!(video["height"], h);
+        assert_eq!(video["r_frame_rate"], "30/1");
+        let frames: u64 = video["nb_read_frames"].as_str().unwrap().parse().unwrap();
+        assert_eq!(frames, (LEN * FPS) as u64, "{label} exact frame count");
+        assert!(
+            streams.iter().any(|s| s["codec_type"] == "audio"),
+            "{label} audio muxed"
+        );
+
+        // Plays in a real player.
+        let mpv = Command::new("mpv")
+            .args([
+                "--no-config",
+                "--ao=null",
+                "--vo=null",
+                "--frames=30",
+                "--quiet",
+            ])
+            .arg(&dst)
+            .output()
+            .expect("mpv must be installed for acceptance");
+        assert!(mpv.status.success(), "{label}: mpv failed to decode");
+    }
+    assert!(our_ffmpeg_children().is_empty(), "no ffmpeg left behind");
 }
 
 #[test]
@@ -369,8 +517,7 @@ fn phase1_export_acceptance() {
             worst_bin = i;
         }
     }
-    let mean_level =
-        env_preview.iter().sum::<f64>() / env_preview.len() as f64;
+    let mean_level = env_preview.iter().sum::<f64>() / env_preview.len() as f64;
     println!(
         "mix comparison: mean level {mean_level:.4}, worst bin diff {worst:.4} at {:.2}s",
         worst_bin as f64 * 0.05
@@ -413,9 +560,11 @@ fn phase1_export_acceptance() {
             dst: dst2.clone(),
             ..spec
         };
-        std::thread::spawn(move || run_export(&project, &spec, &cancel, &mut |p| {
-            let _ = tx.send(p);
-        }))
+        std::thread::spawn(move || {
+            run_export(&project, &spec, &cancel, &mut |p| {
+                let _ = tx.send(p);
+            })
+        })
     };
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {

@@ -272,6 +272,147 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Phase 2 acceptance: a 3-video-track project with opacity and
+/// transforms sustains ≥30 fps at 720p-class preview (compositing all
+/// three layers per output frame), with bounded A/V drift.
+#[test]
+fn three_track_composite_playback_sustains_30fps() {
+    let _serial = serial();
+
+    // 720p-class sources so each layer decodes a real 1280×720 proxy.
+    let make_hd = |color: &str, tone: u32| -> PathBuf {
+        let file = media_dir().join(format!("src-hd-{color}.mp4"));
+        if !file.is_file() {
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("color=c={color}:size=1280x720:rate=30:duration=8"))
+                .args(["-f", "lavfi", "-i"])
+                .arg(format!(
+                    "sine=frequency={tone}:sample_rate=48000:duration=8"
+                ))
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
+                .args(["-c:a", "aac", "-b:a", "96k", "-ac", "2", "-shortest"])
+                .arg(&file)
+                .status()
+                .expect("system ffmpeg required");
+            assert!(status.success());
+        }
+        file
+    };
+    let base_src = make_hd("darkred", 300);
+    let mid_src = make_hd("seagreen", 440);
+    let top_src = make_hd("navy", 660);
+    for src in [&base_src, &mid_src, &top_src] {
+        generate_proxy(src, Some(8.0), |_| {}).expect("proxy");
+    }
+
+    const PLAY_SECS: f64 = 4.0;
+    let mut engine = Engine::new(ProjectSettings::default());
+    let base = engine
+        .add_media(base_src.display().to_string(), 8.0, true, true)
+        .unwrap();
+    let mid = engine
+        .add_media(mid_src.display().to_string(), 8.0, true, true)
+        .unwrap();
+    let top = engine
+        .add_media(top_src.display().to_string(), 8.0, true, true)
+        .unwrap();
+    let video = track_of(&engine, TrackKind::Video);
+    engine.add_clip(video, base, 0.0, 0.0, PLAY_SECS).unwrap();
+
+    // Two overlay tracks above the base, both transformed + translucent
+    // (manual construction until the AddTrack command lands).
+    let mut project = engine.project().clone();
+    let overlay =
+        |track_id: u64, clip_id: u64, media, x: f64, scale: f64, rotation: f64, opacity: f64| {
+            cutty_engine::Track {
+                id: cutty_engine::TrackId(track_id),
+                kind: TrackKind::Video,
+                name: format!("V{track_id}"),
+                locked: false,
+                muted: false,
+                clips: vec![cutty_engine::Clip {
+                    id: cutty_engine::ClipId(clip_id),
+                    media_id: media,
+                    timeline_in: 0.0,
+                    timeline_out: PLAY_SECS,
+                    source_in: 0.5,
+                    source_out: 0.5 + PLAY_SECS,
+                    transform: cutty_engine::Transform {
+                        x,
+                        y: -80.0,
+                        scale,
+                        rotation,
+                    },
+                    opacity,
+                    blend_mode: cutty_engine::BlendMode::Normal,
+                    speed: 1.0,
+                    volume: 0.0,
+                }],
+            }
+        };
+    project
+        .tracks
+        .insert(0, overlay(300, 301, mid, -320.0, 0.45, 0.0, 0.7));
+    project
+        .tracks
+        .insert(0, overlay(302, 303, top, 320.0, 0.35, 20.0, 0.5));
+    project.validate().expect("fixture is valid");
+
+    let (player, rx) = open_player(project);
+    let first = recv_frame(&rx, Duration::from_secs(10)).expect("preview frame");
+    assert_ne!(first.color, "black", "three layers must composite");
+
+    player.play();
+    let mut frames: Vec<FrameRec> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(PLAY_SECS as u64 + 5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Evt::Frame(f)) => frames.push(f),
+            Ok(Evt::Eof) => break,
+            Ok(Evt::Error(e)) if e.contains("audio unavailable") => {}
+            Ok(Evt::Error(e)) => panic!("player error: {e}"),
+            Ok(Evt::Position(..)) => {}
+            Err(_) => panic!("no events for 2s during 3-track playback"),
+        }
+    }
+    player.pause();
+
+    // ≥30fps: essentially every grid frame presented (tolerate warmup).
+    let expected = (PLAY_SECS * FPS) as usize;
+    assert!(
+        frames.len() >= expected - 6,
+        "only {} of {} output frames presented (compositing too slow)",
+        frames.len(),
+        expected
+    );
+
+    // Sustained cadence: no hitch beyond 2.5 frame durations.
+    let mut worst_gap = Duration::ZERO;
+    for pair in frames.windows(2).skip(5) {
+        let dt = pair[1].arrived.duration_since(pair[0].arrived);
+        worst_gap = worst_gap.max(dt);
+        assert!(
+            dt < Duration::from_secs_f64(2.5 * FRAME),
+            "hitch: {dt:?} at pts {:.3}",
+            pair[0].pts
+        );
+    }
+
+    // A/V drift bounded, same criterion as single-track playback.
+    let max_drift = frames
+        .iter()
+        .skip(5)
+        .map(|f| (f.pts - f.clock).abs())
+        .fold(0.0f64, f64::max);
+    println!(
+        "3-track composite: {} frames, worst arrival gap {worst_gap:?}, max |pts-clock| {:.1} ms",
+        frames.len(),
+        max_drift * 1e3
+    );
+    assert!(max_drift < 0.040, "A/V drift {:.1} ms", max_drift * 1e3);
+}
+
 /// Play the whole 12-cut timeline through and check every criterion that
 /// doesn't need an hour of soak: correct source at every presented
 /// frame, no hitch at any cut, bounded A/V drift, black in the gap, Eof.

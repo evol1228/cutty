@@ -866,7 +866,10 @@ fn set_clip_volume_rejects_invalid_gains_and_unknown_clips() {
 
     for bad in [-0.1, f64::NAN, f64::INFINITY] {
         let err = engine.set_clip_volume(id, bad).unwrap_err();
-        assert!(matches!(err, EngineError::InvalidProperty { .. }), "{err:?}");
+        assert!(
+            matches!(err, EngineError::InvalidProperty { .. }),
+            "{err:?}"
+        );
     }
     let err = engine.set_clip_volume(ClipId(9999), 0.5).unwrap_err();
     assert!(matches!(err, EngineError::UnknownClip(_)), "{err:?}");

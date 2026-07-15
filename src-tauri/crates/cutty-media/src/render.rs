@@ -2,26 +2,28 @@
 //! (never proxies), mixed audio from the engine's mixing graph, muxed to
 //! an MP4.
 //!
-//! # Strategy: per-segment encode + concat demuxer
+//! # Two video paths, one picture definition
 //!
-//! The timeline is walked into contiguous video segments (one per clip
-//! window, plus black filler for gaps). Each segment is encoded by its
-//! own ffmpeg invocation — frame-accurate input seek on the original
-//! file, scale/pad to the target frame, fps-normalized — and the
-//! uniformly-encoded parts are joined losslessly with the concat demuxer,
-//! muxing in the offline-rendered audio mix in the same pass.
+//! **Compositor path (the general case).** The same GPU frame renderer
+//! preview uses ([`crate::compose::TimelineRenderer`]) runs offline: for
+//! every output frame, decode the originals in-process, composite the
+//! full layer stack (transforms, opacity, blend modes) at output
+//! resolution, read back, and pipe rawvideo into a single ffmpeg encode
+//! process that muxes the audio mix in the same pass. Readback is
+//! double-buffered across two staging slots so the GPU renders frame N+1
+//! while the CPU writes frame N. Preview == export by construction; the
+//! golden-frame tests in `tests/golden_frames.rs` enforce it.
 //!
-//! Per-segment encode was chosen over one giant `filter_complex` concat
-//! because it (a) handles **mixed source formats** by construction —
-//! every segment is normalized to identical codec/resolution/fps/pixel
-//! format/colorimetry parameters, which is exactly what concat `-c copy`
-//! requires, and no more than one decoder is open at a time regardless of
-//! how many sources the timeline uses; (b) maps progress and cancellation
-//! onto process boundaries (kill one child, clean temp files); (c)
-//! isolates failures to a named segment instead of one inscrutable
-//! filter-graph error; and (d) keeps hardware-encoder argument plumbing
-//! (VAAPI hwupload) trivial, where a shared filter graph would need
-//! per-branch hw frame management.
+//! **Fast path (Phase 1 survivor).** A timeline that composites nothing —
+//! at most one unmuted video track with clips, every clip at identity
+//! transform, full opacity, normal blend — is encoded per segment
+//! straight from the sources: one ffmpeg invocation per clip window
+//! (frame-accurate input seek, scale/pad, fps-normalize), black filler
+//! for gaps, joined losslessly with the concat demuxer. This skips the
+//! decode → GPU → readback → pipe round-trip and keeps hardware-encoder
+//! plumbing trivial, so plain cut-and-export jobs run as fast as they did
+//! in Phase 1. [`fast_path_eligible`] decides; the chosen path is logged
+//! and reported in [`ExportSummary::renderer`].
 //!
 //! # No lossless stream-copy ("smart copy") path — deliberately
 //!
@@ -43,17 +45,20 @@
 //! quality upgrade for a later phase — it needs a libav-backed
 //! `AudioSource` for codecs symphonia doesn't cover (opus/ac3/dts).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cutty_audio::{AudioSegment, MixerTimeline, EXPORT_SAMPLE_RATE};
-use cutty_engine::{active_video_clip, next_boundary_after, timeline_end, Project};
+use cutty_engine::{timeline_end, BlendMode, Project, TrackKind};
 use ffmpeg_sidecar::command::FfmpegCommand;
 use ffmpeg_sidecar::event::{FfmpegEvent, LogLevel};
+use ffmpeg_sidecar::paths::ffmpeg_path;
 
+use crate::compose::TimelineRenderer;
 use crate::encoders::{detected_h264_encoder, H264Encoder};
 use crate::error::MediaError;
 use crate::proxy::{parse_ffmpeg_time, proxy_path_for};
@@ -109,6 +114,9 @@ pub struct ExportSummary {
     /// ffmpeg name of the video encoder used (e.g. `h264_vaapi`).
     pub encoder: &'static str,
     pub hardware_encode: bool,
+    /// Which video pipeline rendered the frames: `"segment-concat"` (the
+    /// fast path) or `"gpu-compositor"`.
+    pub renderer: &'static str,
 }
 
 // ---------------------------------------------------------------------
@@ -210,82 +218,96 @@ fn frame_at(t: f64, fps: f64) -> i64 {
     (t * fps).round() as i64
 }
 
-/// Walk the project's video content into segments covering
-/// `[0, timeline_end)` — clips where a clip is active (top unmuted video
-/// track, same rule as preview), black everywhere else, including a
-/// trailing stretch under audio that outlives the video. Segment
+/// Whether a clip renders with no compositing work at all: identity
+/// transform, full opacity, normal blend.
+fn visually_default(clip: &cutty_engine::Clip) -> bool {
+    clip.transform.is_identity() && clip.opacity == 1.0 && clip.blend_mode == BlendMode::Normal
+}
+
+/// The single unmuted video track carrying clips, if the project has
+/// exactly one (the shape the per-segment fast path can encode).
+fn sole_video_track(project: &Project) -> Option<&cutty_engine::Track> {
+    let mut tracks = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video && !t.muted && !t.clips.is_empty());
+    let first = tracks.next()?;
+    tracks.next().is_none().then_some(first)
+}
+
+/// Whether the Phase 1 per-segment pipeline renders this project exactly:
+/// nothing to composite (at most one unmuted video track holding clips)
+/// and every clip visually default. Everything else goes through the GPU
+/// compositor.
+pub(crate) fn fast_path_eligible(project: &Project) -> bool {
+    let mut tracks = project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Video && !t.muted && !t.clips.is_empty());
+    let Some(track) = tracks.next() else {
+        return true; // no video at all: black frames + the audio mix
+    };
+    if tracks.next().is_some() {
+        return false;
+    }
+    track.clips.iter().all(visually_default)
+}
+
+/// Walk the fast path's single video track into segments covering
+/// `[0, timeline_end)` — one per clip window, black filler for gaps and
+/// for any trailing stretch under audio that outlives the video. Segment
 /// boundaries are snapped once to the output frame grid so the segment
 /// frame counts sum exactly to the total (no cumulative rounding drift).
+///
+/// Only meaningful when [`fast_path_eligible`] holds (the compositor path
+/// needs no plan — it renders every grid frame).
 pub(crate) fn plan_video_segments(project: &Project, fps: f64) -> Vec<PlannedSegment> {
     let end = timeline_end(project);
     let total_frames = frame_at(end, fps);
     let mut segments: Vec<PlannedSegment> = Vec::new();
-    let mut t = 0.0f64;
-    // Bounded walk: each iteration crosses at least one clip/boundary.
-    let max_iters = project
-        .tracks
-        .iter()
-        .map(|tr| tr.clips.len() * 2 + 2)
-        .sum::<usize>()
-        + 2;
+    let mut cursor = 0i64;
 
-    for _ in 0..max_iters {
-        let start_frame = frame_at(t, fps);
-        if start_frame >= total_frames {
-            break;
-        }
-        let (source, seg_end) = match active_video_clip(project, t) {
-            Some(active) => {
-                let (_, clip) = project
-                    .find_clip(active.clip_id)
-                    .expect("resolver returned unknown clip");
+    if let Some(track) = sole_video_track(project) {
+        for clip in &track.clips {
+            let start_frame = frame_at(clip.timeline_in, fps).min(total_frames);
+            let end_frame = frame_at(clip.timeline_out.min(end), fps).min(total_frames);
+            if start_frame > cursor {
+                segments.push(PlannedSegment {
+                    source: SegmentSource::Black,
+                    start_frame: cursor,
+                    end_frame: start_frame,
+                });
+                cursor = start_frame;
+            }
+            if end_frame > cursor {
                 let media = project
                     .media(clip.media_id)
                     .expect("validated clip has media");
                 // The first output frame sits at start_frame/fps, which
                 // can differ from timeline_in by up to half a frame;
                 // shift the source in-point to match.
-                let grid_t = start_frame as f64 / fps;
+                let grid_t = cursor as f64 / fps;
                 let source_in =
                     (clip.source_in + (grid_t - clip.timeline_in) * clip.speed).max(0.0);
-                (
-                    SegmentSource::Clip {
+                segments.push(PlannedSegment {
+                    source: SegmentSource::Clip {
                         path: PathBuf::from(&media.path),
                         source_in,
                         speed: clip.speed,
                     },
-                    clip.timeline_out.min(end),
-                )
+                    start_frame: cursor,
+                    end_frame,
+                });
+                cursor = end_frame;
             }
-            None => {
-                let next = next_boundary_after(project, t).unwrap_or(end).min(end);
-                (SegmentSource::Black, next)
-            }
-        };
-
-        let end_frame = frame_at(seg_end, fps).min(total_frames);
-        if end_frame > start_frame {
-            // Merge back-to-back black (gap boundaries on audio edges
-            // produce consecutive gap spans).
-            if source == SegmentSource::Black {
-                if let Some(last) = segments.last_mut() {
-                    if last.source == SegmentSource::Black && last.end_frame == start_frame {
-                        last.end_frame = end_frame;
-                        t = seg_end;
-                        continue;
-                    }
-                }
-            }
-            segments.push(PlannedSegment {
-                source,
-                start_frame,
-                end_frame,
-            });
         }
-        if seg_end <= t + 1e-9 {
-            break; // no forward progress possible (degenerate data)
-        }
-        t = seg_end;
+    }
+    if cursor < total_frames {
+        segments.push(PlannedSegment {
+            source: SegmentSource::Black,
+            start_frame: cursor,
+            end_frame: total_frames,
+        });
     }
     segments
 }
@@ -391,8 +413,9 @@ fn clip_filter(spec: &ExportSpec, speed: f64, vaapi: bool) -> String {
     chain
 }
 
-/// Output-side encoder arguments shared by every segment — identical
-/// parameters are what make the concat demuxer's `-c copy` join safe.
+/// Output-side video encoder arguments, shared by both video paths (for
+/// segments, identical parameters are what make the concat demuxer's
+/// `-c copy` join safe).
 fn encoder_args(spec: &ExportSpec, encoder: &H264Encoder) -> Vec<String> {
     let q = spec.quality.video_q(encoder).to_string();
     let mut args: Vec<String> = match encoder {
@@ -402,8 +425,18 @@ fn encoder_args(spec: &ExportSpec, encoder: &H264Encoder) -> Vec<String> {
         .map(String::from)
         .to_vec(),
         H264Encoder::Nvenc => [
-            "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", &q, "-b:v", "0",
-            "-pix_fmt", "yuv420p",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            &q,
+            "-b:v",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
         ]
         .map(String::from)
         .to_vec(),
@@ -411,8 +444,8 @@ fn encoder_args(spec: &ExportSpec, encoder: &H264Encoder) -> Vec<String> {
             .map(String::from)
             .to_vec(),
     };
-    // Uniform GOP and colorimetry signaling across all segments (sources
-    // with differing tags would otherwise produce mismatched SPS).
+    // Uniform GOP and colorimetry signaling (sources with differing tags
+    // would otherwise produce mismatched SPS across segments).
     args.extend(
         [
             "-g",
@@ -425,7 +458,6 @@ fn encoder_args(spec: &ExportSpec, encoder: &H264Encoder) -> Vec<String> {
             "bt709",
             "-fps_mode",
             "cfr",
-            "-an",
         ]
         .map(String::from),
     );
@@ -485,7 +517,68 @@ fn segment_args(
 
     args.extend(["-frames:v".into(), segment.frames().to_string()]);
     args.extend(encoder_args(spec, encoder));
-    args.extend(["-y".into(), out.display().to_string()]);
+    args.extend(["-an".into(), "-y".into(), out.display().to_string()]);
+    args
+}
+
+/// Argument list for the compositor path's single encode process:
+/// rawvideo RGBA frames on stdin + the audio WAV, one pass to the final
+/// (`.part`) MP4. RGB→YUV conversion is pinned to bt709/limited range so
+/// the colorimetry matches the fast path's segments.
+fn raw_export_args(
+    spec: &ExportSpec,
+    encoder: &H264Encoder,
+    wav: &Path,
+    out: &Path,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let H264Encoder::Vaapi { device } = encoder {
+        args.extend(["-vaapi_device".into(), device.display().to_string()]);
+    }
+    args.extend(
+        [
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-video_size",
+            &format!("{}x{}", spec.width, spec.height),
+            "-framerate",
+            &format!("{}", spec.fps),
+            "-i",
+            "pipe:0",
+            "-i",
+            &wav.display().to_string(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+        .map(String::from),
+    );
+    let vf = if matches!(encoder, H264Encoder::Vaapi { .. }) {
+        "scale=out_color_matrix=bt709:out_range=tv,format=nv12,hwupload"
+    } else {
+        "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+    };
+    args.extend(["-vf".into(), vf.to_string()]);
+    args.extend(encoder_args(spec, encoder));
+    args.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            spec.quality.audio_bitrate(),
+            "-movflags",
+            "+faststart",
+            // The `.part` name hides the container from extension sniffing.
+            "-f",
+            "mp4",
+            "-y",
+            &out.display().to_string(),
+        ]
+        .map(String::from),
+    );
     args
 }
 
@@ -697,8 +790,7 @@ pub fn run_export(
         }
     }
 
-    let segments = plan_video_segments(project, spec.fps);
-    let total_frames: i64 = segments.last().map(|s| s.end_frame).unwrap_or(0);
+    let total_frames = frame_at(timeline_end(project), spec.fps);
     if total_frames <= 0 {
         return Err(MediaError::ExportNotReady {
             message: "the timeline is empty — add clips before exporting".into(),
@@ -707,6 +799,13 @@ pub fn run_export(
     let audio_timeline = export_audio_timeline(project)?;
     let encoder = detected_h264_encoder();
     let duration_sec = total_frames as f64 / spec.fps;
+    let fast_path = fast_path_eligible(project);
+    let renderer = if fast_path {
+        "segment-concat"
+    } else {
+        "gpu-compositor"
+    };
+    eprintln!("cutty-media: export video path: {renderer}");
 
     // Temp segments can be large; use the cache dir, not tmpfs.
     static JOB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -750,55 +849,71 @@ pub fn run_export(
         other => MediaError::Audio(other),
     })?;
 
-    // --- Stage 2: encode each video segment ---
-    let mut part_files: Vec<PathBuf> = Vec::new();
-    let mut frames_done: i64 = 0;
-    for (idx, segment) in segments.iter().enumerate() {
-        let out = temp_dir.join(format!("seg-{idx:04}.mp4"));
-        let context = match &segment.source {
-            SegmentSource::Clip { path, .. } => format!(
-                "encoding segment {} of {} ({})",
-                idx + 1,
-                segments.len(),
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
-            ),
-            SegmentSource::Black => {
-                format!("encoding segment {} of {} (gap)", idx + 1, segments.len())
-            }
-        };
-        let args = segment_args(spec, encoder, segment, &out);
-        run_ffmpeg(&args, &context, cancel, |out_time, speed| {
-            let seg_frames = (out_time * spec.fps).min(segment.frames() as f64);
-            let done = (frames_done as f64 + seg_frames) / total_frames as f64;
-            progress.report(ExportStage::Video, done, speed);
-        })?;
-        frames_done += segment.frames();
-        progress.report(
-            ExportStage::Video,
-            frames_done as f64 / total_frames as f64,
-            0.0,
-        );
-        part_files.push(out);
+    if fast_path {
+        // --- Stage 2 (fast): encode each video segment ---
+        let segments = plan_video_segments(project, spec.fps);
+        let mut part_files: Vec<PathBuf> = Vec::new();
+        let mut frames_done: i64 = 0;
+        for (idx, segment) in segments.iter().enumerate() {
+            let out = temp_dir.join(format!("seg-{idx:04}.mp4"));
+            let context = match &segment.source {
+                SegmentSource::Clip { path, .. } => format!(
+                    "encoding segment {} of {} ({})",
+                    idx + 1,
+                    segments.len(),
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ),
+                SegmentSource::Black => {
+                    format!("encoding segment {} of {} (gap)", idx + 1, segments.len())
+                }
+            };
+            let args = segment_args(spec, encoder, segment, &out);
+            run_ffmpeg(&args, &context, cancel, |out_time, speed| {
+                let seg_frames = (out_time * spec.fps).min(segment.frames() as f64);
+                let done = (frames_done as f64 + seg_frames) / total_frames as f64;
+                progress.report(ExportStage::Video, done, speed);
+            })?;
+            frames_done += segment.frames();
+            progress.report(
+                ExportStage::Video,
+                frames_done as f64 / total_frames as f64,
+                0.0,
+            );
+            part_files.push(out);
+        }
+
+        // --- Stage 3 (fast): concat + mux (video copied, audio → AAC) ---
+        let list = temp_dir.join("concat.txt");
+        let mut list_file = std::fs::File::create(&list)?;
+        list_file.write_all(concat_list(&part_files).as_bytes())?;
+        list_file.sync_all()?;
+        drop(list_file);
+
+        progress.report(ExportStage::Finalize, 0.0, 0.0);
+        run_ffmpeg(
+            &mux_args(spec, &list, &wav, &part),
+            "muxing the final file",
+            cancel,
+            |out_time, speed| {
+                progress.report(ExportStage::Finalize, out_time / duration_sec, speed);
+            },
+        )?;
+    } else {
+        // --- Stage 2+3 (compositor): render every frame, pipe into one
+        // encode+mux process ---
+        composite_and_encode(
+            project,
+            spec,
+            encoder,
+            &wav,
+            &part,
+            total_frames,
+            cancel,
+            &mut progress,
+        )?;
     }
-
-    // --- Stage 3: concat + mux (video stream-copied, audio → AAC) ---
-    let list = temp_dir.join("concat.txt");
-    let mut list_file = std::fs::File::create(&list)?;
-    list_file.write_all(concat_list(&part_files).as_bytes())?;
-    list_file.sync_all()?;
-    drop(list_file);
-
-    progress.report(ExportStage::Finalize, 0.0, 0.0);
-    run_ffmpeg(
-        &mux_args(spec, &list, &wav, &part),
-        "muxing the final file",
-        cancel,
-        |out_time, speed| {
-            progress.report(ExportStage::Finalize, out_time / duration_sec, speed);
-        },
-    )?;
 
     std::fs::rename(&part, &spec.dst)?;
     guard.keep_part = true; // renamed away; nothing to delete
@@ -809,7 +924,203 @@ pub fn run_export(
         duration_sec,
         encoder: encoder.ffmpeg_name(),
         hardware_encode: encoder.is_hardware(),
+        renderer,
     })
+}
+
+// ---------------------------------------------------------------------
+// The compositor video path
+// ---------------------------------------------------------------------
+
+/// Counters from a compositor-path frame run (logged for the perf
+/// budget; the readback wait is the time spent blocked on GPU→CPU
+/// copies, which double buffering is meant to hide).
+pub struct CompositeRunStats {
+    pub frames: i64,
+    pub readback_wait: Duration,
+    pub adapter: String,
+}
+
+/// Sink for composited frames: `(frame index, padded RGBA rows, row
+/// pitch)`.
+pub type FrameSink<'a> = dyn FnMut(i64, &[u8], usize) -> Result<(), MediaError> + 'a;
+
+/// Drive the compositor frame loop at output resolution: for every output
+/// frame, decode originals in-process, composite the layer stack, and
+/// hand the padded RGBA readback to `emit(frame_idx, data, stride)`.
+/// Readback is double-buffered: frame N+1's decode+composite is submitted
+/// before frame N's readback is consumed. This is THE export frame
+/// generator — the golden-frame tests drive it directly against the
+/// preview renderer.
+pub fn for_each_composited_frame(
+    project: &Project,
+    width: u32,
+    height: u32,
+    fps: f64,
+    total_frames: i64,
+    should_cancel: &dyn Fn() -> bool,
+    emit: &mut FrameSink<'_>,
+) -> Result<CompositeRunStats, MediaError> {
+    let mut renderer = TimelineRenderer::new(width, height, true)?;
+    let originals: HashMap<u64, PathBuf> = project
+        .media
+        .iter()
+        .filter(|m| m.has_video)
+        .map(|m| (m.id.0, PathBuf::from(&m.path)))
+        .collect();
+    let path_of = |media: u64| originals.get(&media).cloned();
+
+    let mut readback_wait = Duration::ZERO;
+    if total_frames > 0 {
+        renderer.begin_frame(project, 0.0, &path_of, 0)?;
+    }
+    for idx in 0..total_frames {
+        if should_cancel() {
+            return Err(MediaError::ExportCancelled);
+        }
+        // Submit the next frame before consuming this one: the GPU
+        // renders N+1 while the CPU waits on / writes N.
+        if idx + 1 < total_frames {
+            renderer.begin_frame(
+                project,
+                (idx + 1) as f64 / fps,
+                &path_of,
+                ((idx + 1) % 2) as usize,
+            )?;
+        }
+        let started = Instant::now();
+        let mut wait = Duration::ZERO;
+        renderer.read_frame((idx % 2) as usize, |frame| {
+            wait = started.elapsed();
+            emit(idx, frame.data, frame.stride)
+        })??;
+        readback_wait += wait;
+    }
+    Ok(CompositeRunStats {
+        frames: total_frames,
+        readback_wait,
+        adapter: renderer.adapter_label(),
+    })
+}
+
+/// The compositor path's encode stage: spawn one ffmpeg (rawvideo stdin +
+/// audio WAV → `.part` MP4) and stream every composited frame into it.
+#[allow(clippy::too_many_arguments)]
+fn composite_and_encode(
+    project: &Project,
+    spec: &ExportSpec,
+    encoder: &H264Encoder,
+    wav: &Path,
+    part: &Path,
+    total_frames: i64,
+    cancel: &CancelToken,
+    progress: &mut Progress<'_>,
+) -> Result<(), MediaError> {
+    cancel.bail_if_cancelled()?;
+    let args = raw_export_args(spec, encoder, wav, part);
+    let mut child = std::process::Command::new(ffmpeg_path())
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|source| MediaError::Spawn {
+            tool: "ffmpeg",
+            source,
+        })?;
+    cancel.watch_child(child.id());
+
+    // Drain stderr on a side thread (ffmpeg blocks when the pipe fills);
+    // keep the last lines for error reporting.
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_tail = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tail.len() == 40 {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        tail.into_iter().collect::<Vec<_>>().join("; ")
+    });
+
+    let stdin = child.stdin.take().expect("stdin piped");
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, stdin);
+    let row_bytes = spec.width as usize * 4;
+    let height = spec.height as usize;
+    let started = Instant::now();
+    let mut bytes_out: u64 = 0;
+
+    let run = for_each_composited_frame(
+        project,
+        spec.width,
+        spec.height,
+        spec.fps,
+        total_frames,
+        &|| cancel.is_cancelled(),
+        &mut |idx, data, stride| {
+            for row in 0..height {
+                writer
+                    .write_all(&data[row * stride..row * stride + row_bytes])
+                    .map_err(MediaError::Io)?;
+            }
+            bytes_out += (row_bytes * height) as u64;
+            if idx % 15 == 0 {
+                let elapsed = started.elapsed().as_secs_f64().max(1e-6);
+                let speed = (idx as f64 / spec.fps / elapsed) as f32;
+                progress.report(ExportStage::Video, idx as f64 / total_frames as f64, speed);
+            }
+            Ok(())
+        },
+    );
+
+    // Close stdin (flush) so ffmpeg finalizes, then reap — on *every*
+    // path, including render errors and cancel. Clearing the pid slot
+    // before the reap keeps a racing `cancel()` off recycled pids.
+    let flush = writer.flush();
+    drop(writer);
+    progress.report(ExportStage::Finalize, 0.0, 0.0);
+    cancel.clear_child();
+    let status = child.wait().map_err(MediaError::Io);
+    let tail = stderr_tail.join().unwrap_or_default();
+
+    // Error precedence: cancel, then the encoder's own failure (a dead
+    // ffmpeg surfaces to the render loop as EPIPE — its stderr is the
+    // real story), then render/pipe errors.
+    cancel.bail_if_cancelled()?;
+    let status = status?;
+    if !status.success() {
+        return Err(MediaError::FfmpegFailed {
+            context: Some("compositor encode".into()),
+            message: if tail.is_empty() {
+                format!("ffmpeg exited with {status}")
+            } else {
+                tail
+            },
+        });
+    }
+    let run = run?;
+    flush?;
+
+    let elapsed = started.elapsed().as_secs_f64().max(1e-6);
+    eprintln!(
+        "cutty-media: compositor export: {} frames at {}x{} in {:.2}s ({:.1} fps), \
+         readback wait {:.0} ms total ({:.2} GB/s effective), {:.1} MB piped, on {}",
+        run.frames,
+        spec.width,
+        spec.height,
+        elapsed,
+        run.frames as f64 / elapsed,
+        run.readback_wait.as_secs_f64() * 1e3,
+        (bytes_out as f64 / 1e9) / run.readback_wait.as_secs_f64().max(1e-6),
+        bytes_out as f64 / 1e6,
+        run.adapter,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1016,6 +1327,81 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_requires_single_default_track() {
+        // Plain single track: eligible.
+        let p = project_with(&[(0.0, 0.0, 2.0), (2.0, 3.0, 5.0)]);
+        assert!(fast_path_eligible(&p));
+
+        // Any non-default visual parameter disqualifies.
+        let mut transformed = p.clone();
+        transformed.tracks[0].clips[0].transform.scale = 0.5;
+        assert!(!fast_path_eligible(&transformed));
+        let mut faded = p.clone();
+        faded.tracks[0].clips[1].opacity = 0.9;
+        assert!(!fast_path_eligible(&faded));
+        let mut blended = p.clone();
+        blended.tracks[0].clips[0].blend_mode = BlendMode::Screen;
+        assert!(!fast_path_eligible(&blended));
+
+        // A second video track with clips disqualifies…
+        let mut multi = p.clone();
+        let mut track = multi.tracks[0].clone();
+        track.id = cutty_engine::TrackId(999);
+        track.clips = vec![multi.tracks[0].clips[0].clone()];
+        track.clips[0].id = cutty_engine::ClipId(998);
+        multi.tracks.insert(0, track);
+        assert!(!fast_path_eligible(&multi));
+        // …unless it is muted (hidden ⇒ nothing to composite).
+        multi.tracks[0].muted = true;
+        assert!(fast_path_eligible(&multi));
+
+        // No video clips at all (audio-only timeline): eligible.
+        let mut empty = p.clone();
+        empty.tracks[0].clips.clear();
+        assert!(fast_path_eligible(&empty));
+    }
+
+    #[test]
+    fn raw_export_args_shape() {
+        let s = spec(1920, 1080, 30.0);
+        let joined = raw_export_args(
+            &s,
+            &H264Encoder::X264,
+            Path::new("/t/mix.wav"),
+            Path::new("/out/final.mp4.part"),
+        )
+        .join(" ");
+        assert!(joined.starts_with(
+            "-f rawvideo -pix_fmt rgba -video_size 1920x1080 -framerate 30 -i pipe:0"
+        ));
+        assert!(joined.contains("-i /t/mix.wav"));
+        assert!(joined.contains("-map 0:v:0 -map 1:a:0"));
+        assert!(joined.contains("-vf scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"));
+        assert!(joined.contains("-c:v libx264"));
+        assert!(joined.contains("-colorspace bt709"));
+        assert!(joined.contains("-c:a aac -b:a 160k"));
+        assert!(joined.contains("-movflags +faststart"));
+        assert!(joined.ends_with("-f mp4 -y /out/final.mp4.part"));
+        assert!(!joined.contains("-an"), "audio is muxed in the same pass");
+
+        let vaapi = H264Encoder::Vaapi {
+            device: PathBuf::from("/dev/dri/renderD128"),
+        };
+        let joined = raw_export_args(
+            &s,
+            &vaapi,
+            Path::new("/t/mix.wav"),
+            Path::new("/out/final.mp4.part"),
+        )
+        .join(" ");
+        assert!(joined.starts_with("-vaapi_device /dev/dri/renderD128 "));
+        assert!(
+            joined.contains("-vf scale=out_color_matrix=bt709:out_range=tv,format=nv12,hwupload")
+        );
+        assert!(joined.contains("-c:v h264_vaapi"));
+    }
+
+    #[test]
     fn mux_args_shape() {
         let s = spec(1920, 1080, 30.0);
         let joined = mux_args(
@@ -1040,10 +1426,7 @@ mod tests {
             PathBuf::from("/t/seg-0000.mp4"),
             PathBuf::from("/we'ird/seg.mp4"),
         ]);
-        assert_eq!(
-            body,
-            "file '/t/seg-0000.mp4'\nfile '/we'\\''ird/seg.mp4'\n"
-        );
+        assert_eq!(body, "file '/t/seg-0000.mp4'\nfile '/we'\\''ird/seg.mp4'\n");
     }
 
     #[test]
@@ -1070,7 +1453,11 @@ mod tests {
         assert!(matches!(err, MediaError::ExportNotReady { .. }), "{err}");
 
         let p = project_with(&[(0.0, 0.0, 1.0)]);
-        for bad in [spec(1921, 1080, 30.0), spec(0, 1080, 30.0), spec(1920, 1080, 0.0)] {
+        for bad in [
+            spec(1921, 1080, 30.0),
+            spec(0, 1080, 30.0),
+            spec(1920, 1080, 0.0),
+        ] {
             let err = run_export(&p, &bad, &cancel, &mut |_| {}).unwrap_err();
             assert!(matches!(err, MediaError::ExportNotReady { .. }), "{err}");
         }

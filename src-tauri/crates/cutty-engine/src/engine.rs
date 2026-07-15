@@ -9,7 +9,7 @@ use crate::command::{
 };
 use crate::error::EngineError;
 use crate::model::{
-    Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TrackId, Transform, EPS,
+    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TrackId, Transform, EPS,
     MIN_CLIP_DURATION,
 };
 
@@ -236,6 +236,7 @@ impl Engine {
             source_out,
             transform: Transform::default(),
             opacity: 1.0,
+            blend_mode: BlendMode::default(),
             speed,
             volume: 1.0,
         };

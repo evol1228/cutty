@@ -46,12 +46,12 @@ pub use command::{
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;
 pub use model::{
-    Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId, TrackKind,
-    Transform, EPS, MIN_CLIP_DURATION,
+    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId,
+    TrackKind, Transform, EPS, MIN_CLIP_DURATION,
 };
 pub use project_file::ProjectFileError;
 pub use recents::RecentProject;
-pub use resolve::{active_video_clip, next_boundary_after, resolve, timeline_end, ActiveClip};
+pub use resolve::{next_boundary_after, resolve, resolve_video_layers, timeline_end, ActiveClip};
 pub use snap::{snap, snap_candidates, snap_clip_move, snap_time, SnappedMove};
 
 /// Cutty's XDG state directory (`$XDG_STATE_HOME/cutty`, usually

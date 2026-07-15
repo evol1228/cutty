@@ -86,6 +86,19 @@ pub enum TrackKind {
 }
 
 /// 2D placement of a clip in the frame.
+///
+/// Semantics (shared by preview and export — the compositor consumes
+/// these directly):
+/// - The clip's base placement is its source frame fit inside the project
+///   canvas (aspect-preserving "contain"), centered.
+/// - `x`/`y` offset the clip center from the canvas center, in **project
+///   pixels** (`ProjectSettings::width`/`height`), +x right, +y down.
+/// - `scale` multiplies the fitted base size (1.0 = fit).
+/// - `rotation` is degrees, clockwise positive.
+///
+/// Rendering at a different resolution (720p preview, 4K export) scales
+/// the whole coordinate space uniformly, so the composition is identical
+/// at every output size.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub x: f64,
@@ -103,6 +116,35 @@ impl Default for Transform {
             rotation: 0.0,
         }
     }
+}
+
+impl Transform {
+    /// Whether this is exactly the identity placement (fit, centered,
+    /// unrotated) — the fast-path export check relies on exact equality.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How a video clip blends with the layers below it.
+///
+/// Formulas follow the W3C compositing spec's separable modes, applied
+/// per channel on sRGB-encoded values (see `cutty-gpu`).
+///
+/// **Schema rule:** additive clip/track *fields* use `#[serde(default)]`
+/// and need no project-version bump (older files simply lack the key).
+/// Adding new *enum variants* here (or a new `TrackKind`) is different:
+/// old builds cannot read files that use them, so that bumps
+/// `project_file::CURRENT_VERSION` with a migration arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Add,
 }
 
 /// A clip: a window into a media file, placed on the timeline.
@@ -129,6 +171,10 @@ pub struct Clip {
     pub transform: Transform,
     /// 0.0..=1.0
     pub opacity: f64,
+    /// Blend mode against the layers below. Additive schema field
+    /// (`serde(default)`): projects saved before Phase 2 load as `Normal`.
+    #[serde(default)]
+    pub blend_mode: BlendMode,
     /// Playback rate. Modeled now, fixed at 1.0 until Phase 3.
     pub speed: f64,
     /// Linear gain, `>= 0.0` (1.0 = unity).
@@ -174,6 +220,11 @@ impl Track {
 
 /// The whole editable state of a Cutty project. Owned exclusively by the
 /// Rust engine; the frontend only ever sees serialized snapshots of it.
+///
+/// `tracks` is stored in **visual order**: index 0 renders at the top of
+/// the timeline panel. Video compositing stacks the other way — the
+/// *last* video track in the vec is the base layer and earlier video
+/// tracks paint over it (see [`crate::resolve::resolve_video_layers`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub settings: ProjectSettings,

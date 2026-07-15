@@ -4,8 +4,8 @@ mod common;
 
 use common::{engine_with_media, Fixture};
 use cutty_engine::{
-    active_video_clip, next_boundary_after, resolve, snap, snap_candidates, snap_clip_move,
-    snap_time, timeline_end, ClipId, EngineError, TrackKind,
+    next_boundary_after, resolve, resolve_video_layers, snap, snap_candidates, snap_clip_move,
+    snap_time, timeline_end, ClipId, EngineError, Track, TrackId, TrackKind,
 };
 
 // ---------------------------------------------------------------------
@@ -124,33 +124,91 @@ fn resolver_skips_muted_tracks() {
 }
 
 #[test]
-fn active_video_clip_prefers_video_tracks_and_skips_gaps() {
+fn video_layers_stack_bottom_to_top_and_skip_audio_gaps_and_muted() {
     let Fixture {
         mut engine,
         media,
         video,
         audio,
     } = engine_with_media();
-    let v = engine.add_clip(video, media, 1.0, 0.0, 3.0).expect("v");
+    let base = engine.add_clip(video, media, 1.0, 0.0, 3.0).expect("v");
     engine.add_clip(audio, media, 0.0, 0.0, 8.0).expect("a");
 
-    // Audio-only coverage at t=0.5: no video clip.
-    assert_eq!(active_video_clip(engine.project(), 0.5), None);
+    // Audio-only coverage at t=0.5: no video layers.
+    assert!(resolve_video_layers(engine.project(), 0.5).is_empty());
 
-    let active = active_video_clip(engine.project(), 2.0).expect("active");
-    assert_eq!(active.clip_id, v);
-    assert_eq!(active.source_time, 1.0);
+    // Single video track: one layer, source-mapped.
+    let layers = resolve_video_layers(engine.project(), 2.0);
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0].clip_id, base);
+    assert_eq!(layers[0].source_time, 1.0);
 
-    // Muted video track hides its clips.
+    // Two overlay tracks *above* the base track (tracks are stored in
+    // visual order, index 0 = top of the panel). Layers must come out
+    // bottom→top: base first, topmost last. Gaps in a track (V2 at 2.0)
+    // contribute nothing; muted tracks are hidden.
     let mut project = engine.project().clone();
-    project
+    let add_video_track = |project: &mut cutty_engine::Project, id: u64, name: &str| {
+        project.tracks.insert(
+            0,
+            Track {
+                id: TrackId(id),
+                kind: TrackKind::Video,
+                name: name.into(),
+                locked: false,
+                muted: false,
+                clips: Vec::new(),
+            },
+        );
+    };
+    add_video_track(&mut project, 100, "V2");
+    add_video_track(&mut project, 101, "V3");
+    // V2 covers [3, 5); V3 covers [1.5, 6). At t=2.0 the stack is
+    // base (V1), then V3 — V2 is in a gap there.
+    let mut clip = project
         .tracks
-        .iter_mut()
-        .find(|t| t.kind == TrackKind::Video)
-        .expect("video track")
-        .muted = true;
-    assert_eq!(active_video_clip(&project, 2.0), None);
-    assert_eq!(active_video_clip(&project, f64::NAN), None);
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .next()
+        .expect("fixture clip")
+        .clone();
+    clip.id = ClipId(200);
+    clip.timeline_in = 3.0;
+    clip.timeline_out = 5.0;
+    clip.source_in = 0.0;
+    clip.source_out = 2.0;
+    project.tracks[1].clips.push(clip.clone()); // V2 (index 1 after inserts)
+    let mut top = clip.clone();
+    top.id = ClipId(201);
+    top.timeline_in = 1.5;
+    top.timeline_out = 6.0;
+    top.source_in = 1.0;
+    top.source_out = 5.5;
+    project.tracks[0].clips.push(top); // V3 (topmost)
+    project.validate().expect("fixture is valid");
+
+    let layers = resolve_video_layers(&project, 2.0);
+    assert_eq!(layers.len(), 2, "V2 is in a gap at t=2");
+    assert_eq!(layers[0].clip_id, base, "base layer first");
+    assert_eq!(layers[1].clip_id, ClipId(201), "topmost layer last");
+    assert_eq!(layers[1].source_time, 1.5);
+
+    let layers = resolve_video_layers(&project, 3.5);
+    assert_eq!(layers.len(), 3, "all three tracks active at t=3.5");
+    assert_eq!(layers[0].clip_id, base);
+    assert_eq!(layers[1].clip_id, ClipId(200));
+    assert_eq!(layers[2].clip_id, ClipId(201));
+
+    // Muting the top track removes only its layer.
+    project.tracks[0].muted = true;
+    let layers = resolve_video_layers(&project, 3.5);
+    assert_eq!(layers.len(), 2);
+    assert_eq!(layers[1].clip_id, ClipId(200));
+
+    // Muted base video track hides it; non-finite times resolve to nothing.
+    project.tracks.iter_mut().for_each(|t| t.muted = true);
+    assert!(resolve_video_layers(&project, 3.5).is_empty());
+    assert!(resolve_video_layers(&project, f64::NAN).is_empty());
 }
 
 #[test]

@@ -51,6 +51,10 @@ pub enum MediaError {
     #[error("export cancelled")]
     ExportCancelled,
 
+    /// GPU compositor failure (init, composite, or readback).
+    #[error("GPU compositor: {0}")]
+    Gpu(#[from] cutty_gpu::GpuError),
+
     /// Offline audio rendering failed.
     #[error("audio render failed: {0}")]
     Audio(#[from] cutty_audio::AudioError),
