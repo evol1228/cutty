@@ -7,9 +7,7 @@
 import { useEffect, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { closePlayer, openPlayer, probeMedia } from "../lib/ipc";
 import { engineRemoveMedia } from "../lib/engineIpc";
-import { dispatchFrame } from "../lib/frameSink";
 import {
   AUDIO_EXTENSIONS,
   IMAGE_EXTENSIONS,
@@ -17,7 +15,6 @@ import {
   VIDEO_EXTENSIONS,
   type PoolItem,
 } from "../state/mediaStore";
-import { usePlayerStore } from "../state/playerStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
 import { beginPoolDrag } from "../timeline/poolDrag";
@@ -89,21 +86,6 @@ async function deleteItem(item: PoolItem): Promise<void> {
   }
 }
 
-/** Double-click: preview the proxy in the Phase 0 player. */
-async function openInPlayer(item: PoolItem): Promise<void> {
-  if (!item.hasVideo || !item.proxyPath || item.missing) return;
-  try {
-    await closePlayer().catch(() => undefined);
-    const info = item.info ?? (await probeMedia(item.path));
-    const player = usePlayerStore.getState();
-    player.setMedia(info);
-    player.setProxyPath(item.proxyPath);
-    player.setPlayerInfo(await openPlayer(item.proxyPath, dispatchFrame));
-  } catch (err) {
-    toast(`Could not open ${item.name}: ${String(err)}`, "error");
-  }
-}
-
 function statusLabel(item: PoolItem): string | null {
   switch (item.status) {
     case "probing":
@@ -149,7 +131,6 @@ function PoolItemCard({ item }: { item: PoolItem }) {
           thumbnailUrl: item.thumbnailUrl,
         });
       }}
-      onDoubleClick={() => void openInPlayer(item)}
     >
       <div
         className={`relative aspect-video overflow-hidden rounded-md border bg-zinc-950 ${borderClass}`}

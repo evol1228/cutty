@@ -16,6 +16,7 @@ import {
   engineSnapTime,
   engineTrimClip,
 } from "../lib/engineIpc";
+import { playbackSeek, playbackToggle } from "../lib/ipc";
 import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
@@ -360,6 +361,21 @@ export function createTimelineController(
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
+  // --- Scrubbing ---------------------------------------------------------
+  //
+  // The store playhead moves immediately (snappy marker); the engine seek
+  // rides the coalescing queue, so a fast drag sends the engine only the
+  // positions it can keep up with — the engine additionally collapses
+  // whatever queues up on its side and cancels stale seeks.
+
+  function scrubTo(t: number): void {
+    const clamped = Math.max(0, t);
+    useProjectStore.getState().setPlayhead(clamped);
+    coalesce(async () => {
+      await playbackSeek(clamped).catch(() => undefined);
+    });
+  }
+
   // --- Pointer handlers -------------------------------------------------
 
   function onPointerDown(e: PointerEvent): void {
@@ -380,7 +396,7 @@ export function createTimelineController(
     if (hit.region === "ruler") {
       gesture = { type: "scrub" };
       canvas.setPointerCapture(e.pointerId);
-      store.setPlayhead(xToTime(x));
+      scrubTo(xToTime(x));
       return;
     }
     if (hit.region === "lane" && hit.clip) {
@@ -471,7 +487,7 @@ export function createTimelineController(
         return;
       }
       case "scrub":
-        useProjectStore.getState().setPlayhead(xToTime(x));
+        scrubTo(xToTime(x));
         return;
     }
   }
@@ -572,10 +588,15 @@ export function createTimelineController(
     if (ctrl) return;
 
     switch (key) {
-      case " ":
-        // Play/pause is reserved for the playback prompt — stub only.
+      case " ": {
+        // A focused button consumes Space itself (e.g. the play button —
+        // toggling here too would double-fire).
+        const target = e.target as HTMLElement | null;
+        if (target?.closest("button")) break;
         e.preventDefault();
+        if (!e.repeat) void playbackToggle().catch(() => undefined);
         break;
+      }
       case "s":
       case "S":
         void splitAtPlayhead();

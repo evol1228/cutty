@@ -29,10 +29,22 @@ impl JpegEncoder {
         height: u32,
         rgb: &[u8],
     ) -> Result<Vec<u8>, MediaError> {
+        self.encode_rgb_strided(width, height, width as usize * 3, rgb)
+    }
+
+    /// Compress an rgb24 buffer whose rows are `pitch` bytes apart
+    /// (libav-decoded frames carry row alignment padding).
+    pub fn encode_rgb_strided(
+        &mut self,
+        width: u32,
+        height: u32,
+        pitch: usize,
+        rgb: &[u8],
+    ) -> Result<Vec<u8>, MediaError> {
         let image = turbojpeg::Image {
             pixels: rgb,
             width: width as usize,
-            pitch: width as usize * 3,
+            pitch,
             height: height as usize,
             format: turbojpeg::PixelFormat::RGB,
         };

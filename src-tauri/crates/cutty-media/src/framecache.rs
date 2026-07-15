@@ -1,10 +1,10 @@
 //! LRU-ish cache of encoded preview frames.
 //!
-//! Spawn-per-seek CLI decoding has a ~100 ms floor (ffmpeg process startup
-//! alone is ~60 ms), so cold seeks cannot hit the <100 ms budget. Seeks
-//! into *visited* content — the dominant pattern when scrubbing — are
-//! served from this cache instantly instead (CLAUDE.md: "a background job
-//! or a cache, not a pass").
+//! Keyed by `(media id, source frame index)` — source-relative, so cached
+//! frames stay valid across timeline edits and serve any clip that shows
+//! the same source content. Seeks into visited content come from here in
+//! well under a millisecond; cold seeks pay the in-process decode cost
+//! (tens of ms).
 //!
 //! Eviction is insertion-ordered (oldest decoded first), which for video
 //! playback approximates LRU: the most recently played region stays hot.
@@ -17,19 +17,23 @@ use std::collections::{HashMap, VecDeque};
 /// idle-RAM budget alongside decode buffers.
 pub const DEFAULT_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Cache key: (media id, source frame index).
+pub type FrameKey = (u64, i64);
+
 /// A cached, encoded frame.
 #[derive(Clone)]
 pub struct CachedFrame {
-    pub pts_sec: f64,
+    /// Presentation time within the *source*, seconds.
+    pub source_pts_sec: f64,
     pub width: u32,
     pub height: u32,
     pub jpeg: Vec<u8>,
 }
 
-/// Frame-index-keyed cache of encoded frames with a byte budget.
+/// Frame-keyed cache of encoded frames with a byte budget.
 pub struct FrameCache {
-    frames: HashMap<i64, CachedFrame>,
-    order: VecDeque<i64>,
+    frames: HashMap<FrameKey, CachedFrame>,
+    order: VecDeque<FrameKey>,
     bytes: usize,
     max_bytes: usize,
 }
@@ -44,18 +48,18 @@ impl FrameCache {
         }
     }
 
-    pub fn get(&self, frame_index: i64) -> Option<&CachedFrame> {
-        self.frames.get(&frame_index)
+    pub fn get(&self, key: FrameKey) -> Option<&CachedFrame> {
+        self.frames.get(&key)
     }
 
-    pub fn insert(&mut self, frame_index: i64, frame: CachedFrame) {
-        if let Some(old) = self.frames.remove(&frame_index) {
+    pub fn insert(&mut self, key: FrameKey, frame: CachedFrame) {
+        if let Some(old) = self.frames.remove(&key) {
             self.bytes -= old.jpeg.len();
-            self.order.retain(|&i| i != frame_index);
+            self.order.retain(|&k| k != key);
         }
         self.bytes += frame.jpeg.len();
-        self.frames.insert(frame_index, frame);
-        self.order.push_back(frame_index);
+        self.frames.insert(key, frame);
+        self.order.push_back(key);
 
         while self.bytes > self.max_bytes {
             let Some(oldest) = self.order.pop_front() else {
@@ -86,7 +90,7 @@ mod tests {
 
     fn frame(bytes: usize) -> CachedFrame {
         CachedFrame {
-            pts_sec: 0.0,
+            source_pts_sec: 0.0,
             width: 2,
             height: 2,
             jpeg: vec![0u8; bytes],
@@ -94,23 +98,24 @@ mod tests {
     }
 
     #[test]
-    fn stores_and_returns_frames() {
+    fn stores_and_returns_frames_per_media() {
         let mut c = FrameCache::new(1000);
-        c.insert(5, frame(100));
-        assert!(c.get(5).is_some());
-        assert!(c.get(6).is_none());
+        c.insert((1, 5), frame(100));
+        assert!(c.get((1, 5)).is_some());
+        assert!(c.get((1, 6)).is_none());
+        assert!(c.get((2, 5)).is_none(), "media id is part of the key");
         assert_eq!(c.bytes(), 100);
     }
 
     #[test]
     fn evicts_oldest_when_over_budget() {
         let mut c = FrameCache::new(250);
-        c.insert(1, frame(100));
-        c.insert(2, frame(100));
-        c.insert(3, frame(100)); // 300 > 250: evict frame 1
-        assert!(c.get(1).is_none());
-        assert!(c.get(2).is_some());
-        assert!(c.get(3).is_some());
+        c.insert((1, 1), frame(100));
+        c.insert((1, 2), frame(100));
+        c.insert((1, 3), frame(100)); // 300 > 250: evict frame 1
+        assert!(c.get((1, 1)).is_none());
+        assert!(c.get((1, 2)).is_some());
+        assert!(c.get((1, 3)).is_some());
         assert_eq!(c.bytes(), 200);
         assert_eq!(c.len(), 2);
     }
@@ -118,8 +123,8 @@ mod tests {
     #[test]
     fn reinserting_a_frame_replaces_it_without_leaking_bytes() {
         let mut c = FrameCache::new(1000);
-        c.insert(1, frame(100));
-        c.insert(1, frame(300));
+        c.insert((1, 1), frame(100));
+        c.insert((1, 1), frame(300));
         assert_eq!(c.bytes(), 300);
         assert_eq!(c.len(), 1);
     }
@@ -127,11 +132,11 @@ mod tests {
     #[test]
     fn oversized_single_frame_does_not_wedge_the_cache() {
         let mut c = FrameCache::new(50);
-        c.insert(1, frame(100)); // bigger than the whole budget
+        c.insert((1, 1), frame(100)); // bigger than the whole budget
         assert!(c.is_empty());
         assert_eq!(c.bytes(), 0);
         // And the cache still works afterwards.
-        c.insert(2, frame(40));
-        assert!(c.get(2).is_some());
+        c.insert((1, 2), frame(40));
+        assert!(c.get((1, 2)).is_some());
     }
 }

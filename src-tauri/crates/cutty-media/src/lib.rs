@@ -7,24 +7,25 @@
 //! Phase 0: probe → proxy → playback decode → trim export.
 
 pub(crate) mod cache;
+pub mod decode;
 pub mod error;
 pub mod export;
 pub mod files;
 pub mod framecache;
 pub mod jpeg;
-pub mod player;
+pub mod playback;
 pub mod probe;
 pub mod proxy;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod thumbnail;
 pub mod tools;
-pub mod video;
 
+pub use decode::{FrameView, SourceDecoder};
 pub use error::MediaError;
 pub use export::{export_trim, TrimResult};
 pub use files::paths_exist;
-pub use player::{EventSink, Player, PlayerEvent, PlayerInfo};
+pub use playback::{PlayerEvent, TimelinePlayer};
 pub use probe::{probe, AudioStreamInfo, MediaInfo, StreamSummary, VideoStreamInfo};
 pub use proxy::{generate_proxy, proxy_path_for, ProxyProgress};
 pub use thumbnail::{generate_thumbnail, thumbnail_path_for};

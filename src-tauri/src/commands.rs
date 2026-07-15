@@ -4,16 +4,30 @@
 
 use std::sync::{Arc, Mutex};
 
-use cutty_media::{MediaInfo, Player, PlayerEvent, PlayerInfo};
+use cutty_media::{MediaInfo, PlayerEvent, TimelinePlayer};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Managed state: the single active player (Phase 0 plays one file).
-/// The `Arc` lets blocking sections run on `spawn_blocking` without
-/// borrowing from the command's lifetime.
+use crate::engine_ipc::EngineHandle;
+
+/// Managed state: the timeline playback engine. Created by
+/// [`playback_attach`] (the Player component connecting its frame
+/// channel); every engine mutation pushes the new project snapshot in via
+/// [`sync_playback`].
 #[derive(Default)]
 pub struct AppState {
-    player: Arc<Mutex<Option<Player>>>,
+    playback: Arc<Mutex<Option<TimelinePlayer>>>,
+}
+
+/// Push the current project snapshot into the playback engine (called by
+/// the engine IPC layer after every committed/transient change).
+pub fn sync_playback(app: &AppHandle, project: cutty_engine::Project) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let guard = state.playback.lock().expect("playback state poisoned");
+        if let Some(player) = guard.as_ref() {
+            player.set_project(project);
+        }
+    }
 }
 
 /// Probe a media file and return its properties.
@@ -38,16 +52,19 @@ pub struct ProxyProgressEvent {
 /// Generate (or fetch from cache) the 720p proxy for a media file.
 ///
 /// Emits `proxy://progress` events while encoding; resolves with the proxy
-/// path when done.
+/// path when done. On success the playback engine re-resolves its sources,
+/// so clips waiting on this proxy start rendering.
 #[tauri::command]
 pub async fn generate_proxy(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     path: String,
     duration_hint: Option<f64>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let emit_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let result = cutty_media::generate_proxy(path.as_ref(), duration_hint, |p| {
-            let _ = app.emit(
+            let _ = emit_app.emit(
                 "proxy://progress",
                 ProxyProgressEvent {
                     src_path: path.clone(),
@@ -61,7 +78,12 @@ pub async fn generate_proxy(
     })
     .await
     .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    if let Some(player) = state.playback.lock().expect("playback poisoned").as_ref() {
+        player.refresh_sources();
+    }
+    Ok(result)
 }
 
 /// Extract (or fetch from cache) the thumbnail for a media file and return
@@ -109,22 +131,24 @@ fn frame_message(pts_sec: f64, width: u32, height: u32, jpeg: &[u8]) -> Vec<u8> 
     msg
 }
 
-/// Open the playback engine on a proxy file. Frames stream over `on_frame`
-/// (binary channel); position/EOF/errors arrive as JSON events. Replaces
-/// any previously open player.
+/// Start (or restart) the timeline playback engine on the current
+/// project. Frames stream over `on_frame` (binary channel);
+/// position/EOF/errors arrive as JSON events. Called once by the Player
+/// component when it mounts.
 #[tauri::command]
-pub async fn open_player(
+pub async fn playback_attach(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    path: String,
+    engine: State<'_, EngineHandle>,
     on_frame: Channel<InvokeResponseBody>,
-) -> Result<PlayerInfo, String> {
-    let state_player = state.player.clone();
+) -> Result<(), String> {
+    let project = engine.0.lock().expect("engine poisoned").project().clone();
+    let playback = state.playback.clone();
+
     tauri::async_runtime::spawn_blocking(move || {
-        // One guard across replace-and-create: concurrent open_player
-        // calls serialize here instead of both installing a live player.
-        let mut guard = state_player.lock().expect("player state poisoned");
-        // Drop any existing player first (joins its threads).
+        // One guard across replace-and-create: concurrent attach calls
+        // serialize here. Drop any previous player first (joins threads).
+        let mut guard = playback.lock().expect("playback state poisoned");
         guard.take();
 
         let sink = Box::new(move |event: PlayerEvent| match event {
@@ -159,63 +183,54 @@ pub async fn open_player(
             }
         });
 
-        let player = Player::open(path.as_ref(), sink).map_err(|e| e.to_string())?;
-        let info = player.info().clone();
+        let player = TimelinePlayer::open(project, sink).map_err(|e| e.to_string())?;
         *guard = Some(player);
-        Ok(info)
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// Tear down the active player, if any.
-#[tauri::command]
-pub async fn close_player(state: State<'_, AppState>) -> Result<(), String> {
-    let state_player = state.player.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        state_player.lock().expect("player state poisoned").take();
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
 /// Transport: toggle play/pause (Space).
 #[tauri::command]
-pub async fn player_toggle(state: State<'_, AppState>) -> Result<(), String> {
-    with_player(&state, |p| p.toggle_play())
+pub async fn playback_toggle(state: State<'_, AppState>) -> Result<(), String> {
+    with_playback(&state, |p| p.toggle_play())
 }
 
 /// Transport: play.
 #[tauri::command]
-pub async fn player_play(state: State<'_, AppState>) -> Result<(), String> {
-    with_player(&state, |p| p.play())
+pub async fn playback_play(state: State<'_, AppState>) -> Result<(), String> {
+    with_playback(&state, |p| p.play())
 }
 
 /// Transport: pause.
 #[tauri::command]
-pub async fn player_pause(state: State<'_, AppState>) -> Result<(), String> {
-    with_player(&state, |p| p.pause())
+pub async fn playback_pause(state: State<'_, AppState>) -> Result<(), String> {
+    with_playback(&state, |p| p.pause())
 }
 
-/// Transport: seek to an absolute position in seconds.
+/// Transport: seek/scrub to an absolute timeline position in seconds.
 #[tauri::command]
-pub async fn player_seek(state: State<'_, AppState>, position_sec: f64) -> Result<(), String> {
-    with_player(&state, |p| p.seek(position_sec))
+pub async fn playback_seek(state: State<'_, AppState>, position_sec: f64) -> Result<(), String> {
+    with_playback(&state, |p| p.seek(position_sec))
 }
 
-/// Transport: step by `delta` frames (negative = backwards).
+/// Transport: step by `delta` project frames (negative = backwards).
 #[tauri::command]
-pub async fn player_step(state: State<'_, AppState>, delta: i64) -> Result<(), String> {
-    with_player(&state, |p| p.step(delta))
+pub async fn playback_step(state: State<'_, AppState>, delta: i64) -> Result<(), String> {
+    with_playback(&state, |p| p.step(delta))
 }
 
-fn with_player(state: &State<'_, AppState>, f: impl FnOnce(&Player)) -> Result<(), String> {
-    match state.player.lock().expect("player state poisoned").as_ref() {
+fn with_playback(
+    state: &State<'_, AppState>,
+    f: impl FnOnce(&TimelinePlayer),
+) -> Result<(), String> {
+    match state.playback.lock().expect("playback poisoned").as_ref() {
         Some(p) => {
             f(p);
             Ok(())
         }
-        None => Err("no player is open".into()),
+        None => Err("playback engine is not attached".into()),
     }
 }
 
@@ -230,7 +245,8 @@ pub struct ExportResult {
 
 /// Losslessly trim `[in_sec, out_sec]` of `src_path` into `dst_path`
 /// (stream copy — the cut starts on the keyframe at or before `in_sec`;
-/// the result reports the actual bounds).
+/// the result reports the actual bounds). Used by the export prompt later
+/// in Phase 1.
 #[tauri::command]
 pub async fn export_trim(
     src_path: String,

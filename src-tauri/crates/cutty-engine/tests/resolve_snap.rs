@@ -4,7 +4,8 @@ mod common;
 
 use common::{engine_with_media, Fixture};
 use cutty_engine::{
-    resolve, snap, snap_candidates, snap_clip_move, snap_time, ClipId, EngineError, TrackKind,
+    active_video_clip, next_boundary_after, resolve, snap, snap_candidates, snap_clip_move,
+    snap_time, timeline_end, ClipId, EngineError, TrackKind,
 };
 
 // ---------------------------------------------------------------------
@@ -120,6 +121,91 @@ fn resolver_skips_muted_tracks() {
     let active = resolve(&project, 1.0);
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].track_id, video);
+}
+
+#[test]
+fn active_video_clip_prefers_video_tracks_and_skips_gaps() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    let v = engine.add_clip(video, media, 1.0, 0.0, 3.0).expect("v");
+    engine.add_clip(audio, media, 0.0, 0.0, 8.0).expect("a");
+
+    // Audio-only coverage at t=0.5: no video clip.
+    assert_eq!(active_video_clip(engine.project(), 0.5), None);
+
+    let active = active_video_clip(engine.project(), 2.0).expect("active");
+    assert_eq!(active.clip_id, v);
+    assert_eq!(active.source_time, 1.0);
+
+    // Muted video track hides its clips.
+    let mut project = engine.project().clone();
+    project
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == TrackKind::Video)
+        .expect("video track")
+        .muted = true;
+    assert_eq!(active_video_clip(&project, 2.0), None);
+    assert_eq!(active_video_clip(&project, f64::NAN), None);
+}
+
+#[test]
+fn timeline_end_is_the_latest_out_point_across_tracks() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    assert_eq!(timeline_end(engine.project()), 0.0, "empty project");
+
+    engine.add_clip(video, media, 0.0, 0.0, 2.0).expect("v");
+    engine.add_clip(audio, media, 5.0, 0.0, 4.0).expect("a");
+    assert_eq!(timeline_end(engine.project()), 9.0);
+
+    // Muted tracks still count — muting hides, it doesn't shorten.
+    let mut project = engine.project().clone();
+    project
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == TrackKind::Audio)
+        .expect("audio track")
+        .muted = true;
+    assert_eq!(timeline_end(&project), 9.0);
+}
+
+#[test]
+fn next_boundary_after_walks_clip_edges_in_order() {
+    let Fixture {
+        mut engine,
+        media,
+        video,
+        audio,
+    } = engine_with_media();
+    engine.add_clip(video, media, 1.0, 0.0, 2.0).expect("v"); // edges 1, 3
+    engine.add_clip(audio, media, 2.0, 0.0, 3.0).expect("a"); // edges 2, 5
+
+    let project = engine.project();
+    assert_eq!(next_boundary_after(project, 0.0), Some(1.0));
+    assert_eq!(next_boundary_after(project, 1.0), Some(2.0), "strictly after");
+    assert_eq!(next_boundary_after(project, 2.5), Some(3.0));
+    assert_eq!(next_boundary_after(project, 3.0), Some(5.0));
+    assert_eq!(next_boundary_after(project, 5.0), None, "nothing after end");
+    assert_eq!(next_boundary_after(project, f64::NAN), None);
+
+    // Muted tracks contribute no boundaries (nothing to wait for there).
+    let mut muted = project.clone();
+    muted
+        .tracks
+        .iter_mut()
+        .find(|t| t.kind == TrackKind::Audio)
+        .expect("audio track")
+        .muted = true;
+    assert_eq!(next_boundary_after(&muted, 1.0), Some(3.0));
 }
 
 // ---------------------------------------------------------------------

@@ -38,5 +38,7 @@ pub use model::{
     Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId, TrackKind,
     Transform, EPS, MIN_CLIP_DURATION,
 };
-pub use resolve::{resolve, ActiveClip};
+pub use resolve::{
+    active_video_clip, next_boundary_after, resolve, timeline_end, ActiveClip,
+};
 pub use snap::{snap, snap_candidates, snap_clip_move, snap_time, SnappedMove};

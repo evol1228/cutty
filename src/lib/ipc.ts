@@ -67,15 +67,11 @@ export function pathsExist(paths: string[]): Promise<boolean[]> {
   return invoke<boolean[]>("paths_exist", { paths });
 }
 
-// --- Player ---
-
-export interface PlayerInfo {
-  width: number;
-  height: number;
-  fps: number;
-  durationSec: number;
-  hasAudio: boolean;
-}
+// --- Timeline playback ---
+//
+// The Rust playback engine owns the clock and everything that moves: the
+// frontend attaches one binary frame channel, sends transport commands,
+// and renders position events. Timeline time is the only time.
 
 export interface PositionEvent {
   positionSec: number;
@@ -87,6 +83,7 @@ export const PLAYER_EOF_EVENT = "player://eof";
 export const PLAYER_ERROR_EVENT = "player://error";
 
 export interface FrameMessage {
+  /** Timeline presentation time, seconds. */
   ptsSec: number;
   width: number;
   height: number;
@@ -104,30 +101,38 @@ function parseFrameMessage(buf: ArrayBuffer): FrameMessage {
   };
 }
 
-export function openPlayer(
-  path: string,
+/** Start (or restart) the playback engine, streaming frames to `onFrame`. */
+export function attachPlayback(
   onFrame: (frame: FrameMessage) => void,
-): Promise<PlayerInfo> {
+): Promise<void> {
   const channel = new Channel<ArrayBuffer>();
   channel.onmessage = (buf) => onFrame(parseFrameMessage(buf));
-  return invoke<PlayerInfo>("open_player", { path, onFrame: channel });
+  return invoke("playback_attach", { onFrame: channel });
 }
 
-export function closePlayer(): Promise<void> {
-  return invoke("close_player");
+export function playbackToggle(): Promise<void> {
+  return invoke("playback_toggle");
 }
 
-export function playerToggle(): Promise<void> {
-  return invoke("player_toggle");
+export function playbackPlay(): Promise<void> {
+  return invoke("playback_play");
 }
 
-export function playerSeek(positionSec: number): Promise<void> {
-  return invoke("player_seek", { positionSec });
+export function playbackPause(): Promise<void> {
+  return invoke("playback_pause");
 }
 
-export function playerStep(delta: number): Promise<void> {
-  return invoke("player_step", { delta });
+/** Seek/scrub to an absolute timeline position (paused: shows the frame). */
+export function playbackSeek(positionSec: number): Promise<void> {
+  return invoke("playback_seek", { positionSec });
 }
+
+/** Step by `delta` project frames (negative = backwards). Pauses. */
+export function playbackStep(delta: number): Promise<void> {
+  return invoke("playback_step", { delta });
+}
+
+// --- Export (Phase 0 spike; the export dialog prompt replaces this) ---
 
 export interface ExportResult {
   path: string;

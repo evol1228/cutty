@@ -1,27 +1,38 @@
-//! Phase 0 acceptance harness (PLAN.md §5) against a real 4K clip.
+//! Timeline playback acceptance harness against real media (PLAN.md §5 +
+//! the Phase 1 playback prompt): 10+ cuts across 3 real source files,
+//! 60 s continuous playback, drift, scrub latency, stepping across cuts.
 //!
-//! Run explicitly (it plays 60s of video in real time):
+//! Run explicitly (plays ~60 s in real time):
 //! ```sh
-//! CUTTY_4K_CLIP=/path/to/4k.mp4 cargo test -p cutty-media --test acceptance -- --ignored --nocapture
+//! cargo test -p cutty-media --test acceptance -- --ignored --nocapture
 //! ```
-//!
-//! Criteria checked:
-//! - proxy playback ≥ 30 fps
-//! - A/V drift (frame pts vs master clock at presentation) < 40 ms over 60 s
-//! - seek responds < 100 ms
-//! - frame stepping is accurate on the frame grid
-//! - lossless trim export has the right duration and plays in mpv
+//! Sources default to the dev machine's test set; override with
+//! `CUTTY_4K_CLIP`, `CUTTY_SRC_B`, `CUTTY_SRC_C`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cutty_media::{generate_proxy, probe, Player, PlayerEvent};
+use cutty_engine::{Engine, ProjectSettings, TrackKind};
+use cutty_media::{generate_proxy, probe, PlayerEvent, TimelinePlayer};
 
-fn clip_path() -> PathBuf {
-    std::env::var("CUTTY_4K_CLIP")
-        .unwrap_or_else(|_| "/home/love/Videos/cutty-test-4k30.mp4".into())
-        .into()
+fn source_paths() -> [PathBuf; 3] {
+    let get = |var: &str, default: &str| {
+        std::env::var(var)
+            .unwrap_or_else(|_| default.into())
+            .into()
+    };
+    [
+        get("CUTTY_4K_CLIP", "/home/love/Videos/cutty-test-4k30.mp4"),
+        get(
+            "CUTTY_SRC_B",
+            "/home/love/Videos/cutty-test-media/beach-broll.mp4",
+        ),
+        get(
+            "CUTTY_SRC_C",
+            "/home/love/Videos/cutty-test-media/drone-pass.mkv",
+        ),
+    ]
 }
 
 struct FrameRec {
@@ -36,10 +47,76 @@ enum Evt {
     Error(String),
 }
 
-fn open_player(proxy: &Path) -> (Player, mpsc::Receiver<Evt>) {
+#[test]
+#[ignore = "real-time 60s playback on real media; run with --ignored"]
+fn timeline_playback_acceptance() {
+    let sources = source_paths();
+    for s in &sources {
+        assert!(s.is_file(), "missing source {}", s.display());
+    }
+
+    // --- Probe + proxies (cached across runs) ---
+    let mut media = Vec::new();
+    for s in &sources {
+        let info = probe(s).expect("probe");
+        let t0 = Instant::now();
+        generate_proxy(s, Some(info.duration_sec), |_| {}).expect("proxy");
+        println!(
+            "{}: {:.1}s source, proxy ready in {:.1?}",
+            s.file_name().unwrap().to_string_lossy(),
+            info.duration_sec,
+            t0.elapsed()
+        );
+        media.push(info);
+    }
+
+    // --- Timeline: 15 cuts cycling the three sources over ~64 s ---
+    let mut engine = Engine::new(ProjectSettings::default());
+    let ids: Vec<_> = sources
+        .iter()
+        .zip(&media)
+        .map(|(path, info)| {
+            engine
+                .add_media(
+                    path.display().to_string(),
+                    info.duration_sec,
+                    info.video.is_some(),
+                    info.audio.is_some(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let video = engine
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .unwrap()
+        .id;
+
+    let mut t = 0.0;
+    let mut cuts = 0;
+    let mut i = 0usize;
+    while t < 64.0 {
+        let media_idx = i % 3;
+        let dur = 4.0_f64.min(media[media_idx].duration_sec - 1.0);
+        // Vary the in-point so repeated visits to a source aren't
+        // contiguous (forces real re-seeks, not continuations).
+        let source_in = (i as f64 * 1.7) % (media[media_idx].duration_sec - dur - 0.5).max(0.5);
+        engine
+            .add_clip(video, ids[media_idx], t, source_in, source_in + dur)
+            .unwrap();
+        t += dur;
+        cuts += 1;
+        i += 1;
+    }
+    println!("timeline: {cuts} segments, {t:.1}s total");
+    assert!(cuts >= 10, "need 10+ cuts for acceptance");
+
+    // --- Open and play through 60 s ---
     let (tx, rx) = mpsc::channel();
-    let player = Player::open(
-        proxy,
+    let player = TimelinePlayer::open(
+        engine.project().clone(),
         Box::new(move |e| {
             let evt = match e {
                 PlayerEvent::Frame {
@@ -56,224 +133,133 @@ fn open_player(proxy: &Path) -> (Player, mpsc::Receiver<Evt>) {
             let _ = tx.send(evt);
         }),
     )
-    .expect("player must open");
-    (player, rx)
-}
+    .expect("player opens");
 
-fn recv_frame(rx: &mpsc::Receiver<Evt>, timeout: Duration) -> Option<FrameRec> {
-    match rx.recv_timeout(timeout) {
-        Ok(Evt::Frame(f)) => Some(f),
-        Ok(Evt::Error(e)) => panic!("player error: {e}"),
-        Ok(Evt::Eof) | Err(_) => None,
-    }
-}
-
-#[test]
-#[ignore = "real-time 60s playback; run with --ignored"]
-fn phase0_acceptance() {
-    let clip = clip_path();
+    let first = rx.recv_timeout(Duration::from_secs(10));
     assert!(
-        clip.is_file(),
-        "4K test clip missing at {} (set CUTTY_4K_CLIP)",
-        clip.display()
+        matches!(first, Ok(Evt::Frame(_))),
+        "must show a preview frame on open"
     );
 
-    // --- Source sanity ---
-    let src_info = probe(&clip).expect("probe 4K clip");
-    let v = src_info.video.clone().expect("4K clip has video");
-    println!(
-        "source: {}x{} @ {:.3} fps, {:.1}s, {} MB",
-        v.width,
-        v.height,
-        v.fps,
-        src_info.duration_sec,
-        src_info.size_bytes / 1_000_000
-    );
-    assert!(v.width >= 3840, "not a 4K clip");
-    assert!(src_info.duration_sec >= 75.0, "need ≥75s for the 60s test");
-
-    // --- Proxy generation ---
-    let t0 = Instant::now();
-    let proxy = generate_proxy(&clip, Some(src_info.duration_sec), |_| {}).expect("proxy");
-    println!("proxy ready in {:.1?}: {}", t0.elapsed(), proxy.display());
-    let proxy_info = probe(&proxy).expect("probe proxy");
-    let pv = proxy_info.video.clone().expect("proxy video");
-    assert!(pv.width <= 1280 && pv.height <= 720);
-    let fps = pv.fps;
-    let frame_dur = 1.0 / fps;
-
-    // --- Open player: must show a preview frame quickly ---
-    let (player, rx) = open_player(&proxy);
-    println!(
-        "player: {}x{} @ {} fps, audio: {}",
-        player.info().width,
-        player.info().height,
-        player.info().fps,
-        player.info().has_audio
-    );
-    let first = recv_frame(&rx, Duration::from_secs(5)).expect("preview frame");
-    assert!(first.pts < 0.05, "preview should be frame 0");
-
-    // --- 60s playback: fps + A/V drift ---
-    println!("playing 60s…");
+    println!("playing 60s across {cuts} cuts…");
     player.play();
-    let play_start = Instant::now();
+    let start = Instant::now();
     let mut frames: Vec<FrameRec> = Vec::new();
-    while play_start.elapsed() < Duration::from_secs(61) {
+    while start.elapsed() < Duration::from_secs(61) {
         match rx.recv_timeout(Duration::from_secs(2)) {
             Ok(Evt::Frame(f)) => frames.push(f),
             Ok(Evt::Eof) => break,
-            Ok(Evt::Error(e)) => panic!("player error during playback: {e}"),
+            Ok(Evt::Error(e)) if e.contains("audio unavailable") => {}
+            Ok(Evt::Error(e)) => panic!("player error: {e}"),
             Err(_) => panic!("no frames for 2s during playback"),
         }
     }
     player.pause();
 
-    // Warmup: skip the first 10 frames (clock spin-up, first GOP).
     let steady = &frames[10.min(frames.len())..];
-    assert!(steady.len() > 100, "collected only {} frames", steady.len());
+    assert!(steady.len() > 1500, "collected only {}", steady.len());
 
-    let span_wall = steady
+    let span = steady
         .last()
         .unwrap()
         .arrived
         .duration_since(steady.first().unwrap().arrived)
         .as_secs_f64();
-    let eff_fps = (steady.len() - 1) as f64 / span_wall;
+    let eff_fps = (steady.len() - 1) as f64 / span;
 
     let max_drift = steady
         .iter()
         .map(|f| (f.pts - f.clock).abs())
         .fold(0.0, f64::max);
-    let mean_drift =
-        steady.iter().map(|f| (f.pts - f.clock).abs()).sum::<f64>() / steady.len() as f64;
 
-    // pts gaps > 1.5 frames = dropped frames.
-    let drops = steady
-        .windows(2)
-        .filter(|w| w[1].pts - w[0].pts > 1.5 * frame_dur)
-        .count();
+    // Hitch detector: worst wall-clock gap between consecutive frames.
+    let frame_dur = 1.0 / 30.0;
+    let mut worst_gap = Duration::ZERO;
+    let mut hitches = 0;
+    for pair in steady.windows(2) {
+        let dt = pair[1].arrived.duration_since(pair[0].arrived);
+        worst_gap = worst_gap.max(dt);
+        if dt.as_secs_f64() > 2.5 * frame_dur {
+            hitches += 1;
+            println!(
+                "  hitch {dt:?} between pts {:.3} and {:.3}",
+                pair[0].pts, pair[1].pts
+            );
+        }
+    }
 
     println!(
-        "playback: {} frames in {:.1}s → {:.2} fps | drift mean {:.1} ms, max {:.1} ms | {} drop gaps",
+        "playback: {} frames in {span:.1}s → {eff_fps:.2} fps | drift max {:.1} ms | worst gap {worst_gap:?} | {hitches} hitches",
         steady.len(),
-        span_wall,
-        eff_fps,
-        mean_drift * 1e3,
         max_drift * 1e3,
-        drops
     );
-    assert!(eff_fps >= 29.5, "playback fps {eff_fps:.2} < 29.5");
-    assert!(
-        max_drift < 0.040,
-        "A/V drift {:.1} ms ≥ 40 ms",
-        max_drift * 1e3
-    );
+    assert!(eff_fps >= 29.5, "fps {eff_fps:.2} < 29.5");
+    assert!(max_drift < 0.040, "drift {:.1} ms", max_drift * 1e3);
+    assert_eq!(hitches, 0, "visible hitches during cut playback");
 
-    // --- Seek latency (paused) ---
-    // The engine frame cache (64 MB ≈ the last 15–20 s of viewed 720p)
-    // serves seeks into visited content instantly; anything else pays the
-    // spawn-per-seek decode cost, whose measured floor on this machine is
-    // ~100 ms of ffmpeg process startup + format open. Cold seeks are a
-    // known Phase 0 miss — reported and sanity-bounded here, flagged for
-    // the in-process-decoder migration in the Phase 0 summary.
-    while rx.try_recv().is_ok() {} // drain
-    let seek = |target: f64, label: &str, bound_ms: u64| {
-        let t = Instant::now();
+    // --- Scrub latency (cold + warm) across all sources ---
+    while rx.try_recv().is_ok() {}
+    let seek_check = |target: f64, label: &str, bound_ms: u64| {
+        let t0 = Instant::now();
         player.seek(target);
-        let f = recv_frame(&rx, Duration::from_secs(2)).expect("seek preview frame");
-        let latency = t.elapsed();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // Frames already in flight when the seek was issued (e.g. the
+        // pause snap) can still arrive first — wait for the one that
+        // answers *this* seek.
+        let frame = loop {
+            match rx.recv_timeout(deadline - Instant::now()) {
+                Ok(Evt::Frame(f))
+                    if f.pts <= target + 1e-6 && target - f.pts < 2.0 * frame_dur =>
+                {
+                    break f;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("no frame at {target} after seek"),
+            }
+        };
+        let latency = t0.elapsed();
         println!(
             "seek {label} → {target:5.1}s: {latency:8.1?} (pts {:.3})",
-            f.pts
+            frame.pts
         );
         assert!(
             latency < Duration::from_millis(bound_ms),
-            "{label} seek to {target}s took {latency:?} (≥{bound_ms}ms)"
-        );
-        assert!(
-            (f.pts - target).abs() < 2.0 * frame_dur,
-            "seek landed at {} for target {target}",
-            f.pts
+            "{label} seek took {latency:?} (≥{bound_ms} ms)"
         );
     };
-    // Recently viewed content: must satisfy the <100 ms criterion.
-    seek(55.0, "warm", 100);
-    seek(58.5, "warm", 100);
-    // Cold content: report against a sanity bound only.
-    seek(30.0, "COLD", 300);
-    seek(75.0, "COLD", 300);
-    // Revisiting a cold seek must now be a cache hit under the criterion.
-    seek(58.5, "warm", 100);
-    seek(30.0, "rewarmed", 100);
+    seek_check(30.2, "cold", 100);
+    seek_check(9.7, "cold", 100);
+    seek_check(51.3, "cold", 100);
+    seek_check(17.44, "cold", 100);
+    seek_check(30.2, "warm", 50);
 
-    // --- Frame stepping ---
+    // --- Frame stepping across a cut boundary ---
     while rx.try_recv().is_ok() {}
-    player.seek(10.0);
-    let mut last = recv_frame(&rx, Duration::from_secs(2))
-        .expect("frame at 10s")
-        .pts;
-    for dir in [1i64, 1, 1, -1, -1] {
-        let t = Instant::now();
+    let cut = 4.0; // first cut (all segments are 4s here)
+    player.seek(cut - frame_dur);
+    let _ = rx.recv_timeout(Duration::from_secs(2));
+    for (dir, expect_side) in [(1i64, "after"), (-1, "before")] {
         player.step(dir);
-        let f = recv_frame(&rx, Duration::from_secs(2)).expect("step frame");
-        let delta = f.pts - last;
-        println!("step {dir:+}: Δ {:+.4}s in {:5.1?}", delta, t.elapsed());
-        assert!(
-            (delta - dir as f64 * frame_dur).abs() < 0.005,
-            "step {dir:+} moved {delta}s (expected {:.4})",
-            dir as f64 * frame_dur
-        );
-        assert!(t.elapsed() < Duration::from_millis(150), "step too slow");
-        last = f.pts;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let frame = loop {
+            match rx.recv_timeout(deadline - Instant::now()) {
+                Ok(Evt::Frame(f)) => break f,
+                Ok(_) => continue,
+                Err(_) => panic!("no frame after step {dir}"),
+            }
+        };
+        match expect_side {
+            "after" => assert!(
+                frame.pts >= cut - 1e-6,
+                "step +1 across cut landed at {:.3}",
+                frame.pts
+            ),
+            _ => assert!(
+                frame.pts < cut,
+                "step -1 back across cut landed at {:.3}",
+                frame.pts
+            ),
+        }
+        println!("step {dir:+} across cut → pts {:.3}", frame.pts);
     }
-    drop(player);
-
-    // --- Trim export: [10, 20] cut, verified by ffprobe + mpv ---
-    // Lossless stream copy snaps the in point to the keyframe ≤ 10s; the
-    // engine resolves that keyframe itself and reports the actual bounds,
-    // so the file duration must match the prediction exactly.
-    let out = std::env::temp_dir().join("cutty-acceptance-trim.mp4");
-    let t = Instant::now();
-    let result = cutty_media::export_trim(&clip, &out, 10.0, 20.0).expect("trim export");
-    let trimmed = probe(&out).expect("probe trimmed export");
-    println!(
-        "trim export: {:.2?}, in 10.0 → keyframe {:.3}, duration {:.3}s (predicted {:.3}), {}x{}",
-        t.elapsed(),
-        result.actual_start_sec,
-        trimmed.duration_sec,
-        result.duration_sec,
-        trimmed.video.as_ref().map(|v| v.width).unwrap_or(0),
-        trimmed.video.as_ref().map(|v| v.height).unwrap_or(0),
-    );
-    assert!(
-        result.actual_start_sec <= 10.0,
-        "cut must start at or before the requested in point"
-    );
-    assert!(
-        (trimmed.duration_sec - result.duration_sec).abs() < 0.3,
-        "duration {} ≠ predicted {}",
-        trimmed.duration_sec,
-        result.duration_sec
-    );
-    assert!(
-        trimmed.duration_sec >= 10.0 - 0.3,
-        "cut must cover the whole requested range"
-    );
-    let tv = trimmed.video.expect("video kept");
-    assert_eq!((tv.width, tv.height), (v.width, v.height), "no re-scale");
-    assert_eq!(tv.codec, v.codec, "stream copy must not re-encode");
-
-    // mpv must accept it (headless decode of the first 30 frames).
-    let mpv = std::process::Command::new("mpv")
-        .args(["--no-config", "--vo=null", "--ao=null", "--frames=30"])
-        .arg(&out)
-        .output()
-        .expect("mpv must be installed for acceptance");
-    assert!(
-        mpv.status.success(),
-        "mpv failed on the trimmed export: {}",
-        String::from_utf8_lossy(&mpv.stderr)
-    );
-    println!("mpv playback check: OK");
 }

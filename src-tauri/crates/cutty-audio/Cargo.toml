@@ -7,5 +7,18 @@ edition.workspace = true
 [dependencies]
 cpal = "0.18.1"
 ringbuf = "0.4"
-symphonia = { version = "0.6.0", default-features = false, features = ["isomp4", "aac", "opt-simd"] }
+# Formats/codecs: MP4/AAC covers proxies (always transcoded to LC-AAC);
+# the rest covers audio-only originals placed straight on the audio track.
+symphonia = { version = "0.6.0", default-features = false, features = [
+    "isomp4",
+    "aac",
+    "mp3",
+    "wav",
+    "pcm",
+    "flac",
+    "ogg",
+    "vorbis",
+    "adpcm",
+    "opt-simd",
+] }
 thiserror.workspace = true

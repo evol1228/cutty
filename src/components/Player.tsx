@@ -1,16 +1,25 @@
-import { useEffect, useRef, useState } from "react";
+// Center panel: the preview player. Renders whatever the Rust playback
+// engine presents (it owns the clock, decoding, and all timeline logic) —
+// this component attaches the binary frame channel, sends transport
+// commands, and mirrors position events into the stores.
+
+import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  attachPlayback,
   PLAYER_EOF_EVENT,
   PLAYER_ERROR_EVENT,
   PLAYER_POSITION_EVENT,
-  playerSeek,
-  playerStep,
-  playerToggle,
+  playbackStep,
+  playbackToggle,
   type PositionEvent,
 } from "../lib/ipc";
-import { setFrameHandler } from "../lib/frameSink";
+import { dispatchFrame, setFrameHandler } from "../lib/frameSink";
 import { usePlayerStore } from "../state/playerStore";
+import { useProjectStore } from "../state/projectStore";
+import { toast } from "../state/toastStore";
+import { timelineEndSec } from "../timeline/actions";
+import { ensureVisible } from "../timeline/view";
 
 /** HH:MM:SS:FF timecode. */
 function timecode(sec: number, fps: number): string {
@@ -22,16 +31,30 @@ function timecode(sec: number, fps: number): string {
   return `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}:${pad(ff)}`;
 }
 
-const SEEK_THROTTLE_MS = 80;
+/** Preview canvas resolution: the project frame fit within 1280×720. */
+function previewSize(width: number, height: number): [number, number] {
+  const scale = Math.min(1280 / width, 720 / height, 1);
+  return [Math.round(width * scale), Math.round(height * scale)];
+}
+
+let attachStarted = false;
 
 function Player() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { playerInfo, playing, positionSec, inPointSec, outPointSec } =
-    usePlayerStore();
-  const setInPoint = usePlayerStore((s) => s.setInPoint);
-  const setOutPoint = usePlayerStore((s) => s.setOutPoint);
+  const attached = usePlayerStore((s) => s.attached);
+  const playing = usePlayerStore((s) => s.playing);
+  const playheadSec = useProjectStore((s) => s.playheadSec);
+  const project = useProjectStore((s) => s.project);
 
-  // Paint decoded frames. Bypasses React entirely — see frameSink.
+  const fps = project?.settings.fps ?? 30;
+  const durationSec = project ? timelineEndSec(project) : 0;
+  const [canvasW, canvasH] = previewSize(
+    project?.settings.width ?? 1920,
+    project?.settings.height ?? 1080,
+  );
+
+  // Paint presented frames, letterboxed into the project-shaped canvas.
+  // Bypasses React entirely (30–60 events/s) — see frameSink.
   useEffect(() => {
     let dispatched = 0;
     let drawn = 0;
@@ -47,32 +70,48 @@ function Player() {
         const canvas = canvasRef.current;
         const ctx = canvas?.getContext("2d");
         if (canvas && ctx) {
-          if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-            canvas.width = bmp.width;
-            canvas.height = bmp.height;
-          }
-          ctx.drawImage(bmp, 0, 0);
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          const scale = Math.min(
+            canvas.width / bmp.width,
+            canvas.height / bmp.height,
+          );
+          const dw = bmp.width * scale;
+          const dh = bmp.height * scale;
+          ctx.drawImage(bmp, (canvas.width - dw) / 2, (canvas.height - dh) / 2, dw, dh);
         }
         bmp.close();
-        usePlayerStore.getState().setPosition(frame.ptsSec);
       });
     });
     return () => setFrameHandler(null);
   }, []);
 
-  // Engine transport events.
+  // Attach the playback engine once (idempotent under StrictMode).
+  useEffect(() => {
+    if (attachStarted) return;
+    attachStarted = true;
+    attachPlayback(dispatchFrame)
+      .then(() => usePlayerStore.getState().setAttached(true))
+      .catch((err: unknown) => {
+        attachStarted = false;
+        toast(`Playback engine failed to start: ${String(err)}`, "error");
+      });
+  }, []);
+
+  // Engine transport events: the engine clock drives the playhead.
   useEffect(() => {
     const unlistens = [
       listen<PositionEvent>(PLAYER_POSITION_EVENT, (e) => {
-        const s = usePlayerStore.getState();
-        s.setPlaying(e.payload.playing);
-        if (!e.payload.playing) s.setPosition(e.payload.positionSec);
+        usePlayerStore.getState().setPlaying(e.payload.playing);
+        useProjectStore.getState().setPlayhead(e.payload.positionSec);
+        if (e.payload.playing) ensureVisible(e.payload.positionSec);
       }),
       listen(PLAYER_EOF_EVENT, () => {
         usePlayerStore.getState().setPlaying(false);
       }),
       listen<string>(PLAYER_ERROR_EVENT, (e) => {
-        console.error("player error:", e.payload);
+        console.warn("playback:", e.payload);
+        toast(e.payload, "error");
       }),
     ];
     return () => {
@@ -80,66 +119,7 @@ function Player() {
     };
   }, []);
 
-  // Keyboard transport: Space toggle, ←/→ frame step. Steps are gated on
-  // the previous invoke resolving — OS key auto-repeat (~30 Hz) must not
-  // queue up ~110 ms cold-decode restarts faster than they complete.
-  const stepInFlight = useRef(false);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!usePlayerStore.getState().playerInfo) return;
-      // Don't hijack keys meant for a focused control (buttons activate
-      // on Space; inputs need their arrows).
-      const target = e.target as HTMLElement | null;
-      if (target?.closest("button, input, select, textarea, [contenteditable]")) {
-        return;
-      }
-      if (e.code === "Space") {
-        e.preventDefault();
-        if (!e.repeat) void playerToggle();
-      } else if (e.code === "ArrowLeft" || e.code === "ArrowRight") {
-        e.preventDefault();
-        if (stepInFlight.current) return;
-        stepInFlight.current = true;
-        playerStep(e.code === "ArrowLeft" ? -1 : 1).finally(() => {
-          stepInFlight.current = false;
-        });
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // Slider seeks, throttled so scrubbing doesn't spam decoder restarts.
-  // While dragging, the slider shows the pointer value — in-flight frame
-  // messages must not yank it back to the old position.
-  const [scrubValue, setScrubValue] = useState<number | null>(null);
-  const lastSeek = useRef(0);
-  const pendingSeek = useRef<number | null>(null);
-  function onScrub(value: number) {
-    setScrubValue(value);
-    const now = performance.now();
-    if (now - lastSeek.current >= SEEK_THROTTLE_MS) {
-      lastSeek.current = now;
-      void playerSeek(value);
-    } else if (pendingSeek.current === null) {
-      const wait = SEEK_THROTTLE_MS - (now - lastSeek.current);
-      pendingSeek.current = value;
-      setTimeout(() => {
-        const v = pendingSeek.current;
-        pendingSeek.current = null;
-        lastSeek.current = performance.now();
-        if (v !== null) void playerSeek(v);
-      }, wait);
-    } else {
-      pendingSeek.current = value;
-    }
-  }
-  function endScrub() {
-    setScrubValue(null);
-  }
-
-  const fps = playerInfo?.fps ?? 30;
-  const duration = playerInfo?.durationSec ?? 0;
+  const transportReady = attached && durationSec > 0;
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-zinc-950">
@@ -148,71 +128,42 @@ function Player() {
           id="player-canvas"
           ref={canvasRef}
           className="max-h-full max-w-full rounded bg-black"
-          width={1280}
-          height={720}
+          width={canvasW}
+          height={canvasH}
         />
       </div>
-      <div className="flex h-12 shrink-0 items-center gap-3 border-t border-zinc-800 bg-zinc-900 px-4">
-        <span className="font-mono text-zinc-400" title="position">
-          {timecode(positionSec, fps)}
+      <div className="flex h-12 shrink-0 items-center justify-center gap-3 border-t border-zinc-800 bg-zinc-900 px-4">
+        <span className="font-mono text-zinc-400" title="playhead">
+          {timecode(playheadSec, fps)}
         </span>
         <button
-          disabled={!playerInfo}
-          onClick={() => void playerStep(-1)}
+          disabled={!transportReady}
+          onClick={() => void playbackStep(-1)}
           className="rounded bg-zinc-800 px-2 py-1 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
           title="Previous frame (←)"
         >
           ⏮︎
         </button>
         <button
-          disabled={!playerInfo}
-          onClick={() => void playerToggle()}
+          id="play-toggle"
+          disabled={!transportReady}
+          onClick={() => void playbackToggle()}
           className="rounded-full bg-zinc-800 px-4 py-1.5 text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
           title="Play/Pause (Space)"
         >
           {playing ? "⏸" : "▶"}
         </button>
         <button
-          disabled={!playerInfo}
-          onClick={() => void playerStep(1)}
+          disabled={!transportReady}
+          onClick={() => void playbackStep(1)}
           className="rounded bg-zinc-800 px-2 py-1 text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
           title="Next frame (→)"
         >
           ⏭︎
         </button>
-        <input
-          type="range"
-          disabled={!playerInfo}
-          min={0}
-          max={duration}
-          step={1 / fps}
-          value={scrubValue ?? positionSec}
-          onChange={(e) => onScrub(Number(e.target.value))}
-          onPointerUp={endScrub}
-          onBlur={endScrub}
-          className="min-w-0 flex-1 accent-sky-500"
-        />
-        <span className="font-mono text-zinc-600">
-          {timecode(duration, fps)}
+        <span className="font-mono text-zinc-600" title="timeline duration">
+          {timecode(durationSec, fps)}
         </span>
-        <div className="flex items-center gap-1 border-l border-zinc-800 pl-3 text-xs">
-          <button
-            disabled={!playerInfo}
-            onClick={() => setInPoint(positionSec)}
-            className="rounded bg-zinc-800 px-2 py-1 text-zinc-400 hover:bg-zinc-700 disabled:opacity-40"
-            title="Set trim in point"
-          >
-            In {inPointSec !== null ? timecode(inPointSec, fps) : "—"}
-          </button>
-          <button
-            disabled={!playerInfo}
-            onClick={() => setOutPoint(positionSec)}
-            className="rounded bg-zinc-800 px-2 py-1 text-zinc-400 hover:bg-zinc-700 disabled:opacity-40"
-            title="Set trim out point"
-          >
-            Out {outPointSec !== null ? timecode(outPointSec, fps) : "—"}
-          </button>
-        </div>
       </div>
     </main>
   );

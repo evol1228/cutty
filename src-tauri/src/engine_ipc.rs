@@ -66,6 +66,9 @@ fn snapshot(engine: &mut Engine) -> EngineSnapshot {
 
 fn emit_state(app: &AppHandle, engine: &mut Engine) {
     let _ = app.emit(ENGINE_STATE_EVENT, snapshot(engine));
+    // The playback engine mirrors every project change (its scrub/pump
+    // paths resolve against the newest snapshot).
+    crate::commands::sync_playback(app, engine.project().clone());
 }
 
 /// Run a mutating engine operation; on success emit the new state.

@@ -4,7 +4,7 @@
 // undo step. No timeline math here — target picking reads engine state,
 // the engine validates and clamps.
 
-import type { Clip, Track, TrimEdge } from "../lib/engineIpc";
+import type { Clip, Project, Track, TrimEdge } from "../lib/engineIpc";
 import {
   engineAddClip,
   engineAddMedia,
@@ -18,8 +18,23 @@ import {
   engineTrimClip,
   engineUndo,
 } from "../lib/engineIpc";
+import { playbackSeek, playbackStep } from "../lib/ipc";
+import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
+import { toast } from "../state/toastStore";
 import { ensureVisible } from "./view";
+
+/** Timeline end (latest clip out point) — display/navigation helper; the
+ * engine's `timeline_end` is the authority during playback. */
+export function timelineEndSec(project: Project): number {
+  let end = 0;
+  for (const track of project.tracks) {
+    // Clips are sorted and non-overlapping, so the last one ends the track.
+    const last = track.clips[track.clips.length - 1];
+    if (last && last.timelineOut > end) end = last.timelineOut;
+  }
+  return end;
+}
 
 /** Run `run` inside a transaction when it spans several commands, so the
  * whole action lands on the undo stack as a single entry. */
@@ -130,31 +145,31 @@ export async function redo(): Promise<void> {
   }
 }
 
-/** Step the playhead by one project frame. */
+/** Step the playhead by one project frame — the engine decodes and shows
+ * the exact frame, across cut boundaries; its position event moves the
+ * playhead. The optimistic store update keeps the UI snappy. */
 export function stepFrame(direction: -1 | 1): void {
   const { project, playheadSec, setPlayhead } = useProjectStore.getState();
   const fps = project?.settings.fps ?? 30;
   const next = Math.max(0, playheadSec + direction / fps);
   setPlayhead(next);
   ensureVisible(next);
+  void playbackStep(direction).catch(() => undefined);
 }
 
 export function goToStart(): void {
   useProjectStore.getState().setPlayhead(0);
   ensureVisible(0);
+  void playbackSeek(0).catch(() => undefined);
 }
 
 /** End key: jump to the last clip's out point (0 on an empty timeline). */
 export function goToEnd(): void {
   const { project, setPlayhead } = useProjectStore.getState();
-  let end = 0;
-  for (const track of project?.tracks ?? []) {
-    // Clips are sorted and non-overlapping, so the last one ends the track.
-    const last = track.clips[track.clips.length - 1];
-    if (last && last.timelineOut > end) end = last.timelineOut;
-  }
+  const end = project ? timelineEndSec(project) : 0;
   setPlayhead(end);
   ensureVisible(end);
+  void playbackSeek(end).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------
@@ -182,6 +197,52 @@ function mulberry32(seed: number): () => number {
 function trackEnd(track: Track): number {
   const last = track.clips[track.clips.length - 1];
   return last ? last.timelineOut : 0;
+}
+
+/**
+ * Build the playback-acceptance timeline from real imported media: 13
+ * short segments (12 hard cuts) cycling the first three ready video
+ * files in the pool, with varied in-points. One undo step. Dev tool for
+ * validating multi-cut playback in the running app.
+ */
+export async function seedCutTimeline(): Promise<void> {
+  const { project } = useProjectStore.getState();
+  const videoTrack = project?.tracks.find((t) => t.kind === "video");
+  if (!videoTrack) return;
+  const ready = useMediaStore
+    .getState()
+    .items.flatMap((i) =>
+      i.mediaId !== null &&
+      i.hasVideo &&
+      !i.missing &&
+      i.status !== "error" &&
+      i.durationSec !== null &&
+      i.durationSec >= 3
+        ? [{ mediaId: i.mediaId, durationSec: i.durationSec }]
+        : [],
+    );
+  if (ready.length < 3) {
+    toast("Seed cuts needs 3+ imported video files of ≥3s each.");
+    return;
+  }
+  const media = ready.slice(0, 3);
+  const rng = mulberry32(0xcafe);
+  await engineBeginTransaction();
+  try {
+    let t = trackEnd(videoTrack) + (videoTrack.clips.length > 0 ? 0.5 : 0);
+    for (let i = 0; i < 13; i++) {
+      const m = media[i % 3];
+      const dur = 0.8 + rng() * 1.4;
+      const maxIn = Math.max(0, m.durationSec - dur - 0.2);
+      const sourceIn = rng() * maxIn;
+      await engineAddClip(videoTrack.id, m.mediaId, t, sourceIn, sourceIn + dur);
+      t += dur;
+    }
+    await engineCommitTransaction();
+  } catch (err) {
+    console.error("seeding cut timeline failed", err);
+    await engineRollbackTransaction().catch(() => undefined);
+  }
 }
 
 /**

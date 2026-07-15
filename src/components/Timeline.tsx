@@ -7,6 +7,7 @@ import { useProjectStore } from "../state/projectStore";
 import {
   deleteSelection,
   redo,
+  seedCutTimeline,
   seedDummyClips,
   splitAtPlayhead,
   undo,
@@ -118,10 +119,18 @@ function Timeline() {
           <button
             className={BUTTON}
             disabled={!project}
-            title="Add 50 dummy clips (dev — import lands later)"
+            title="Add 50 dummy clips (dev — timeline perf acceptance)"
             onClick={() => void seedDummyClips()}
           >
             Seed 50
+          </button>
+          <button
+            className={BUTTON}
+            disabled={!project}
+            title="Build a 12-cut timeline from the first 3 imported videos (dev — playback acceptance)"
+            onClick={() => void seedCutTimeline()}
+          >
+            Seed cuts
           </button>
           <span>Zoom</span>
           <input

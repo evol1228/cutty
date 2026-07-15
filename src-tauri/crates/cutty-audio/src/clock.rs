@@ -33,9 +33,6 @@ pub struct PlaybackClock {
     /// Transport state. Paused ⇒ the callback emits silence and the
     /// position freezes.
     playing: AtomicBool,
-    /// The decoder hit end of stream; cleared by the next seek. Lets the
-    /// video side detect that this clock will not advance further.
-    ended: AtomicBool,
     /// Seek handshake: the decoder thread parks the new base position here
     /// and must not push post-seek samples until the audio callback has
     /// drained the ring and rebased (`rebase_pending` flips false) —
@@ -55,7 +52,6 @@ impl PlaybackClock {
             last_buffer_frames: AtomicU64::new(0),
             last_cb_nanos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
-            ended: AtomicBool::new(false),
             rebase: Mutex::new(None),
             rebase_pending: AtomicBool::new(false),
         }
@@ -82,15 +78,6 @@ impl PlaybackClock {
 
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Acquire)
-    }
-
-    /// True once the decoder exhausted the stream (until the next seek).
-    pub fn is_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_ended(&self, ended: bool) {
-        self.ended.store(ended, Ordering::Release);
     }
 
     pub(crate) fn set_playing(&self, playing: bool) {
@@ -193,13 +180,4 @@ mod tests {
         assert_eq!(c.position_secs(), 0.0);
     }
 
-    #[test]
-    fn ended_flag_round_trips() {
-        let c = PlaybackClock::new(48_000);
-        assert!(!c.is_ended());
-        c.set_ended(true);
-        assert!(c.is_ended());
-        c.set_ended(false);
-        assert!(!c.is_ended());
-    }
 }

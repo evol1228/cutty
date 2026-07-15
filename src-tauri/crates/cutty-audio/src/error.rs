@@ -23,9 +23,10 @@ pub enum AudioError {
     #[error("no audio output device available")]
     NoDevice,
 
-    /// The output device does not support the file's sample rate.
-    #[error("output device does not support {0} Hz (resampling lands post-Phase 0)")]
-    UnsupportedRate(u32),
+    /// The default output device offers a configuration the mixer cannot
+    /// drive (e.g. a non-f32 sample format).
+    #[error("unsupported audio output configuration: {0}")]
+    UnsupportedDevice(String),
 
     /// Generic I/O error.
     #[error("I/O error: {0}")]
