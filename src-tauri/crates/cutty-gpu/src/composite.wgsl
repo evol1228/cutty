@@ -42,23 +42,38 @@ fn overlay_channel(b: f32, s: f32) -> f32 {
     return select(1.0 - 2.0 * (1.0 - s) * (1.0 - b), 2.0 * s * b, b <= 0.5);
 }
 
+// Inverse placement: output pixel center → source UV.
+fn layer_uv(pos: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        layer.inv_row0.x * pos.x + layer.inv_row0.y * pos.y + layer.inv_row0.z,
+        layer.inv_row1.x * pos.x + layer.inv_row1.y * pos.y + layer.inv_row1.z,
+    );
+}
+
+// Coverage: 1 inside the layer quad, 0 outside, with a one-texel linear
+// ramp at the border (cheap deterministic edge AA — matters for rotated
+// layers).
+fn layer_coverage(uv: vec2<f32>) -> f32 {
+    let src_dims = vec2<f32>(textureDimensions(layer_tex));
+    let dist_px = min(uv, vec2<f32>(1.0) - uv) * src_dims;
+    return clamp(min(dist_px.x, dist_px.y) + 0.5, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let out_dims = vec2<f32>(textureDimensions(accum_tex));
     let dst = textureSampleLevel(accum_tex, samp, pos.xy / out_dims, 0.0);
 
-    let uv = vec2<f32>(
-        layer.inv_row0.x * pos.x + layer.inv_row0.y * pos.y + layer.inv_row0.z,
-        layer.inv_row1.x * pos.x + layer.inv_row1.y * pos.y + layer.inv_row1.z,
-    );
+    let uv = layer_uv(pos.xy);
     let src = textureSampleLevel(layer_tex, samp, uv, 0.0);
+    let coverage = layer_coverage(uv);
 
-    // Coverage: 1 inside the layer quad, 0 outside, with a one-texel
-    // linear ramp at the border (cheap deterministic edge AA — matters
-    // for rotated layers).
-    let src_dims = vec2<f32>(textureDimensions(layer_tex));
-    let dist_px = min(uv, vec2<f32>(1.0) - uv) * src_dims;
-    let coverage = clamp(min(dist_px.x, dist_px.y) + 0.5, 0.0, 1.0);
+    // Blend 5: the source is premultiplied (a transition pass output) —
+    // straight "premultiplied over" against the opaque backdrop.
+    if (layer.blend == 5u) {
+        let g = layer.opacity * coverage;
+        return vec4<f32>(src.rgb * g + dst.rgb * (1.0 - src.a * g), 1.0);
+    }
 
     var blended: vec3<f32>;
     switch layer.blend {
@@ -77,4 +92,17 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let a = layer.opacity * src.a * coverage;
     return vec4<f32>(mix(dst.rgb, blended, a), 1.0);
+}
+
+// Transition intermediates: one layer rendered over *transparency* with
+// premultiplied alpha (opacity and edge coverage baked into α). The
+// transition pass blends two of these; the result re-enters the main
+// stack through the blend-5 path above. Uses bindings 0/2/3 only — the
+// accumulator is not read.
+@fragment
+fn fs_layer_premul(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = layer_uv(pos.xy);
+    let src = textureSampleLevel(layer_tex, samp, uv, 0.0);
+    let a = layer.opacity * src.a * layer_coverage(uv);
+    return vec4<f32>(src.rgb * a, a);
 }

@@ -43,6 +43,35 @@ pub(crate) const BLOCK_FRAMES: usize = 512;
 /// Poll cadence while the ring is full / a rebase is pending.
 const IDLE_POLL: Duration = Duration::from_millis(3);
 
+/// An equal-power fade over `[start, end]` timeline seconds — the audio
+/// half of a video transition. The incoming gain rises `sin(x·π/2)`, the
+/// outgoing falls `cos(x·π/2)`, so a crossfading pair sums to constant
+/// power. Degenerate ramps (`end <= start`) read as unity gain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FadeRamp {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl FadeRamp {
+    fn x(&self, t: f64) -> f64 {
+        if self.end <= self.start {
+            return 1.0;
+        }
+        ((t - self.start) / (self.end - self.start)).clamp(0.0, 1.0)
+    }
+
+    /// Rising equal-power gain (the incoming clip).
+    pub fn gain_in(&self, t: f64) -> f32 {
+        (self.x(t) * std::f64::consts::FRAC_PI_2).sin() as f32
+    }
+
+    /// Falling equal-power gain (the outgoing clip).
+    pub fn gain_out(&self, t: f64) -> f32 {
+        (self.x(t) * std::f64::consts::FRAC_PI_2).cos() as f32
+    }
+}
+
 /// One audio-contributing clip, flattened for the mixer. Built by the
 /// playback layer from the project snapshot (the mixer knows nothing
 /// about tracks or media ids).
@@ -60,6 +89,11 @@ pub struct AudioSegment {
     pub speed: f64,
     /// Linear gain.
     pub volume: f64,
+    /// Equal-power ramps from video transitions (evaluated per sample on
+    /// top of `volume`). Both may be present on a clip inside a chain of
+    /// transitions.
+    pub fade_in: Option<FadeRamp>,
+    pub fade_out: Option<FadeRamp>,
 }
 
 /// The mixer's whole input: every audio-contributing clip on the timeline.
@@ -216,14 +250,25 @@ impl ClipReader {
         }
 
         let step = seg.speed * self.src_rate / rate;
-        let vol = seg.volume as f32;
+        let base_vol = seg.volume as f32;
+        let has_fades = seg.fade_in.is_some() || seg.fade_out.is_some();
         self.evict();
-        for frame in out.chunks_exact_mut(2) {
+        for (k, frame) in out.chunks_exact_mut(2).enumerate() {
             let i = self.cursor.floor() as i64;
             self.ensure(i + 1)?;
             let (l0, r0) = self.frame_at(i);
             let (l1, r1) = self.frame_at(i + 1);
             let frac = (self.cursor - i as f64) as f32;
+            let mut vol = base_vol;
+            if has_fades {
+                let t = (t0 + k as i64) as f64 / rate;
+                if let Some(ramp) = &seg.fade_in {
+                    vol *= ramp.gain_in(t);
+                }
+                if let Some(ramp) = &seg.fade_out {
+                    vol *= ramp.gain_out(t);
+                }
+            }
             frame[0] += (l0 + (l1 - l0) * frac) * vol;
             frame[1] += (r0 + (r1 - r0) * frac) * vol;
             self.cursor += step;
@@ -636,6 +681,8 @@ mod tests {
             source_in,
             speed: 1.0,
             volume,
+            fade_in: None,
+            fade_out: None,
         }
     }
 
@@ -887,6 +934,89 @@ mod tests {
                 "frame {k}: {} vs {expected}",
                 out[k * 2]
             );
+        }
+    }
+
+    #[test]
+    fn transition_crossfade_applies_equal_power_ramps_per_sample() {
+        // Outgoing constant-source segment fading out over [0.5, 1.0],
+        // incoming fading in over the same span: at every sample the two
+        // gains must be cos/sin of the ramp position, and the summed
+        // power of a unity crossfade stays 1.
+        let v = 0.5;
+        let ramp = FadeRamp {
+            start: 0.5,
+            end: 1.0,
+        };
+        let mut out_seg = seg(0.0, 1.0, 0.0, v);
+        out_seg.fade_out = Some(ramp);
+        let mut in_seg = seg(0.5, 1.5, 0.0, v);
+        in_seg.fade_in = Some(ramp);
+
+        let placed = place(
+            MixerTimeline {
+                segments: vec![out_seg, in_seg],
+            },
+            RATE,
+        );
+        let mut readers = HashMap::new();
+        let mut out = vec![0f32; 64 * 2];
+        let head = (0.75 * f64::from(RATE)) as i64; // mid-ramp
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            head,
+            RATE,
+            &mut out,
+        );
+        for k in 0..64usize {
+            let t = (head + k as i64) as f64 / f64::from(RATE);
+            let x = (t - ramp.start) / (ramp.end - ramp.start);
+            let expected =
+                v as f32 * ((x * std::f64::consts::FRAC_PI_2).cos() as f32
+                    + (x * std::f64::consts::FRAC_PI_2).sin() as f32);
+            assert!(
+                (out[k * 2] - expected).abs() < 1e-5,
+                "sample {k}: {} vs {expected}",
+                out[k * 2]
+            );
+        }
+        // At the exact crossover both sides sit at √½ · v.
+        let mut out = vec![0f32; 2];
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            (0.75 * f64::from(RATE)) as i64,
+            RATE,
+            &mut out,
+        );
+        let expected = v as f32 * 2.0 * std::f64::consts::FRAC_1_SQRT_2 as f32;
+        assert!((out[0] - expected).abs() < 1e-5, "{} vs {expected}", out[0]);
+    }
+
+    /// Constant 1.0 mono source at the output rate (crossfade math test).
+    struct ConstOne;
+
+    impl AudioSource for ConstOne {
+        fn sample_rate(&self) -> u32 {
+            RATE
+        }
+
+        fn channels(&self) -> usize {
+            1
+        }
+
+        fn seek(&mut self, _secs: f64) -> Result<(), AudioError> {
+            Ok(())
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> Result<usize, AudioError> {
+            out.fill(1.0);
+            Ok(out.len())
         }
     }
 

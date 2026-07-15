@@ -6,6 +6,7 @@
 //!
 //! Phase 0: probe → proxy → playback decode → trim export.
 
+pub(crate) mod audio_layout;
 pub(crate) mod cache;
 pub mod compose;
 pub mod decode;
@@ -25,6 +26,7 @@ pub mod thumbnail;
 pub mod tools;
 
 pub use compose::{FrameSlice, RenderStats, TimelineRenderer};
+pub use cutty_gpu::{transition_kind, transitions, TransitionDef};
 pub use decode::{FrameView, SourceDecoder};
 pub use encoders::{detected_h264_encoder, start_encoder_detection, H264Encoder};
 pub use error::MediaError;

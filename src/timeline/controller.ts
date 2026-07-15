@@ -5,13 +5,14 @@
 // exactly one undo entry on release. Snap positions come from the engine;
 // the only local math is pixel↔time conversion and hit-testing.
 
-import type { Clip, Track, TrimEdge } from "../lib/engineIpc";
+import type { Clip, Track, TransitionSpan, TrimEdge } from "../lib/engineIpc";
 import {
   engineAddClip,
   engineBeginTransaction,
   engineCommitTransaction,
   engineMoveClipToTrack,
   engineRollbackTransaction,
+  engineSetTransition,
   engineSnapClipMove,
   engineSnapTime,
   engineTrimClip,
@@ -33,10 +34,12 @@ import {
 import { requestDraw, setDrawCallback } from "./dirty";
 import {
   setTimelineDropTarget,
+  setTransitionDropTarget,
   type DragMedia,
   type TimelineDropTarget,
+  type TransitionDropTarget,
 } from "./poolDrag";
-import { drawTimeline, type TimelineOverlay } from "./renderer";
+import { chipRect, drawTimeline, type TimelineOverlay } from "./renderer";
 import {
   canvasYToContentY,
   laneIndexAtY,
@@ -55,6 +58,13 @@ const EDGE_PX = 6;
 const DRAG_THRESHOLD_PX = 3;
 /** Snap radius, CSS px (converted to seconds at the current zoom). */
 const SNAP_PX = 8;
+/** How close (CSS px) a transition drop must be to a cut to take it. */
+const CUT_REACH_PX = 28;
+/** Chip edge zone for the duration drag, CSS px. */
+const CHIP_EDGE_PX = 6;
+/** Shortest transition the duration drag requests, seconds (the engine
+ * clamps identically — this just keeps the gesture sane). */
+const MIN_TRANSITION_SEC = 0.1;
 
 type Zone = "start" | "end" | "body";
 
@@ -85,6 +95,14 @@ type Gesture =
       blockedLaneName: string | null;
     }
   | { type: "trim"; clipId: number; edge: TrimEdge; cancelled: boolean }
+  | {
+      type: "transitionDuration";
+      clipId: number;
+      kind: string;
+      cut: number;
+      maxDuration: number;
+      cancelled: boolean;
+    }
   | { type: "pan"; lastClientX: number }
   | { type: "scrub" };
 
@@ -107,6 +125,7 @@ export function createTimelineController(
     snapLineSec: null,
     dropPreview: null,
     invalidLaneIndex: null,
+    transitionDrag: null,
   };
   let gesture: Gesture = { type: "idle" };
   let lastPointerX: number | null = null;
@@ -395,7 +414,132 @@ export function createTimelineController(
     leave: clearDropPreview,
   };
 
+  // --- Transition drops (Transitions tab → cut points) -----------------
+  //
+  // Cuts are touching clip pairs on unlocked video tracks. While a
+  // transition drags over a lane every cut shows a marker; the nearest
+  // within reach is the drop target. Dropping calls one engine command
+  // (set_transition), which also replaces an existing transition on
+  // that cut.
+
+  interface CutPoint {
+    /** Outgoing clip (the transition's owner). */
+    fromClipId: number;
+    cut: number;
+  }
+
+  function cutsOnTrack(track: Track): CutPoint[] {
+    const cuts: CutPoint[] = [];
+    for (let i = 0; i + 1 < track.clips.length; i++) {
+      const a = track.clips[i];
+      const b = track.clips[i + 1];
+      if (Math.abs(b.timelineIn - a.timelineOut) <= 1e-6) {
+        cuts.push({ fromClipId: a.id, cut: b.timelineIn });
+      }
+    }
+    return cuts;
+  }
+
+  /** The lane + cut a transition drag at canvas (x, y) would land on. */
+  function transitionDropAt(
+    x: number,
+    y: number,
+  ): { trackIndex: number; cuts: CutPoint[]; active: CutPoint | null } | null {
+    const project = useProjectStore.getState().project;
+    if (!project) return null;
+    const trackIndex = laneIndexAtY(project.tracks, canvasYToContentY(y));
+    if (trackIndex === null) return null;
+    const track = project.tracks[trackIndex];
+    if (track.kind !== "video" || track.locked) return null;
+    const cuts = cutsOnTrack(track);
+    let active: CutPoint | null = null;
+    let best = pxToDuration(CUT_REACH_PX);
+    const t = xToTime(x);
+    for (const cut of cuts) {
+      const dist = Math.abs(cut.cut - t);
+      if (dist < best) {
+        best = dist;
+        active = cut;
+      }
+    }
+    return { trackIndex, cuts, active };
+  }
+
+  function clearTransitionDrag(): void {
+    if (overlay.transitionDrag !== null) {
+      overlay.transitionDrag = null;
+      requestDraw();
+    }
+  }
+
+  const transitionDropTarget: TransitionDropTarget = {
+    over: (clientX, clientY) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      if (x < 0 || y < 0 || x > rect.width || y > rect.height) {
+        clearTransitionDrag();
+        return;
+      }
+      const drop = transitionDropAt(x, y);
+      overlay.transitionDrag = drop
+        ? {
+            trackIndex: drop.trackIndex,
+            cuts: drop.cuts.map((c) => c.cut),
+            activeCut: drop.active?.cut ?? null,
+          }
+        : null;
+      requestDraw();
+    },
+    drop: (clientX, clientY, item) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      clearTransitionDrag();
+      const inside = x >= 0 && y >= 0 && x <= rect.width && y <= rect.height;
+      if (!inside) return;
+      const drop = transitionDropAt(x, y);
+      if (!drop?.active) return;
+      const target = drop.active;
+      enqueue(async () => {
+        try {
+          await engineSetTransition(target.fromClipId, {
+            kind: item.id,
+            duration: item.defaultDuration,
+          });
+          useProjectStore.getState().setSelectedTransition(target.fromClipId);
+        } catch (err) {
+          toast(`Could not add ${item.label}: ${String(err)}`, "error");
+        }
+      });
+    },
+    leave: clearTransitionDrag,
+  };
+
   // --- Hit testing -----------------------------------------------------
+
+  /** Transition chip under the pointer (chips draw above clips, so they
+   * hit-test first). */
+  function hitTransition(
+    x: number,
+    y: number,
+  ): { span: TransitionSpan; zone: "body" | "edge" } | null {
+    const { project, transitions } = useProjectStore.getState();
+    if (!project) return null;
+    for (const span of transitions) {
+      // chipRect is canvas-space (it includes the ruler offset).
+      const rect = chipRect(span, project.tracks);
+      if (!rect) continue;
+      if (x < rect.x - 1 || x > rect.x + rect.w + 1) continue;
+      if (y < rect.y || y > rect.y + rect.h) continue;
+      const zone =
+        x <= rect.x + CHIP_EDGE_PX || x >= rect.x + rect.w - CHIP_EDGE_PX
+          ? "edge"
+          : "body";
+      return { span, zone };
+    }
+    return null;
+  }
 
   function hitTest(x: number, y: number): Hit {
     const project = useProjectStore.getState().project;
@@ -463,6 +607,31 @@ export function createTimelineController(
     }
     if (e.button !== 0) return;
 
+    const chip = hitTransition(x, y);
+    if (chip) {
+      store.setSelectedTransition(chip.span.fromClipId);
+      const track = store.project?.tracks.find(
+        (t) => t.id === chip.span.trackId,
+      );
+      if (track?.locked) {
+        toast(`Track "${track.name}" is locked — unlock it to edit.`);
+        return;
+      }
+      if (chip.zone === "edge") {
+        enqueue(() => engineBeginTransaction());
+        gesture = {
+          type: "transitionDuration",
+          clipId: chip.span.fromClipId,
+          kind: chip.span.kind,
+          cut: chip.span.cut,
+          maxDuration: chip.span.maxDuration,
+          cancelled: false,
+        };
+        canvas.setPointerCapture(e.pointerId);
+      }
+      return;
+    }
+
     const hit = hitTest(x, y);
     if (hit.region === "ruler") {
       gesture = { type: "scrub" };
@@ -505,6 +674,12 @@ export function createTimelineController(
 
     switch (gesture.type) {
       case "idle": {
+        const chip = hitTransition(x, y);
+        if (chip) {
+          canvas.style.cursor = chip.zone === "edge" ? "ew-resize" : "pointer";
+          if (canvas.title !== "") canvas.title = "";
+          return;
+        }
         const hit = hitTest(x, y);
         canvas.style.cursor = cursorFor(hit);
         // Missing-media tooltip on hovered clips.
@@ -570,6 +745,20 @@ export function createTimelineController(
         coalesce(() => applyTrim(clipId, edge, to));
         return;
       }
+      case "transitionDuration": {
+        const { clipId, kind, cut, maxDuration } = gesture;
+        const duration = Math.min(
+          Math.max(2 * Math.abs(xToTime(x) - cut), MIN_TRANSITION_SEC),
+          maxDuration,
+        );
+        coalesce(async () => {
+          await engineSetTransition(clipId, { kind, duration }).catch(
+            () => undefined,
+          );
+          requestDraw();
+        });
+        return;
+      }
       case "pan": {
         const dx = gesture.lastClientX - e.clientX;
         gesture.lastClientX = e.clientX;
@@ -609,6 +798,21 @@ export function createTimelineController(
         }
         break;
       }
+      case "transitionDuration": {
+        const { clipId, kind, cut, maxDuration, cancelled } = gesture;
+        if (!cancelled) {
+          const duration = Math.min(
+            Math.max(2 * Math.abs(xToTime(x) - cut), MIN_TRANSITION_SEC),
+            maxDuration,
+          );
+          finishGesture(async () => {
+            await engineSetTransition(clipId, { kind, duration }).catch(
+              () => undefined,
+            );
+          });
+        }
+        break;
+      }
       default:
         break;
     }
@@ -617,7 +821,11 @@ export function createTimelineController(
   }
 
   function onPointerCancel(): void {
-    if (gesture.type === "move" || gesture.type === "trim") {
+    if (
+      gesture.type === "move" ||
+      gesture.type === "trim" ||
+      gesture.type === "transitionDuration"
+    ) {
       cancelGesture();
     }
     gesture = { type: "idle" };
@@ -659,7 +867,11 @@ export function createTimelineController(
     if (isEditableTarget(e)) return;
 
     // Mid-drag, only Escape (cancel) is live.
-    if (gesture.type === "move" || gesture.type === "trim") {
+    if (
+      gesture.type === "move" ||
+      gesture.type === "trim" ||
+      gesture.type === "transitionDuration"
+    ) {
       if (e.key === "Escape") {
         gesture.cancelled = true;
         cancelGesture();
@@ -704,9 +916,19 @@ export function createTimelineController(
         void splitAtPlayhead();
         break;
       case "Delete":
-      case "Backspace":
+      case "Backspace": {
+        const store = useProjectStore.getState();
+        if (store.selectedTransition !== null) {
+          const clipId = store.selectedTransition;
+          store.setSelectedTransition(null);
+          void engineSetTransition(clipId, null).catch((err) =>
+            toast(String(err), "error"),
+          );
+          break;
+        }
         void deleteSelection(e.shiftKey);
         break;
+      }
       case "q":
       case "Q":
         void trimSelectedToPlayhead("start");
@@ -801,11 +1023,26 @@ export function createTimelineController(
   const unsubscribe = useProjectStore.subscribe(() => requestDraw());
   const unsubscribeMedia = useMediaStore.subscribe(() => requestDraw());
   setTimelineDropTarget(dropTarget);
+  setTransitionDropTarget(transitionDropTarget);
+
+  function onDoubleClick(e: MouseEvent): void {
+    const { x, y } = canvasPos(e);
+    const chip = hitTransition(x, y);
+    if (!chip) return;
+    useProjectStore.getState().setSelectedTransition(chip.span.fromClipId);
+    useProjectStore.getState().setTransitionPicker({
+      clipId: chip.span.fromClipId,
+      kind: chip.span.kind,
+      x: e.clientX,
+      y: e.clientY,
+    });
+  }
 
   canvas.addEventListener("pointerdown", onPointerDown);
   canvas.addEventListener("pointermove", onPointerMove);
   canvas.addEventListener("pointerup", onPointerUp);
   canvas.addEventListener("pointercancel", onPointerCancel);
+  canvas.addEventListener("dblclick", onDoubleClick);
   canvas.addEventListener("wheel", onWheel, { passive: false });
   window.addEventListener("keydown", onKeyDown);
 
@@ -815,6 +1052,7 @@ export function createTimelineController(
     disposed = true;
     setDrawCallback(null);
     setTimelineDropTarget(null);
+    setTransitionDropTarget(null);
     resizeObserver.disconnect();
     unsubscribe();
     unsubscribeMedia();
@@ -822,6 +1060,7 @@ export function createTimelineController(
     canvas.removeEventListener("pointermove", onPointerMove);
     canvas.removeEventListener("pointerup", onPointerUp);
     canvas.removeEventListener("pointercancel", onPointerCancel);
+    canvas.removeEventListener("dblclick", onDoubleClick);
     canvas.removeEventListener("wheel", onWheel);
     window.removeEventListener("keydown", onKeyDown);
   };

@@ -8,7 +8,9 @@
 //! `x - a + a` float drift).
 
 use crate::error::EngineError;
-use crate::model::{BlendMode, Clip, ClipId, MediaRef, Project, Track, TrackId, Transform};
+use crate::model::{
+    BlendMode, Clip, ClipId, MediaRef, Project, Track, TrackId, Transform, Transition,
+};
 
 /// A reversible timeline mutation.
 ///
@@ -754,6 +756,75 @@ impl Command for SetClipVolume {
 
     fn name(&self) -> &'static str {
         "SetClipVolume"
+    }
+}
+
+/// Set (add, replace, or remove) the transition at a clip's out cut. Old
+/// and new values captured verbatim, so one command type covers the whole
+/// lifecycle and undo restores the exact prior state.
+#[derive(Debug, Clone)]
+pub struct SetTransition {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub old: Option<Transition>,
+    pub new: Option<Transition>,
+}
+
+impl Command for SetTransition {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let track = project
+            .track_mut(self.track_id)
+            .ok_or(EngineError::UnknownTrack(self.track_id))?;
+        let clip = track
+            .clip_mut(self.clip_id)
+            .ok_or(EngineError::UnknownClip(self.clip_id))?;
+        clip.transition_out = self.new.clone();
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(SetTransition {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            old: self.new.clone(),
+            new: self.old.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "SetTransition"
+    }
+}
+
+/// A structural command plus its consequences, applied as one atomic,
+/// invertible unit — e.g. a clip move together with the removal of the
+/// transitions whose cuts that move destroys. Parts apply in order; the
+/// inverse applies the inverted parts in reverse order. Constructed only
+/// by the engine (`execute_structural`), never sent over the wire.
+#[derive(Debug)]
+pub struct Compound {
+    /// The primary command's name (compounds are invisible in labels).
+    pub name: &'static str,
+    pub parts: Vec<Box<dyn Command>>,
+}
+
+impl Command for Compound {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        for part in &self.parts {
+            part.apply(project)?;
+        }
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(Compound {
+            name: self.name,
+            parts: self.parts.iter().rev().map(|p| p.invert()).collect(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 

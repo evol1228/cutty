@@ -219,9 +219,13 @@ fn frame_at(t: f64, fps: f64) -> i64 {
 }
 
 /// Whether a clip renders with no compositing work at all: identity
-/// transform, full opacity, normal blend.
+/// transform, full opacity, normal blend, and no transition at its out
+/// cut (a transition needs two decoded streams and a shader).
 fn visually_default(clip: &cutty_engine::Clip) -> bool {
-    clip.transform.is_identity() && clip.opacity == 1.0 && clip.blend_mode == BlendMode::Normal
+    clip.transform.is_identity()
+        && clip.opacity == 1.0
+        && clip.blend_mode == BlendMode::Normal
+        && clip.transition_out.is_none()
 }
 
 /// The single visible video track carrying clips, if the project has
@@ -316,8 +320,11 @@ pub(crate) fn plan_video_segments(project: &Project, fps: f64) -> Vec<PlannedSeg
 /// unmuted track, resolved to the *same files preview plays* — the proxy
 /// for video media, the original for audio-only media (see module docs).
 /// Unlike preview (which renders silence until a proxy appears), export
-/// refuses to run while a needed proxy is still generating.
+/// refuses to run while a needed proxy is still generating. Transition
+/// crossfades come from the same [`crate::audio_layout`] placement the
+/// live mixer uses, so the exported mix equals the preview mix.
 pub(crate) fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, MediaError> {
+    let spans = cutty_engine::transition_spans(project);
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
         for clip in &track.clips {
@@ -345,13 +352,16 @@ pub(crate) fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, 
             } else {
                 src.to_path_buf()
             };
+            let placement = crate::audio_layout::audio_placement(clip, &spans);
             segments.push(AudioSegment {
                 path,
-                timeline_in: clip.timeline_in,
-                timeline_out: clip.timeline_out,
-                source_in: clip.source_in,
+                timeline_in: placement.timeline_in,
+                timeline_out: placement.timeline_out,
+                source_in: placement.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                fade_in: placement.fade_in,
+                fade_out: placement.fade_out,
             });
         }
     }

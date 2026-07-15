@@ -7,7 +7,11 @@
 import { useEffect, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { engineRemoveMedia } from "../lib/engineIpc";
+import {
+  cachedTransitionList,
+  engineRemoveMedia,
+  type TransitionDef,
+} from "../lib/engineIpc";
 import {
   AUDIO_EXTENSIONS,
   IMAGE_EXTENSIONS,
@@ -17,10 +21,11 @@ import {
 } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
-import { beginPoolDrag } from "../timeline/poolDrag";
+import { beginPoolDrag, beginTransitionDrag } from "../timeline/poolDrag";
 
-const TABS = ["Import", "Library"] as const;
+const TABS = ["Import", "Transitions", "Library"] as const;
 type Tab = (typeof TABS)[number];
+
 
 function formatDuration(sec: number): string {
   const s = Math.max(0, Math.round(sec));
@@ -191,6 +196,122 @@ function PoolItemCard({ item }: { item: PoolItem }) {
   );
 }
 
+/** A schematic per-kind glyph: A→B panels with the transition's motion. */
+function TransitionGlyph({ id }: { id: string }) {
+  const arrow = (d: string) => (
+    <path d={d} stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+  );
+  let motif: React.ReactNode;
+  if (id.startsWith("wipe") || id.startsWith("slide")) {
+    motif =
+      id.endsWith("left") ? arrow("M26 20 H14 M18 15 l-5 5 5 5")
+      : id.endsWith("right") ? arrow("M14 20 H26 M22 15 l5 5 -5 5")
+      : id.endsWith("up") ? arrow("M20 26 V14 M15 18 l5 -5 5 5")
+      : arrow("M20 14 V26 M15 22 l5 5 5 -5");
+  } else if (id.startsWith("circle") || id === "radial") {
+    motif = <circle cx="20" cy="20" r="7" stroke="currentColor" strokeWidth="2" fill="none" />;
+  } else if (id === "crosszoom") {
+    motif = arrow("M20 12 v16 M12 20 h16 M15 15 l10 10 M25 15 l-10 10");
+  } else if (id === "pixelize" || id === "glitchmemories") {
+    motif = (
+      <g fill="currentColor">
+        <rect x="14" y="14" width="5" height="5" />
+        <rect x="22" y="17" width="5" height="5" />
+        <rect x="16" y="22" width="5" height="5" />
+      </g>
+    );
+  } else if (id === "cube" || id === "doorway") {
+    motif = arrow("M14 14 l6 3 6 -3 M20 17 v9 M14 14 v9 l6 3 6 -3 v-9");
+  } else if (id === "windowslice") {
+    motif = (
+      <g stroke="currentColor" strokeWidth="2">
+        <line x1="15" y1="13" x2="15" y2="27" />
+        <line x1="20" y1="13" x2="20" y2="27" />
+        <line x1="25" y1="13" x2="25" y2="27" />
+      </g>
+    );
+  } else {
+    // fade / linearblur: two overlapping panels.
+    motif = (
+      <g>
+        <rect x="12" y="13" width="11" height="11" rx="1.5" fill="currentColor" opacity="0.45" />
+        <rect x="17" y="16" width="11" height="11" rx="1.5" fill="currentColor" opacity="0.85" />
+      </g>
+    );
+  }
+  return (
+    <svg viewBox="0 0 40 40" className="h-10 w-10 text-violet-300">
+      {motif}
+    </svg>
+  );
+}
+
+/** The Transitions tab: a grid of draggable transition tiles. Drag one
+ * onto a cut point in the timeline (cuts light up while dragging). */
+function TransitionsPanel() {
+  const [catalog, setCatalog] = useState<TransitionDef[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    cachedTransitionList()
+      .then((defs) => {
+        if (alive) setCatalog(defs);
+      })
+      .catch((err) => {
+        if (alive) setError(String(err));
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  if (error) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-4 text-center text-xs text-red-400">
+        Could not load transitions: {error}
+      </div>
+    );
+  }
+  if (!catalog) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-xs text-zinc-600">
+        Loading…
+      </div>
+    );
+  }
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+      <p className="shrink-0 text-[11px] leading-snug text-zinc-500">
+        Drag a transition onto a cut between two touching clips.
+      </p>
+      <div className="grid min-h-0 flex-1 auto-rows-min grid-cols-2 gap-2 overflow-y-auto pb-2">
+        {catalog.map((def) => (
+          <div
+            key={def.id}
+            title={`${def.label} — drag onto a cut (${def.defaultDuration.toFixed(1)}s)`}
+            className="group cursor-grab select-none"
+            onPointerDown={(e) =>
+              beginTransitionDrag(e.nativeEvent, {
+                id: def.id,
+                label: def.label,
+                defaultDuration: def.defaultDuration,
+              })
+            }
+          >
+            <div className="flex aspect-video items-center justify-center rounded-md border border-zinc-800 bg-zinc-950 group-hover:border-violet-600">
+              <TransitionGlyph id={def.id} />
+            </div>
+            <div className="mt-1 truncate text-center text-[11px] text-zinc-300">
+              {def.label}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function MediaPool() {
   const [tab, setTab] = useState<Tab>("Import");
   const [dropHover, setDropHover] = useState(false);
@@ -231,7 +352,9 @@ function MediaPool() {
           </button>
         ))}
       </nav>
-      {tab === "Import" ? (
+      {tab === "Transitions" ? (
+        <TransitionsPanel />
+      ) : tab === "Import" ? (
         <div
           className={`flex min-h-0 flex-1 flex-col gap-3 p-3 ${
             dropHover ? "bg-sky-950/30 ring-1 ring-inset ring-sky-600" : ""

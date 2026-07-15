@@ -401,6 +401,157 @@ fn three_track_composite_playback_sustains_30fps() {
     assert!(max_drift < 0.040, "A/V drift {:.1} ms", max_drift * 1e3);
 }
 
+/// Phase 2 acceptance: playback through **five consecutive transitions**
+/// holds the 30 fps cadence with no hitch — every span decodes two
+/// 720p-class streams at once while the GPU runs the transition shader.
+#[test]
+fn five_consecutive_transitions_play_without_hitching() {
+    let _serial = serial();
+
+    // 720p sources so each side of a span decodes a real 1280×720 proxy.
+    let make_hd = |color: &str, tone: u32| -> PathBuf {
+        let file = media_dir().join(format!("src-hd-tr-{color}.mp4"));
+        if !file.is_file() {
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("color=c={color}:size=1280x720:rate=30:duration=8"))
+                .args(["-f", "lavfi", "-i"])
+                .arg(format!(
+                    "sine=frequency={tone}:sample_rate=48000:duration=8"
+                ))
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
+                .args(["-c:a", "aac", "-b:a", "96k", "-ac", "2", "-shortest"])
+                .arg(&file)
+                .status()
+                .expect("system ffmpeg required");
+            assert!(status.success());
+        }
+        file
+    };
+    let sources = [
+        ("red", make_hd("red", 300)),
+        ("green", make_hd("green", 440)),
+        ("blue", make_hd("blue", 660)),
+    ];
+    for (_, src) in &sources {
+        generate_proxy(src, Some(8.0), |_| {}).expect("proxy");
+    }
+
+    // Six 1.2s clips back to back — five cuts, a different transition on
+    // each (mixing cheap wipes with the heavy multi-tap shaders).
+    let mut engine = Engine::new(ProjectSettings::default());
+    let media: Vec<MediaId> = sources
+        .iter()
+        .map(|(_, src)| {
+            engine
+                .add_media(src.display().to_string(), 8.0, true, true)
+                .unwrap()
+        })
+        .collect();
+    let video = track_of(&engine, TrackKind::Video);
+    let mut clips = Vec::new();
+    let mut colors = Vec::new();
+    for i in 0..6 {
+        let t = i as f64 * 1.2;
+        let clip = engine
+            .add_clip(video, media[i % 3], t, 0.5, 1.7)
+            .unwrap();
+        clips.push(clip);
+        colors.push(sources[i % 3].0);
+    }
+    for (i, kind) in ["fade", "wipeleft", "circleopen", "crosszoom", "linearblur"]
+        .iter()
+        .enumerate()
+    {
+        engine
+            .set_transition(
+                clips[i],
+                Some(cutty_engine::Transition {
+                    kind: (*kind).to_string(),
+                    duration: 0.5,
+                }),
+            )
+            .unwrap();
+    }
+    let end = 6.0 * 1.2;
+    let spans: Vec<(f64, f64)> = (1..6)
+        .map(|i| (i as f64 * 1.2 - 0.25, i as f64 * 1.2 + 0.25))
+        .collect();
+
+    let (player, rx) = open_player(engine.project().clone());
+    let first = recv_frame(&rx, Duration::from_secs(10)).expect("preview frame");
+    assert_eq!(first.color, "red");
+
+    player.play();
+    let mut frames: Vec<FrameRec> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(end as u64 + 6);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Evt::Frame(f)) => frames.push(f),
+            Ok(Evt::Eof) => break,
+            Ok(Evt::Error(e)) if e.contains("audio unavailable") => {}
+            Ok(Evt::Error(e)) => panic!("player error: {e}"),
+            Ok(Evt::Position(..)) => {}
+            Err(_) => panic!("no events for 2s during transition playback"),
+        }
+    }
+    player.pause();
+
+    // ≥30 fps: essentially every grid frame presented (tolerate warmup).
+    let expected = (end * FPS) as usize;
+    assert!(
+        frames.len() >= expected - 8,
+        "only {} of {} output frames presented (two-stream decode too slow)",
+        frames.len(),
+        expected
+    );
+
+    // No hitch anywhere — especially not at span entries, where the
+    // second decoder starts streaming.
+    let mut worst_gap = Duration::ZERO;
+    for pair in frames.windows(2).skip(5) {
+        let dt = pair[1].arrived.duration_since(pair[0].arrived);
+        worst_gap = worst_gap.max(dt);
+        assert!(
+            dt < Duration::from_secs_f64(2.5 * FRAME),
+            "hitch: {dt:?} at pts {:.3}",
+            pair[0].pts
+        );
+    }
+    println!("5-transition playback: {} frames, worst gap {worst_gap:?}", frames.len());
+
+    // Content sanity: outside every span the presented frame shows its
+    // clip's solid color; inside a span it shows one/both neighbors
+    // (blends classify as either side), never black.
+    let in_span = |pts: f64| spans.iter().any(|&(s, e)| pts >= s - 1e-6 && pts < e + 1e-6);
+    for f in frames.iter().skip(3) {
+        if in_span(f.pts) {
+            assert_ne!(f.color, "black", "span frame at {:.3} went black", f.pts);
+        } else if f.pts < end - 1e-6 {
+            let idx = ((f.pts / 1.2).floor() as usize).min(5);
+            assert_eq!(
+                f.color, colors[idx],
+                "frame at {:.3} showed {} (expected {})",
+                f.pts, f.color, colors[idx]
+            );
+        }
+    }
+
+    // A/V drift stays bounded through the overlaps. Print the worst
+    // offenders first — the pts values say which span (if any) lagged.
+    let mut lags: Vec<(f64, f64)> = frames
+        .iter()
+        .skip(5)
+        .map(|f| (f.pts, (f.pts - f.clock).abs()))
+        .collect();
+    lags.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (pts, lag) in lags.iter().take(8) {
+        println!("lag {:6.1} ms at pts {pts:.3}", lag * 1e3);
+    }
+    let max_drift = lags.first().map(|&(_, lag)| lag).unwrap_or(0.0);
+    assert!(max_drift < 0.040, "A/V drift {:.1} ms", max_drift * 1e3);
+}
+
 /// Play the whole 12-cut timeline through and check every criterion that
 /// doesn't need an hour of soak: correct source at every presented
 /// frame, no hitch at any cut, bounded A/V drift, black in the gap, Eof.

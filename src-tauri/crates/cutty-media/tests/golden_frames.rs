@@ -130,6 +130,7 @@ fn fixture_project() -> (Project, i64) {
             blend_mode: *mode,
             speed: 1.0,
             volume: 1.0,
+                transition_out: None,
         });
     }
     project.validate().expect("fixture is valid");

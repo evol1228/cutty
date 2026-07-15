@@ -4,7 +4,7 @@
 // beyond pixel↔time conversion; clips are drawn exactly where the engine
 // says they are.
 
-import type { Clip, Project, Track } from "../lib/engineIpc";
+import type { Clip, Project, Track, TransitionSpan } from "../lib/engineIpc";
 import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { requestDraw } from "./dirty";
@@ -25,6 +25,15 @@ export interface DropPreview {
   durSec: number;
 }
 
+/** Cut points highlighted while a transition drags over a video lane. */
+export interface TransitionDragOverlay {
+  trackIndex: number;
+  /** Every cut on the lane (touching clip pairs), seconds. */
+  cuts: number[];
+  /** The cut that would take the drop (nearest within reach), or null. */
+  activeCut: number | null;
+}
+
 /** Transient gesture state drawn on top of engine state. */
 export interface TimelineOverlay {
   /** Snap indicator line, seconds; null when not snapping. */
@@ -34,6 +43,8 @@ export interface TimelineOverlay {
   /** Lane a drag is hovering but may not drop into (locked/incompatible);
    * tinted red. Null when no invalid hover. */
   invalidLaneIndex: number | null;
+  /** Transition-drag cut highlighting; null when no transition drag. */
+  transitionDrag: TransitionDragOverlay | null;
 }
 
 const COLORS = {
@@ -62,7 +73,18 @@ const COLORS = {
   dropFill: "rgba(14, 165, 233, 0.25)", // sky-500
   dropBorder: "#38bdf8", // sky-400
   emptyHint: "#52525b", // zinc-600
+  transitionFill: "#6d28d9", // violet-700
+  transitionBorder: "#a78bfa", // violet-400
+  transitionSelectedFill: "#7c3aed", // violet-600
+  transitionIcon: "#ede9fe", // violet-50
+  cutMark: "rgba(167, 139, 250, 0.6)", // violet-400
+  cutMarkActive: "#fbbf24", // amber-400
 } as const;
+
+/** Transition chip height, px (straddles the cut mid-lane). */
+const CHIP_H = 16;
+/** Minimum on-screen chip width, px (short transitions stay grabbable). */
+const CHIP_MIN_W = 18;
 
 /** Hidden tracks keep their clips visible but faded. */
 const HIDDEN_TRACK_ALPHA = 0.35;
@@ -347,6 +369,106 @@ function drawClip(
   }
 }
 
+/** On-canvas geometry of a transition chip. Shared with the controller's
+ * hit testing so pixels and pointer math never drift apart. */
+export function chipRect(
+  span: TransitionSpan,
+  tracks: readonly Track[],
+): { x: number; y: number; w: number; h: number } | null {
+  const trackIndex = tracks.findIndex((t) => t.id === span.trackId);
+  if (trackIndex < 0) return null;
+  const w = Math.max(durationToPx(span.end - span.start), CHIP_MIN_W);
+  const x = timeToX(span.cut) - w / 2;
+  const laneY = laneCanvasY(tracks, trackIndex);
+  const laneH = laneHeight(tracks[trackIndex].kind);
+  return { x, y: laneY + (laneH - CHIP_H) / 2, w, h: CHIP_H };
+}
+
+/** The transition chip: a rounded pill straddling the cut with a bowtie
+ * glyph; selected chips get the amber border + duration grips. */
+function drawTransitionChip(
+  ctx: CanvasRenderingContext2D,
+  span: TransitionSpan,
+  tracks: readonly Track[],
+  selected: boolean,
+): void {
+  const rect = chipRect(span, tracks);
+  if (!rect) return;
+  const { x, y, w, h } = rect;
+
+  ctx.fillStyle = selected
+    ? COLORS.transitionSelectedFill
+    : COLORS.transitionFill;
+  roundRectPath(ctx, x, y, w, h, h / 2);
+  ctx.fill();
+  ctx.lineWidth = selected ? 2 : 1;
+  ctx.strokeStyle = selected ? COLORS.selectedBorder : COLORS.transitionBorder;
+  roundRectPath(ctx, x, y, w, h, h / 2);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+
+  // Bowtie glyph (◁▷ meeting at the cut).
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  const gw = Math.min(8, w / 2 - 3);
+  if (gw >= 4) {
+    ctx.fillStyle = COLORS.transitionIcon;
+    ctx.beginPath();
+    ctx.moveTo(cx - gw, cy - 4);
+    ctx.lineTo(cx - 1, cy);
+    ctx.lineTo(cx - gw, cy + 4);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx + gw, cy - 4);
+    ctx.lineTo(cx + 1, cy);
+    ctx.lineTo(cx + gw, cy + 4);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Duration grips on the selected chip.
+  if (selected && w >= 30) {
+    ctx.fillStyle = COLORS.grip;
+    ctx.fillRect(x + 2.5, cy - 4, 2, 8);
+    ctx.fillRect(x + w - 4.5, cy - 4, 2, 8);
+  }
+}
+
+/** Cut-point markers while a transition drags over a lane: every cut
+ * gets a tick; the drop target gets the bright diamond. */
+function drawCutHighlights(
+  ctx: CanvasRenderingContext2D,
+  overlay: TransitionDragOverlay,
+  tracks: readonly Track[],
+): void {
+  if (overlay.trackIndex >= tracks.length) return;
+  const laneY = laneCanvasY(tracks, overlay.trackIndex);
+  const laneH = laneHeight(tracks[overlay.trackIndex].kind);
+  for (const cut of overlay.cuts) {
+    const x = Math.round(timeToX(cut)) + 0.5;
+    const active = cut === overlay.activeCut;
+    ctx.strokeStyle = active ? COLORS.cutMarkActive : COLORS.cutMark;
+    ctx.lineWidth = active ? 2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x, laneY + 3);
+    ctx.lineTo(x, laneY + laneH - 4);
+    ctx.stroke();
+    if (active) {
+      const cy = laneY + laneH / 2;
+      ctx.fillStyle = COLORS.cutMarkActive;
+      ctx.beginPath();
+      ctx.moveTo(x, cy - 6);
+      ctx.lineTo(x + 5, cy);
+      ctx.lineTo(x, cy + 6);
+      ctx.lineTo(x - 5, cy);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  ctx.lineWidth = 1;
+}
+
 function drawDropPreview(
   ctx: CanvasRenderingContext2D,
   preview: DropPreview,
@@ -420,7 +542,8 @@ export function drawTimeline(
   height: number,
   overlay: TimelineOverlay,
 ): void {
-  const { project, selection, playheadSec } = useProjectStore.getState();
+  const { project, selection, playheadSec, transitions, selectedTransition } =
+    useProjectStore.getState();
 
   ctx.fillStyle = COLORS.background;
   ctx.fillRect(0, 0, width, height);
@@ -472,6 +595,29 @@ export function drawTimeline(
       ctx.globalAlpha = 1;
       if (track.locked) drawLockHatch(ctx, width, laneY, laneH);
     });
+
+    // Transition chips straddle their cuts, above the clips.
+    for (const span of transitions) {
+      const trackIndex = tracks.findIndex((t) => t.id === span.trackId);
+      if (trackIndex < 0) continue;
+      const laneY = laneCanvasY(tracks, trackIndex);
+      const laneH = laneHeight(tracks[trackIndex].kind);
+      if (laneY + laneH < RULER_H || laneY > height) continue;
+      const x = timeToX(span.cut);
+      if (x < -60 || x > width + 60) continue;
+      const dim = tracks[trackIndex].hidden
+        ? HIDDEN_TRACK_ALPHA
+        : tracks[trackIndex].locked
+          ? LOCKED_TRACK_ALPHA
+          : 1;
+      if (dim !== 1) ctx.globalAlpha = dim;
+      drawTransitionChip(ctx, span, tracks, span.fromClipId === selectedTransition);
+      ctx.globalAlpha = 1;
+    }
+
+    if (overlay.transitionDrag) {
+      drawCutHighlights(ctx, overlay.transitionDrag, tracks);
+    }
 
     if (!hasClips && !overlay.dropPreview) {
       ctx.fillStyle = COLORS.emptyHint;

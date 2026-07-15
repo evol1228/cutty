@@ -41,6 +41,12 @@ export interface Transform {
   rotation: number;
 }
 
+/** Transition bound to a clip's out cut (kind = shader registry id). */
+export interface Transition {
+  kind: string;
+  duration: number;
+}
+
 export interface Clip {
   id: number;
   mediaId: number;
@@ -53,6 +59,8 @@ export interface Clip {
   blendMode: BlendMode;
   speed: number;
   volume: number;
+  /** Transition into the next clip on the same track (absent = none). */
+  transitionOut?: Transition | null;
 }
 
 export interface Track {
@@ -74,8 +82,27 @@ export interface Project {
   tracks: Track[];
 }
 
+/** A transition resolved to its effective span (engine-computed — the
+ * chip renders exactly here; all clamping is engine-side). */
+export interface TransitionSpan {
+  trackId: number;
+  fromClipId: number;
+  toClipId: number;
+  kind: string;
+  /** The cut instant the transition is centered on. */
+  cut: number;
+  /** Effective span, seconds. */
+  start: number;
+  end: number;
+  /** Stored (requested) duration, seconds. */
+  requested: number;
+  /** Longest duration this cut currently supports (drag clamp). */
+  maxDuration: number;
+}
+
 export interface EngineSnapshot {
   project: Project;
+  transitions: TransitionSpan[];
   undoDepth: number;
   redoDepth: number;
   transactionActive: boolean;
@@ -252,6 +279,38 @@ export function engineCommitTransaction(): Promise<void> {
 
 export function engineRollbackTransaction(): Promise<void> {
   return invoke("engine_rollback_transaction");
+}
+
+/** One transition shader available in the library panel. */
+export interface TransitionDef {
+  id: string;
+  label: string;
+  defaultDuration: number;
+}
+
+/** The transition catalog (static per build; cache the result). */
+export function transitionList(): Promise<TransitionDef[]> {
+  return invoke<TransitionDef[]>("transition_list");
+}
+
+let transitionCatalogCache: Promise<TransitionDef[]> | null = null;
+
+/** [`transitionList`], fetched once and shared. */
+export function cachedTransitionList(): Promise<TransitionDef[]> {
+  transitionCatalogCache ??= transitionList();
+  return transitionCatalogCache;
+}
+
+/** Set, replace, or remove (null) the transition at a clip's out cut.
+ * Returns the stored duration after engine-side clamping. */
+export function engineSetTransition(
+  clipId: number,
+  transition: Transition | null,
+): Promise<number | null> {
+  return invoke<number | null>("engine_set_transition", {
+    clipId,
+    transition,
+  });
 }
 
 /** Snap a time to clip edges / playhead; null when nothing is in range. */

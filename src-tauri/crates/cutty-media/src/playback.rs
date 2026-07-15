@@ -31,9 +31,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cutty_audio::{AudioSegment, MixerTimeline, TimelineAudio};
+use cutty_audio::{MixerTimeline, TimelineAudio};
 use cutty_engine::{
-    resolve_video_layers, timeline_end, ClipId, Project, ProjectSettings, TrackKind,
+    resolve_track_visuals, resolve_video_layers, timeline_end, transition_spans, Project,
+    ProjectSettings, TrackKind, TrackVisual,
 };
 
 use crate::compose::TimelineRenderer;
@@ -178,31 +179,51 @@ fn preview_size(settings: &ProjectSettings) -> (u32, u32) {
 // Timeline queries beyond the resolver
 // ---------------------------------------------------------------------
 
-/// A video clip that starts within the lookahead window.
+/// A video clip that starts (visually) within the lookahead window.
 struct UpcomingClip {
     clip_id: u64,
     media_id: u64,
+    /// When the clip first appears on screen: its `timeline_in`, or the
+    /// transition span start when it enters through a transition.
     timeline_in: f64,
+    /// The source position needed at that first appearance (negative
+    /// values — an incoming freeze side — clamp to 0 at the decoder).
     source_in: f64,
+    /// Entering mid-transition: both sides stream, so the running
+    /// decoder can never be reused for this clip.
+    via_transition: bool,
 }
 
-/// Video clips on visible tracks starting in `(t, t + horizon]`.
+/// Video clips on visible tracks whose first on-screen moment falls in
+/// `(t, t + horizon]`. Transition targets appear at their span start —
+/// half a transition *before* their cut — with the extended source
+/// position, so priming completes before the overlap begins.
 fn upcoming_video_starts(project: &Project, t: f64, horizon: f64) -> Vec<UpcomingClip> {
+    let spans = transition_spans(project);
     let mut upcoming: Vec<UpcomingClip> = project
         .tracks
         .iter()
         .filter(|track| track.kind == TrackKind::Video && !track.hidden)
         .flat_map(|track| {
-            track
-                .clips
-                .iter()
-                .filter(|clip| t < clip.timeline_in && clip.timeline_in <= t + horizon)
-                .map(|clip| UpcomingClip {
+            let spans = &spans;
+            track.clips.iter().filter_map(move |clip| {
+                let span = spans.iter().find(|s| s.to_clip == clip.id);
+                let (start, source_in, via_transition) = match span {
+                    Some(s) => (
+                        s.start,
+                        clip.source_in - (s.cut - s.start) * clip.speed,
+                        true,
+                    ),
+                    None => (clip.timeline_in, clip.source_in, false),
+                };
+                (t < start && start <= t + horizon).then_some(UpcomingClip {
                     clip_id: clip.id.0,
                     media_id: clip.media_id.0,
-                    timeline_in: clip.timeline_in,
-                    source_in: clip.source_in,
+                    timeline_in: start,
+                    source_in,
+                    via_transition,
                 })
+            })
         })
         .collect();
     upcoming.sort_by(|a, b| a.timeline_in.total_cmp(&b.timeline_in));
@@ -226,7 +247,11 @@ fn is_continuation(project: &Project, upcoming: &UpcomingClip, t: f64) -> bool {
 /// clip on an unmuted track. Video-track clips contribute their media's
 /// audio (scaled by clip volume) from the proxy; audio-track clips play
 /// from their resolved file. Muting a track silences it either way.
+/// Video transitions extend the two clips across the span with
+/// equal-power ramps ([`crate::audio_layout`]); music tracks are
+/// untouched.
 fn mixer_timeline(project: &Project, sources: &Sources) -> MixerTimeline {
+    let spans = transition_spans(project);
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
         for clip in &track.clips {
@@ -239,13 +264,16 @@ fn mixer_timeline(project: &Project, sources: &Sources) -> MixerTimeline {
             let Some(path) = sources.audio_path(clip.media_id.0) else {
                 continue; // proxy not ready yet — silent until refresh
             };
-            segments.push(AudioSegment {
+            let placement = crate::audio_layout::audio_placement(clip, &spans);
+            segments.push(cutty_audio::AudioSegment {
                 path,
-                timeline_in: clip.timeline_in,
-                timeline_out: clip.timeline_out,
-                source_in: clip.source_in,
+                timeline_in: placement.timeline_in,
+                timeline_out: placement.timeline_out,
+                source_in: placement.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                fade_in: placement.fade_in,
+                fade_out: placement.fade_out,
             });
         }
     }
@@ -397,9 +425,16 @@ struct PrimeRequest {
     source_in: f64,
 }
 
-/// A prime result: `(clip id, media id, positioned decoder)` or
-/// `(clip id, error)`.
-type PrimeResult = Result<(u64, u64, SourceDecoder), (u64, String)>;
+/// A matured prime, ready to install.
+struct PrimedDecoder {
+    clip_id: u64,
+    media_id: u64,
+    source_in: f64,
+    decoder: SourceDecoder,
+}
+
+/// A prime result: a positioned decoder, or `(clip id, error)`.
+type PrimeResult = Result<PrimedDecoder, (u64, String)>;
 
 struct Prefetcher {
     req_tx: Sender<PrimeRequest>,
@@ -433,13 +468,18 @@ impl Prefetcher {
     }
 }
 
-/// Open a decoder and position it on the clip's first frame. The decoded
-/// frame stays in the decoder's buffer — installing it uploads that frame
-/// without touching the stream again.
-fn prime(req: &PrimeRequest) -> Result<(u64, u64, SourceDecoder), MediaError> {
+/// Open a decoder and position it on the clip's first visible frame. The
+/// decoded frame stays in the decoder's buffer — installing it uploads
+/// that frame without touching the stream again.
+fn prime(req: &PrimeRequest) -> Result<PrimedDecoder, MediaError> {
     let mut decoder = SourceDecoder::open(&req.path)?;
     decoder.seek_to(req.source_in)?;
-    Ok((req.clip_id, req.media_id, decoder))
+    Ok(PrimedDecoder {
+        clip_id: req.clip_id,
+        media_id: req.media_id,
+        source_in: req.source_in,
+        decoder,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -453,6 +493,12 @@ struct EncodedFrame {
     width: u32,
     height: u32,
     jpeg: Vec<u8>,
+}
+
+/// A frame submitted to the GPU whose readback hasn't been consumed.
+struct InflightFrame {
+    idx: i64,
+    slot: usize,
 }
 
 /// Wall-clock takeover when the audio clock stops advancing (device
@@ -483,13 +529,17 @@ struct Engine {
     /// preview then shows black and reports why, audio still plays).
     renderer: Option<TimelineRenderer>,
     prefetch: Prefetcher,
-    /// Positioned decoders per upcoming clip id, ready to install.
-    primed: HashMap<u64, SourceDecoder>,
     /// Prime requests in flight (clip ids); stale results are dropped.
     in_flight: HashSet<u64>,
     /// Active layer clip ids at the last rendered frame (decoder GC runs
     /// when this changes).
     prev_layer_clips: Vec<u64>,
+    /// A composited frame submitted to the GPU but not yet read back —
+    /// the playing pump pre-submits grid frame N+1 before encoding N, so
+    /// the GPU renders while the CPU JPEG-encodes (mirroring the export
+    /// frontend's double buffering). Every transport/project change
+    /// flushes it.
+    inflight: Option<InflightFrame>,
     /// The next output grid frame to render while playing.
     next_grid_idx: Option<i64>,
     /// A rendered-but-not-yet-presented frame (pacing wait interrupted).
@@ -545,9 +595,9 @@ fn run(project: Project, jpeg: JpegEncoder, sink: EventSink, cmd_rx: Receiver<Cm
         cache: FrameCache::new(DEFAULT_CAPACITY_BYTES),
         renderer: None,
         prefetch,
-        primed: HashMap::new(),
         in_flight: HashSet::new(),
         prev_layer_clips: Vec::new(),
+        inflight: None,
         next_grid_idx: None,
         pending_frame: None,
         position: 0.0,
@@ -729,6 +779,7 @@ impl Engine {
         if up_to_date {
             return;
         }
+        self.flush_inflight();
         self.cache.clear();
         match TimelineRenderer::new(want.0, want.1, false) {
             Ok(r) => {
@@ -754,13 +805,13 @@ impl Engine {
     // --- Command handlers ----------------------------------------------
 
     fn apply_project(&mut self, project: Project) {
+        self.flush_inflight();
         self.project = project;
         self.sources.rebuild(&self.project);
         self.clock
             .set_timeline(mixer_timeline(&self.project, &self.sources));
         // Every cached frame is a composite of the old project.
         self.cache.clear();
-        self.primed.clear();
         self.in_flight.clear();
         self.ensure_renderer();
 
@@ -776,6 +827,7 @@ impl Engine {
     }
 
     fn do_refresh(&mut self) {
+        self.flush_inflight();
         self.sources.rebuild(&self.project);
         self.clock
             .set_timeline(mixer_timeline(&self.project, &self.sources));
@@ -801,6 +853,7 @@ impl Engine {
         self.at_eof = false;
         self.pending_frame = None;
         self.next_grid_idx = None; // re-anchor to the clock
+        self.flush_inflight();
         self.clock.play();
         self.reset_clock_tracking();
         self.emit_position();
@@ -855,9 +908,12 @@ impl Engine {
     // --- Frame production -------------------------------------------------
 
     /// Produce the composited, encoded output frame for grid index `idx`:
-    /// cache first, then the renderer. `None` = black (gap, no renderer,
-    /// or a failed compose — failures are reported).
+    /// cache first, then the renderer, synchronously (the paused path;
+    /// [`Engine::compose_frame_playing`] is the pipelined playing path).
+    /// `None` = black (gap, no renderer, or a failed compose — failures
+    /// are reported). Callers guarantee no frame is in flight.
     fn compose_frame(&mut self, idx: i64) -> Option<EncodedFrame> {
+        debug_assert!(self.inflight.is_none(), "sync compose with a frame in flight");
         let fps = self.project_fps();
         let t = idx as f64 / fps;
 
@@ -869,29 +925,107 @@ impl Engine {
                 jpeg: hit.jpeg.clone(),
             });
         }
-        if resolve_video_layers(&self.project, t).is_empty() {
+        if !self.submit_frame(idx, 0) {
             return None;
         }
-        self.renderer.as_ref()?; // init failure already reported
+        self.read_encoded(idx, 0)
+    }
 
-        let (result, issues, (out_w, out_h)) = {
+    /// The playing-path frame producer: consumes the pre-submitted frame
+    /// when it matches, submits grid frame `idx + 1` to the GPU *before*
+    /// reading `idx` back, then reads + JPEG-encodes `idx`. The GPU
+    /// renders the next frame while the CPU encodes this one — the same
+    /// double buffering the export frontend uses, which is what keeps
+    /// transition spans (two decodes + shader passes) inside the frame
+    /// budget.
+    fn compose_frame_playing(&mut self, idx: i64) -> Option<EncodedFrame> {
+        let fps = self.project_fps();
+        if let Some(hit) = self.cache.get(idx) {
+            let frame = EncodedFrame {
+                timeline_pts: idx as f64 / fps,
+                width: hit.width,
+                height: hit.height,
+                jpeg: hit.jpeg.clone(),
+            };
+            self.flush_inflight();
+            return Some(frame);
+        }
+
+        let slot = match self.inflight.take() {
+            Some(inflight) if inflight.idx == idx => inflight.slot,
+            stale => {
+                if stale.is_some() {
+                    self.inflight = stale;
+                    self.flush_inflight();
+                }
+                if !self.submit_frame(idx, 0) {
+                    return None;
+                }
+                0
+            }
+        };
+
+        // Pre-submit the next grid frame (if it draws anything and isn't
+        // cached) so the GPU works while this frame encodes.
+        let next = idx + 1;
+        let next_t = next as f64 / fps;
+        if next_t < self.end() - 1e-9 && self.cache.get(next).is_none() {
+            let next_slot = 1 - slot;
+            if self.submit_frame(next, next_slot) {
+                self.inflight = Some(InflightFrame {
+                    idx: next,
+                    slot: next_slot,
+                });
+            }
+        }
+
+        self.read_encoded(idx, slot)
+    }
+
+    /// Submit grid frame `idx`'s decode + composite to the GPU on `slot`
+    /// (no readback). `false` when nothing renders there (gap, renderer
+    /// down, or a failed submit — failures are reported).
+    fn submit_frame(&mut self, idx: i64, slot: usize) -> bool {
+        let fps = self.project_fps();
+        let t = idx as f64 / fps;
+        if resolve_video_layers(&self.project, t).is_empty() || self.renderer.is_none() {
+            return false;
+        }
+        let (result, issues) = {
             let Engine {
                 renderer,
                 sources,
-                jpeg,
                 project,
                 ..
             } = self;
             let renderer = renderer.as_mut().expect("checked above");
-            let result =
-                renderer.render_with(project, t, &|media| sources.video_path(media), |frame| {
-                    jpeg.encode_rgba_strided(frame.width, frame.height, frame.stride, frame.data)
-                });
-            (result, renderer.take_issues(), renderer.output_size())
+            let result = renderer.begin_frame(project, t, &|media| sources.video_path(media), slot);
+            (result, renderer.take_issues())
         };
         for issue in issues {
             self.report(issue);
         }
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                self.report(format!("compose failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Block on `slot`'s readback, JPEG-encode it, and cache it as `idx`.
+    fn read_encoded(&mut self, idx: i64, slot: usize) -> Option<EncodedFrame> {
+        let fps = self.project_fps();
+        let t = idx as f64 / fps;
+        let (result, (out_w, out_h)) = {
+            let Engine { renderer, jpeg, .. } = self;
+            let renderer = renderer.as_mut()?;
+            let result = renderer.read_frame(slot, |frame| {
+                jpeg.encode_rgba_strided(frame.width, frame.height, frame.stride, frame.data)
+            });
+            (result, renderer.output_size())
+        };
         match result {
             Ok(Ok(jpeg)) => {
                 self.cache.insert(
@@ -920,10 +1054,22 @@ impl Engine {
         }
     }
 
+    /// Discard a pre-submitted frame (transport or project changed under
+    /// it). The readback must still be consumed — an unread submission
+    /// would poison its slot's next map.
+    fn flush_inflight(&mut self) {
+        if let Some(inflight) = self.inflight.take() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                let _ = renderer.read_frame(inflight.slot, |_| ());
+            }
+        }
+    }
+
     /// Show the correct frame for timeline time `t` (paused-path: scrub,
     /// step, seek preview, post-edit refresh). Renders on the output
     /// frame grid, cache-first.
     fn scrub_to(&mut self, t: f64) {
+        self.flush_inflight();
         self.position = t;
         let fps = self.project_fps();
         let idx = (t * fps + 1e-6).floor() as i64;
@@ -988,6 +1134,7 @@ impl Engine {
             self.at_eof = true;
             self.pending_frame = None;
             self.next_grid_idx = None;
+            self.flush_inflight();
             (self.sink)(PlayerEvent::Eof);
             self.emit_position();
             return None;
@@ -1026,7 +1173,7 @@ impl Engine {
 
         // Keep decoders warm for what's coming, then render.
         self.maintain_pipeline(t_frame);
-        let frame = self.compose_frame(idx);
+        let frame = self.compose_frame_playing(idx);
         self.next_grid_idx = Some(idx + 1);
 
         match frame {
@@ -1064,15 +1211,22 @@ impl Engine {
 
     /// Keep the decode pipeline ahead of the playhead: install matured
     /// prefetches, request primes for cuts entering the lookahead window,
-    /// and close decoders that fell out of range.
+    /// and close decoders that fell out of range. Transition overlaps
+    /// put **both** clips of a pair in the active set, so two streams
+    /// stay warm for the whole span.
     fn maintain_pipeline(&mut self, t: f64) {
         if self.renderer.is_none() {
             return;
         }
 
-        // The active stack, with each layer's media and source time.
-        let actives: Vec<(u64, u64, f64)> = resolve_video_layers(&self.project, t)
+        // The active stack — every streaming clip with its source time
+        // (a transition contributes two).
+        let actives: Vec<(u64, u64, f64)> = resolve_track_visuals(&self.project, t)
             .iter()
+            .flat_map(|v| match v {
+                TrackVisual::Single(c) => vec![c],
+                TrackVisual::Transition { from, to, .. } => vec![from, to],
+            })
             .filter_map(|a| {
                 self.project
                     .find_clip(a.clip_id)
@@ -1080,31 +1234,26 @@ impl Engine {
             })
             .collect();
 
-        // Install matured prefetches for clips that are now active.
-        for &(clip_id, media_id, source_time) in &actives {
-            if let Some(decoder) = self.primed.remove(&clip_id) {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.offer_decoder(media_id, decoder, source_time);
-                }
-            }
-        }
-
-        // Drop primes whose clip disappeared or already ended.
-        let project = &self.project;
-        self.primed.retain(|&clip_id, _| {
-            project
-                .find_clip(ClipId(clip_id))
-                .is_some_and(|(_, c)| c.timeline_out > t)
-        });
-
-        // Prime decoders for cuts inside the lookahead window.
+        // Prime decoders for cuts inside the lookahead window; matured
+        // primes install straight into the renderer (`poll_prefetch`),
+        // where they wait keyed by clip until their frames arrive.
         let upcoming = upcoming_video_starts(&self.project, t, LOOKAHEAD);
         for up in &upcoming {
-            if self.primed.contains_key(&up.clip_id) || self.in_flight.contains(&up.clip_id) {
+            if self.in_flight.contains(&up.clip_id) {
                 continue;
             }
-            if is_continuation(&self.project, up, t) {
-                continue; // the running session flows across the split
+            if self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.has_session(up.clip_id))
+            {
+                continue; // already installed (or streaming)
+            }
+            // A transition target always needs its own session (the
+            // outgoing clip keeps streaming beside it); only plain cuts
+            // can flow through the running decoder.
+            if !up.via_transition && is_continuation(&self.project, up, t) {
+                continue;
             }
             let Some(path) = self.sources.video_path(up.media_id) else {
                 continue; // proxy pending — the switch will render black
@@ -1118,18 +1267,18 @@ impl Engine {
             });
         }
 
-        // Close decoders for sources neither active nor upcoming, when
-        // the stack changes ("one decoder session per active source").
+        // Reconcile decode sessions when the stack changes: sessions
+        // migrate across plain cuts (same media), the rest close.
         let ids: Vec<u64> = actives.iter().map(|&(clip, ..)| clip).collect();
         if ids != self.prev_layer_clips {
             self.prev_layer_clips = ids;
-            let keep: HashSet<u64> = actives
+            let needed: Vec<(u64, u64)> = actives
                 .iter()
-                .map(|&(_, media, _)| media)
-                .chain(upcoming.iter().map(|u| u.media_id))
+                .map(|&(clip, media, _)| (clip, media))
+                .chain(upcoming.iter().map(|u| (u.clip_id, u.media_id)))
                 .collect();
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.retain_sources(&keep);
+                renderer.sync_sources(&needed);
             }
         }
     }
@@ -1137,9 +1286,22 @@ impl Engine {
     fn poll_prefetch(&mut self) {
         while let Ok(result) = self.prefetch.res_rx.try_recv() {
             match result {
-                Ok((clip_id, _media_id, decoder)) => {
-                    if self.in_flight.remove(&clip_id) {
-                        self.primed.insert(clip_id, decoder);
+                Ok(primed) => {
+                    // Install immediately: the session waits under its
+                    // clip id until that clip's first frame samples it
+                    // (the GC keeps upcoming clips). Installing on
+                    // activation instead would leave the render path a
+                    // cold open when the pipelined pump submits one
+                    // frame ahead of the active set.
+                    if self.in_flight.remove(&primed.clip_id) {
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.offer_decoder(
+                                primed.clip_id,
+                                primed.media_id,
+                                primed.decoder,
+                                primed.source_in,
+                            );
+                        }
                     }
                     // Anything else is stale (project changed): dropped.
                 }

@@ -40,20 +40,24 @@ pub use autosave::{
     RecoveryCandidate,
 };
 pub use command::{
-    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, DeleteClip, JoinClips, MoveClip,
-    MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RestoreMedia, RippleDelete, RippleInsert,
-    RippleMove, SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag,
-    SplitClip, TrackFlag, TrimClip,
+    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, JoinClips,
+    MoveClip, MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RestoreMedia, RippleDelete,
+    RippleInsert, RippleMove, SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume,
+    SetTrackFlag, SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;
 pub use model::{
-    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId,
-    TrackKind, Transform, EPS, MIN_CLIP_DURATION,
+    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track,
+    TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
+    MIN_TRANSITION_DURATION, TOUCH_EPS,
 };
 pub use project_file::ProjectFileError;
 pub use recents::RecentProject;
-pub use resolve::{next_boundary_after, resolve, resolve_video_layers, timeline_end, ActiveClip};
+pub use resolve::{
+    next_boundary_after, resolve, resolve_track_visuals, resolve_video_layers, timeline_end,
+    transition_duration_limit, transition_spans, ActiveClip, TrackVisual, TransitionSpan,
+};
 pub use snap::{snap, snap_candidates, snap_clip_move, snap_time, SnappedMove};
 
 /// Cutty's XDG state directory (`$XDG_STATE_HOME/cutty`, usually

@@ -249,6 +249,8 @@ fn preview_mix_timeline(project: &cutty_engine::Project) -> MixerTimeline {
                 source_in: clip.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                fade_in: None,
+                fade_out: None,
             });
         }
     }
@@ -321,6 +323,7 @@ fn phase2_compositor_export_acceptance() {
                 blend_mode: cutty_engine::BlendMode::Normal,
                 speed: 1.0,
                 volume: 0.0,
+                transition_out: None,
             }],
         }
     };
@@ -397,6 +400,100 @@ fn phase2_compositor_export_acceptance() {
             .expect("mpv must be installed for acceptance");
         assert!(mpv.status.success(), "{label}: mpv failed to decode");
     }
+    assert!(our_ffmpeg_children().is_empty(), "no ffmpeg left behind");
+}
+
+/// Phase 2 acceptance: a **transition-heavy** 60 s timeline (a transition
+/// on every one of its seven cuts, including the multi-tap shaders)
+/// exports through the GPU compositor at 1080p at ≥1× realtime when
+/// hardware encode is available. Every span decodes two 1080p original
+/// streams simultaneously.
+#[test]
+#[ignore = "heavy: full transition-heavy 1080p export; run with --ignored"]
+fn transitions_export_acceptance() {
+    let recording = screen_recording();
+    let music = music_bed();
+    generate_proxy(&recording, None, |_| {}).expect("proxy for export audio");
+
+    let mut project = build_short(&recording, &music);
+    // A different transition on every cut of the short.
+    let kinds = [
+        "fade",
+        "wiperight",
+        "circleopen",
+        "crosszoom",
+        "slideleft",
+        "linearblur",
+        "pixelize",
+    ];
+    {
+        let track = project
+            .tracks
+            .iter_mut()
+            .find(|t| t.kind == TrackKind::Video)
+            .unwrap();
+        assert_eq!(track.clips.len(), 8, "seven cuts to dress");
+        for (i, kind) in kinds.iter().enumerate() {
+            track.clips[i].transition_out = Some(cutty_engine::Transition {
+                kind: (*kind).to_string(),
+                duration: 0.8,
+            });
+        }
+    }
+    project.validate().expect("fixture is valid");
+    assert_eq!(cutty_engine::transition_spans(&project).len(), 7);
+
+    let dst = std::env::temp_dir().join("cutty-media-tests/transitions-60s.mp4");
+    let _ = std::fs::remove_file(&dst);
+    let spec = ExportSpec {
+        width: 1920,
+        height: 1080,
+        fps: FPS,
+        quality: ExportQuality::Medium,
+        dst: dst.clone(),
+    };
+    let cancel = CancelToken::new();
+    let t0 = Instant::now();
+    let summary = run_export(&project, &spec, &cancel, &mut |_| {}).expect("transition export");
+    let wall = t0.elapsed();
+    let speed = SHORT_SECS / wall.as_secs_f64();
+    println!(
+        "transition-heavy 60s @1080p: {wall:.1?} ({speed:.2}x realtime) via {} — renderer {}",
+        summary.encoder, summary.renderer
+    );
+    assert_eq!(
+        summary.renderer, "gpu-compositor",
+        "transitions must disqualify the fast path"
+    );
+    if summary.hardware_encode {
+        assert!(
+            speed >= 1.0,
+            "transition-heavy 1080p export below realtime: {speed:.2}x"
+        );
+    }
+
+    let info = ffprobe_json(&dst);
+    let duration: f64 = info["format"]["duration"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (duration - SHORT_SECS).abs() < 0.31,
+        "duration {duration:.2}s"
+    );
+    let streams = info["streams"].as_array().unwrap();
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .expect("video stream");
+    assert_eq!(video["width"], 1920);
+    assert_eq!(video["height"], 1080);
+    assert_eq!(video["r_frame_rate"], "30/1");
+    assert!(
+        streams.iter().any(|s| s["codec_type"] == "audio"),
+        "audio muxed"
+    );
     assert!(our_ffmpeg_children().is_empty(), "no ffmpeg left behind");
 }
 

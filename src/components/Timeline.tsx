@@ -3,15 +3,17 @@
 // src/timeline/).
 
 import { useEffect, useRef, useState } from "react";
-import type { Track, TrackFlag } from "../lib/engineIpc";
+import type { Track, TrackFlag, TransitionDef } from "../lib/engineIpc";
 import {
+  cachedTransitionList,
   engineAddTrack,
   engineMoveTrack,
   engineRemoveTrack,
   engineSetTrackFlag,
+  engineSetTransition,
 } from "../lib/engineIpc";
 import { startEngineSync } from "../state/engineSync";
-import { useProjectStore } from "../state/projectStore";
+import { useProjectStore, type TransitionPicker } from "../state/projectStore";
 import { toast } from "../state/toastStore";
 import {
   deleteSelection,
@@ -311,6 +313,88 @@ function TrackHeader({
   );
 }
 
+// --- Transition picker (double-click on a chip swaps the type) ----------
+
+function TransitionPickerMenu({
+  picker,
+  onClose,
+}: {
+  picker: TransitionPicker;
+  onClose: () => void;
+}) {
+  const [catalog, setCatalog] = useState<TransitionDef[]>([]);
+  const transitions = useProjectStore((s) => s.transitions);
+  const span = transitions.find((t) => t.fromClipId === picker.clipId);
+
+  useEffect(() => {
+    let alive = true;
+    cachedTransitionList()
+      .then((defs) => {
+        if (alive) setCatalog(defs);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
+  if (!span) return null;
+
+  const swap = (kind: string) => {
+    engineSetTransition(picker.clipId, {
+      kind,
+      duration: span.requested,
+    }).catch((err) => toast(String(err), "error"));
+    onClose();
+  };
+  const remove = () => {
+    engineSetTransition(picker.clipId, null).catch((err) =>
+      toast(String(err), "error"),
+    );
+    onClose();
+  };
+
+  const ITEM =
+    "block w-full px-3 py-1 text-left text-xs hover:bg-zinc-800 " +
+    "text-zinc-300";
+
+  return (
+    <div className="fixed inset-0 z-[70]" onPointerDown={onClose}>
+      <div
+        className="absolute z-[71] max-h-72 w-44 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 py-1 shadow-xl shadow-black/50"
+        style={{
+          left: Math.min(picker.x, window.innerWidth - 190),
+          top: Math.min(picker.y, window.innerHeight - 300),
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {catalog.map((def) => (
+          <button
+            key={def.id}
+            className={`${ITEM} ${def.id === span.kind ? "text-violet-300" : ""}`}
+            onClick={() => swap(def.id)}
+          >
+            {def.id === span.kind ? "✓ " : ""}
+            {def.label}
+          </button>
+        ))}
+        <div className="my-1 h-px bg-zinc-800" />
+        <button className={`${ITEM} text-red-400`} onClick={remove}>
+          Remove transition
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Timeline() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const project = useProjectStore((s) => s.project);
@@ -321,6 +405,8 @@ function Timeline() {
   const setSnapEnabled = useProjectStore((s) => s.setSnapEnabled);
   const pxPerSec = useProjectStore((s) => s.pxPerSec);
   const trackScrollPx = useProjectStore((s) => s.trackScrollPx);
+  const transitionPicker = useProjectStore((s) => s.transitionPicker);
+  const setTransitionPicker = useProjectStore((s) => s.setTransitionPicker);
   const [menu, setMenu] = useState<MenuState | null>(null);
 
   useEffect(() => {
@@ -475,6 +561,12 @@ function Timeline() {
           menu={menu}
           tracks={tracks}
           onClose={() => setMenu(null)}
+        />
+      )}
+      {transitionPicker && (
+        <TransitionPickerMenu
+          picker={transitionPicker}
+          onClose={() => setTransitionPicker(null)}
         />
       )}
     </section>

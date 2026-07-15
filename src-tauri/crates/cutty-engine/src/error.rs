@@ -76,6 +76,11 @@ pub enum EngineError {
     #[error("split point {at} is outside clip {clip:?} (must be strictly inside)")]
     SplitOutOfRange { clip: ClipId, at: f64 },
 
+    /// A transition is malformed or has no cut to bind to (no touching
+    /// next clip on the track, or the clip is not on a video track).
+    #[error("invalid transition on clip {clip:?}: {reason}")]
+    InvalidTransition { clip: ClipId, reason: &'static str },
+
     /// The operation targets a locked track. `name` is carried so the UI
     /// can say which track without a second lookup.
     #[error("track \"{name}\" is locked — unlock it to edit")]

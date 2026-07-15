@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use cutty_engine::{
-    BlendMode, ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove, TrackFlag, TrackId,
-    TrackKind, Transform, TrimEdge,
+    transition_spans, BlendMode, ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove,
+    TrackFlag, TrackId, TrackKind, Transform, Transition, TrimEdge,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -29,12 +29,34 @@ impl Default for EngineHandle {
     }
 }
 
+/// A transition resolved to its effective on-timeline span (mirrors
+/// `cutty_engine::TransitionSpan`). The UI renders chips exactly where
+/// these say — clamping and centering stay engine-side.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionSpanWire {
+    pub track_id: u64,
+    pub from_clip_id: u64,
+    pub to_clip_id: u64,
+    pub kind: String,
+    pub cut: f64,
+    pub start: f64,
+    pub end: f64,
+    /// Stored (requested) duration, seconds.
+    pub requested: f64,
+    /// The longest duration this cut currently supports.
+    pub max_duration: f64,
+}
+
 /// Full engine state as sent to the frontend (also the return value of
 /// [`engine_get_state`] for the initial fetch).
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSnapshot {
     pub project: Project,
+    /// Resolved transition spans for the project above (derived state —
+    /// recomputed with every snapshot).
+    pub transitions: Vec<TransitionSpanWire>,
     pub undo_depth: usize,
     pub redo_depth: usize,
     pub transaction_active: bool,
@@ -60,8 +82,23 @@ impl From<TrimEdgeArg> for TrimEdge {
 fn snapshot(engine: &mut Engine) -> EngineSnapshot {
     // The snapshot below supersedes any pending per-command events.
     engine.drain_events();
+    let transitions = transition_spans(engine.project())
+        .into_iter()
+        .map(|s| TransitionSpanWire {
+            track_id: s.track_id.0,
+            from_clip_id: s.from_clip.0,
+            to_clip_id: s.to_clip.0,
+            kind: s.kind,
+            cut: s.cut,
+            start: s.start,
+            end: s.end,
+            requested: s.requested,
+            max_duration: s.max_duration,
+        })
+        .collect();
     EngineSnapshot {
         project: engine.project().clone(),
+        transitions,
         undo_depth: engine.undo_depth(),
         redo_depth: engine.redo_depth(),
         transaction_active: engine.transaction_active(),
@@ -317,6 +354,35 @@ pub fn engine_set_track_flag(
 ) -> Result<(), String> {
     mutate(&app, &state, |e| {
         e.set_track_flag(TrackId(track_id), flag, value)
+    })
+}
+
+/// Wire form of a transition assignment.
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionArg {
+    pub kind: String,
+    pub duration: f64,
+}
+
+/// Set, replace, or remove (`transition: null`) the transition at a
+/// clip's out cut. Returns the stored duration after clamping (`null`
+/// when removing).
+#[tauri::command]
+pub fn engine_set_transition(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    transition: Option<TransitionArg>,
+) -> Result<Option<f64>, String> {
+    mutate(&app, &state, |e| {
+        e.set_transition(
+            ClipId(clip_id),
+            transition.map(|t| Transition {
+                kind: t.kind,
+                duration: t.duration,
+            }),
+        )
     })
 }
 

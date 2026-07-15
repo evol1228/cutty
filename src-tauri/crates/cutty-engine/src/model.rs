@@ -17,6 +17,24 @@ pub const EPS: f64 = 1e-9;
 /// this so no operation can produce a (near-)zero-length clip.
 pub const MIN_CLIP_DURATION: f64 = 1e-3;
 
+/// Two clips "touch" (share a cut) when their facing edges are within this
+/// tolerance, seconds. Well under one frame at any real rate, comfortably
+/// above f64 dust. Transitions bind to touching edges; every adjacency
+/// check (validation, pruning, span resolution) uses this one definition.
+pub const TOUCH_EPS: f64 = 1e-6;
+
+/// Shortest transition the engine stores, seconds (matching the CapCut
+/// floor — anything shorter reads as a hard cut).
+pub const MIN_TRANSITION_DURATION: f64 = 0.1;
+
+/// Longest transition the engine stores, seconds.
+pub const MAX_TRANSITION_DURATION: f64 = 5.0;
+
+/// Whether `a`'s out edge and `b`'s in edge share a cut (see [`TOUCH_EPS`]).
+pub fn clips_touch(a: &Clip, b: &Clip) -> bool {
+    (b.timeline_in - a.timeline_out).abs() <= TOUCH_EPS
+}
+
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -147,6 +165,22 @@ pub enum BlendMode {
     Add,
 }
 
+/// A transition bound to the cut at its owning clip's out edge.
+///
+/// The span is `duration` seconds **centered on the cut**; the effective
+/// span is derived at resolve time ([`crate::resolve::transition_spans`]),
+/// clamped to both clips' durations and to available source handles.
+/// `kind` is a transition id from the GPU shader registry (`cutty-gpu`);
+/// unknown ids render as a crossfade rather than failing, so project
+/// files stay forward-compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transition {
+    pub kind: String,
+    /// Requested duration, seconds. Validated finite and positive.
+    pub duration: f64,
+}
+
 /// A clip: a window into a media file, placed on the timeline.
 ///
 /// Invariants (enforced by [`Project::validate`]):
@@ -155,6 +189,7 @@ pub enum BlendMode {
 /// - `(timeline_out - timeline_in) * speed == source_out - source_in`
 ///   (within [`EPS`]) — `speed` is modeled but fixed at `1.0` in Phase 1
 /// - no overlap with other clips on the same track (touching edges are fine)
+/// - `transition_out` only on video tracks, only with a touching next clip
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
@@ -179,6 +214,12 @@ pub struct Clip {
     pub speed: f64,
     /// Linear gain, `>= 0.0` (1.0 = unity).
     pub volume: f64,
+    /// Transition into the next clip on the same track, spanning the cut
+    /// at `timeline_out`. Additive schema field (`serde(default)`):
+    /// pre-transition projects load as `None`, and files without
+    /// transitions serialize byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_out: Option<Transition>,
 }
 
 impl Clip {
@@ -318,6 +359,44 @@ impl Project {
                         track: track.id,
                         a: pair[0].id,
                         b: pair[1].id,
+                    });
+                }
+            }
+            // Transitions bind to a live cut: video track, touching next
+            // clip, sane duration. Structural commands prune what a
+            // mutation would leave dangling, so this only trips on bugs
+            // and on hand-edited project files.
+            for (i, clip) in track.clips.iter().enumerate() {
+                let Some(transition) = &clip.transition_out else {
+                    continue;
+                };
+                if track.kind != TrackKind::Video {
+                    return Err(EngineError::InvalidTransition {
+                        clip: clip.id,
+                        reason: "transitions only apply to video clips",
+                    });
+                }
+                if transition.kind.is_empty() {
+                    return Err(EngineError::InvalidTransition {
+                        clip: clip.id,
+                        reason: "empty transition kind",
+                    });
+                }
+                if !transition.duration.is_finite() || transition.duration <= 0.0 {
+                    return Err(EngineError::InvalidProperty {
+                        clip: clip.id,
+                        property: "transition.duration",
+                        value: transition.duration,
+                    });
+                }
+                let touching_next = track
+                    .clips
+                    .get(i + 1)
+                    .is_some_and(|next| clips_touch(clip, next));
+                if !touching_next {
+                    return Err(EngineError::InvalidTransition {
+                        clip: clip.id,
+                        reason: "no adjacent clip after the cut",
                     });
                 }
             }

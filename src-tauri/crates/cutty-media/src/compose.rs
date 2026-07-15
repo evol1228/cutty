@@ -20,15 +20,30 @@
 //!
 //! Decoders advance forward frame-by-frame when the target is near
 //! (sequential playback, small hops), and seek when it is not (scrubs,
-//! jump cuts). One decoder serves each source across all tracks; the rare
-//! project that shows the *same* source at two different offsets
-//! simultaneously gets one decoder per occurrence.
+//! jump cuts). Decode sessions are keyed by **clip**: normally that means
+//! one decoder per on-screen source, and a session migrates ("adoption")
+//! to the next clip of the same media at a cut, so split points still
+//! flow through one decoder. During a transition overlap the two clips
+//! hold two sessions — even when they read the same file at different
+//! offsets — because both stream simultaneously.
+//!
+//! # Transitions
+//!
+//! Inside a transition span ([`cutty_engine::resolve_track_visuals`]) a
+//! track plans a *pair*: both sides decode and upload, and the GPU runs
+//! the registered transition shader between them
+//! ([`cutty_gpu::Visual::Transition`]). Extended source times implement
+//! the handle semantics — the outgoing side runs past its `source_out`
+//! (decoders hold the last frame at end of file: the freeze case), the
+//! incoming side runs negative (clamped to frame 0: the incoming
+//! freeze). Clip blend modes are ignored *during* the overlap (the pair
+//! composites as one normal layer); opacity and transforms apply.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use cutty_engine::{resolve_video_layers, Clip, Project, ProjectSettings};
-use cutty_gpu::{BlendMode as GpuBlend, Compositor, Layer, SourceTexture, Target};
+use cutty_engine::{resolve_track_visuals, ActiveClip, Clip, Project, ProjectSettings, TrackVisual};
+use cutty_gpu::{BlendMode as GpuBlend, Compositor, Layer, SourceTexture, Target, Visual};
 
 use crate::decode::SourceDecoder;
 use crate::error::MediaError;
@@ -57,6 +72,8 @@ pub struct RenderStats {
 
 /// One open source: a decoder plus its GPU texture and what's in it.
 struct SourceState {
+    /// The media file this decoder reads — adoption matches on it.
+    media_id: u64,
     decoder: SourceDecoder,
     texture: SourceTexture,
     /// Source frame index currently uploaded to `texture`.
@@ -64,9 +81,10 @@ struct SourceState {
 }
 
 impl SourceState {
-    fn new(compositor: &Compositor, decoder: SourceDecoder) -> Self {
+    fn new(compositor: &Compositor, media_id: u64, decoder: SourceDecoder) -> Self {
         let texture = compositor.create_source(decoder.width(), decoder.height());
         Self {
+            media_id,
             decoder,
             texture,
             uploaded_idx: None,
@@ -167,15 +185,42 @@ impl SourceState {
     }
 }
 
+/// Tear decode sessions down off the caller's thread: destroying a
+/// frame-threaded libav context joins its worker pool (multiple
+/// milliseconds), which would stall the playback control thread right at
+/// a cut. Spawn failure falls back to an inline drop.
+fn dispose_sources(dropped: Vec<SourceState>) {
+    if dropped.is_empty() {
+        return;
+    }
+    // Spawn failure drops the closure — and with it the sessions —
+    // inline, which is the right fallback.
+    let _ = std::thread::Builder::new()
+        .name("cutty-decoder-drop".into())
+        .spawn(move || drop(dropped));
+}
+
 /// A layer resolved and sampled, ready to composite (phase 1 of
 /// `begin_frame`; phase 2 turns these into borrowed [`Layer`]s).
 struct PlannedLayer {
-    key: (u64, u32),
+    /// Clip id — the decode-session key.
+    key: u64,
     center: (f32, f32),
     size: (f32, f32),
     rotation_rad: f32,
     opacity: f32,
     blend: GpuBlend,
+}
+
+/// One planned visual: a layer, or a sampled transition pair.
+enum PlannedVisual {
+    Layer(PlannedLayer),
+    Transition {
+        from: PlannedLayer,
+        to: PlannedLayer,
+        kind: u32,
+        progress: f32,
+    },
 }
 
 /// A composited output frame, borrowed from the readback buffer.
@@ -246,10 +291,12 @@ pub struct TimelineRenderer {
     /// `true`: any layer failure fails the frame (export). `false`: the
     /// layer is dropped and the message recorded (preview keeps playing).
     strict: bool,
-    /// Keyed by (media id, per-frame occurrence index) — the occurrence
-    /// index is nonzero only when one source is on screen twice at
-    /// different offsets.
-    sources: HashMap<(u64, u32), SourceState>,
+    /// Decode sessions keyed by clip id (see the module docs on
+    /// adoption). A clip name outlives its decoder only until the GC
+    /// (`sync_sources`) runs.
+    sources: HashMap<u64, SourceState>,
+    /// Transition kinds already reported as unknown (fallback to fade).
+    unknown_kinds: HashSet<String>,
     issues: Vec<String>,
     stats: RenderStats,
 }
@@ -266,6 +313,7 @@ impl TimelineRenderer {
             out_h,
             strict,
             sources: HashMap::new(),
+            unknown_kinds: HashSet::new(),
             issues: Vec::new(),
             stats: RenderStats::default(),
         })
@@ -289,17 +337,23 @@ impl TimelineRenderer {
         std::mem::take(&mut self.issues)
     }
 
-    /// Whether a decoder for `media_id` is currently open.
-    pub fn has_source(&self, media_id: u64) -> bool {
-        self.sources.contains_key(&(media_id, 0))
+    /// Whether a decode session exists for `clip_id` (installed prime or
+    /// streaming).
+    pub fn has_session(&self, clip_id: u64) -> bool {
+        self.sources.contains_key(&clip_id)
     }
 
-    /// Install a prefetched decoder for `media_id`, positioned near
-    /// `needed_src_t`. Kept only when it beats the existing decoder (none,
-    /// or one that would have to seek); otherwise dropped.
-    pub fn offer_decoder(&mut self, media_id: u64, decoder: SourceDecoder, needed_src_t: f64) {
-        let key = (media_id, 0);
-        if let Some(existing) = self.sources.get(&key) {
+    /// Install a prefetched decoder for `clip_id` (reading `media_id`),
+    /// positioned near `needed_src_t`. Dropped when the clip already has
+    /// a session that reaches the target without seeking.
+    pub fn offer_decoder(
+        &mut self,
+        clip_id: u64,
+        media_id: u64,
+        decoder: SourceDecoder,
+        needed_src_t: f64,
+    ) {
+        if let Some(existing) = self.sources.get(&clip_id) {
             let fps = existing.decoder.fps();
             let needed = (needed_src_t.max(0.0) * fps + PTS_EPS).floor() as i64;
             let reachable = existing.uploaded_idx == Some(needed)
@@ -312,21 +366,157 @@ impl TimelineRenderer {
                     (0..=FORWARD_WINDOW_FRAMES).contains(&gap)
                 });
             if reachable {
-                return; // the running decoder flows into this clip: keep it
+                return; // the running decoder already covers this clip
             }
         }
         self.sources
-            .insert(key, SourceState::new(&self.compositor, decoder));
+            .insert(clip_id, SourceState::new(&self.compositor, media_id, decoder));
     }
 
-    /// Close decoders for sources not in `keep` (media ids).
-    pub fn retain_sources(&mut self, keep: &std::collections::HashSet<u64>) {
-        self.sources.retain(|(media, _), _| keep.contains(media));
+    /// Reconcile decode sessions with what plays now and soon: sessions
+    /// migrate to the next clip of the same media first (a cut's
+    /// continuation flows through the running decoder — no reopen, no
+    /// seek), then everything not in `needed` closes. `needed` is
+    /// `(clip id, media id)` for every active and upcoming clip.
+    pub fn sync_sources(&mut self, needed: &[(u64, u64)]) {
+        let needed_clips: std::collections::HashSet<u64> =
+            needed.iter().map(|&(clip, _)| clip).collect();
+        for &(clip, media) in needed {
+            if self.sources.contains_key(&clip) {
+                continue;
+            }
+            let orphan = self
+                .sources
+                .iter()
+                .find(|(k, v)| !needed_clips.contains(*k) && v.media_id == media)
+                .map(|(k, _)| *k);
+            if let Some(k) = orphan {
+                let state = self.sources.remove(&k).expect("just found");
+                self.sources.insert(clip, state);
+            }
+        }
+        let drop_keys: Vec<u64> = self
+            .sources
+            .keys()
+            .filter(|k| !needed_clips.contains(k))
+            .copied()
+            .collect();
+        let dropped: Vec<SourceState> = drop_keys
+            .iter()
+            .filter_map(|k| self.sources.remove(k))
+            .collect();
+        dispose_sources(dropped);
     }
 
     /// Close every decoder (source files may have changed on disk).
     pub fn clear_sources(&mut self) {
-        self.sources.clear();
+        dispose_sources(self.sources.drain().map(|(_, v)| v).collect());
+    }
+
+    /// Ensure a decode session for `clip_id` (adopting a same-media
+    /// orphan when one exists, cold-opening otherwise) and sample it at
+    /// `source_time`. `Ok(None)` = the layer contributes nothing this
+    /// frame (missing file / empty stream, lenient mode).
+    #[allow(clippy::too_many_arguments)]
+    fn sample_side(
+        &mut self,
+        project: &Project,
+        active: &ActiveClip,
+        needed: &HashSet<u64>,
+        path_of: &dyn Fn(u64) -> Option<PathBuf>,
+        transition_side: bool,
+    ) -> Result<Option<PlannedLayer>, MediaError> {
+        let Some((_, clip)) = project.find_clip(active.clip_id) else {
+            return Ok(None);
+        };
+        let key = active.clip_id.0;
+        let media = clip.media_id.0;
+
+        if !self.sources.contains_key(&key) {
+            // Adopt a same-media session no planned clip owns (the
+            // continuation flow when the pump's sync didn't run — e.g.
+            // scrubbing straight to a cut).
+            let orphan = self
+                .sources
+                .iter()
+                .find(|(k, v)| !needed.contains(*k) && v.media_id == media)
+                .map(|(k, _)| *k);
+            if let Some(k) = orphan {
+                let state = self.sources.remove(&k).expect("just found");
+                self.sources.insert(key, state);
+            } else {
+                let Some(path) = path_of(media) else {
+                    self.layer_problem(format!(
+                        "no renderable file for media {media} (proxy still generating?)"
+                    ))?;
+                    return Ok(None);
+                };
+                self.stats.cold_opens += 1;
+                match SourceDecoder::open(&path) {
+                    Ok(decoder) => {
+                        self.sources
+                            .insert(key, SourceState::new(&self.compositor, media, decoder));
+                    }
+                    Err(e) => {
+                        self.layer_problem(format!("open {} failed: {e}", path.display()))?;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let state = self.sources.get_mut(&key).expect("just ensured");
+        match state.sample(&self.compositor, active.source_time, &mut self.stats) {
+            Ok(true) => {
+                let (cx, cy, w, h, rot) = layer_placement(
+                    state.texture.width(),
+                    state.texture.height(),
+                    clip,
+                    &project.settings,
+                    self.out_w,
+                    self.out_h,
+                );
+                Ok(Some(PlannedLayer {
+                    key,
+                    center: (cx, cy),
+                    size: (w, h),
+                    rotation_rad: rot,
+                    opacity: clip.opacity as f32,
+                    // Blend modes need the backdrop, which a transition
+                    // intermediate doesn't have: the pair composites as
+                    // one normal layer.
+                    blend: if transition_side {
+                        GpuBlend::Normal
+                    } else {
+                        gpu_blend(clip.blend_mode)
+                    },
+                }))
+            }
+            Ok(false) => Ok(None), // stream with no frames
+            Err(e) => {
+                // Broken decoder: drop it so the next frame reopens.
+                self.sources.remove(&key);
+                self.layer_problem(format!("decode failed: {e}"))?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Dispatch index for a transition kind, falling back to fade (and
+    /// reporting once) for ids this build doesn't know.
+    fn transition_kind_index(&mut self, kind: &str) -> u32 {
+        match cutty_gpu::transition_kind(kind) {
+            Some(index) => index,
+            None => {
+                if self.unknown_kinds.insert(kind.to_string()) {
+                    self.issues.push(format!(
+                        "unknown transition \"{kind}\" — rendering a crossfade \
+                         (project saved by a newer Cutty?)"
+                    ));
+                }
+                0 // fade
+            }
+        }
     }
 
     /// Decode, upload, and composite the output frame at time `t` into
@@ -341,82 +531,80 @@ impl TimelineRenderer {
         path_of: &dyn Fn(u64) -> Option<PathBuf>,
         slot: usize,
     ) -> Result<(), MediaError> {
-        let actives = resolve_video_layers(project, t);
+        let track_visuals = resolve_track_visuals(project, t);
+        let needed: HashSet<u64> = track_visuals
+            .iter()
+            .flat_map(|v| match v {
+                TrackVisual::Single(c) => vec![c.clip_id.0],
+                TrackVisual::Transition { from, to, .. } => vec![from.clip_id.0, to.clip_id.0],
+            })
+            .collect();
 
-        // Phase 1 (mutable): ensure a decoder per layer and sample it.
-        let mut plan: Vec<PlannedLayer> = Vec::new();
-        let mut occurrence: HashMap<u64, u32> = HashMap::new();
-        for active in &actives {
-            let Some((_, clip)) = project.find_clip(active.clip_id) else {
-                continue;
-            };
-            let media = clip.media_id.0;
-            let occ = occurrence.entry(media).or_insert(0);
-            let key = (media, *occ);
-            *occ += 1;
-
-            if !self.sources.contains_key(&key) {
-                let Some(path) = path_of(media) else {
-                    self.layer_problem(format!(
-                        "no renderable file for media {media} (proxy still generating?)"
-                    ))?;
-                    continue;
-                };
-                self.stats.cold_opens += 1;
-                match SourceDecoder::open(&path) {
-                    Ok(decoder) => {
-                        self.sources
-                            .insert(key, SourceState::new(&self.compositor, decoder));
-                    }
-                    Err(e) => {
-                        self.layer_problem(format!("open {} failed: {e}", path.display()))?;
-                        continue;
+        // Phase 1 (mutable): ensure decoders and sample every side.
+        let mut plan: Vec<PlannedVisual> = Vec::new();
+        for visual in &track_visuals {
+            match visual {
+                TrackVisual::Single(active) => {
+                    if let Some(layer) = self.sample_side(project, active, &needed, path_of, false)?
+                    {
+                        plan.push(PlannedVisual::Layer(layer));
                     }
                 }
-            }
-
-            let state = self.sources.get_mut(&key).expect("just ensured");
-            match state.sample(&self.compositor, active.source_time, &mut self.stats) {
-                Ok(true) => {
-                    let (cx, cy, w, h, rot) = layer_placement(
-                        state.texture.width(),
-                        state.texture.height(),
-                        clip,
-                        &project.settings,
-                        self.out_w,
-                        self.out_h,
-                    );
-                    plan.push(PlannedLayer {
-                        key,
-                        center: (cx, cy),
-                        size: (w, h),
-                        rotation_rad: rot,
-                        opacity: clip.opacity as f32,
-                        blend: gpu_blend(clip.blend_mode),
-                    });
-                }
-                Ok(false) => { /* stream with no frames: contributes nothing */ }
-                Err(e) => {
-                    // Broken decoder: drop it so the next frame reopens.
-                    self.sources.remove(&key);
-                    self.layer_problem(format!("decode failed: {e}"))?;
+                TrackVisual::Transition {
+                    from,
+                    to,
+                    kind,
+                    progress,
+                } => {
+                    let from_layer = self.sample_side(project, from, &needed, path_of, true)?;
+                    let to_layer = self.sample_side(project, to, &needed, path_of, true)?;
+                    let kind = self.transition_kind_index(kind);
+                    match (from_layer, to_layer) {
+                        (Some(from), Some(to)) => plan.push(PlannedVisual::Transition {
+                            from,
+                            to,
+                            kind,
+                            progress: *progress as f32,
+                        }),
+                        // One side missing (lenient mode): degrade to the
+                        // side that exists rather than dropping the track.
+                        (Some(single), None) | (None, Some(single)) => {
+                            plan.push(PlannedVisual::Layer(single));
+                        }
+                        (None, None) => {}
+                    }
                 }
             }
         }
 
-        // Phase 2 (immutable): build layer refs and composite.
-        let layers: Vec<Layer> = plan
+        // Phase 2 (immutable): build texture refs and composite.
+        let as_layer = |p: &PlannedLayer| Layer {
+            source: &self.sources[&p.key].texture,
+            center: p.center,
+            size: p.size,
+            rotation_rad: p.rotation_rad,
+            opacity: p.opacity,
+            blend: p.blend,
+        };
+        let visuals: Vec<Visual> = plan
             .iter()
-            .map(|p| Layer {
-                source: &self.sources[&p.key].texture,
-                center: p.center,
-                size: p.size,
-                rotation_rad: p.rotation_rad,
-                opacity: p.opacity,
-                blend: p.blend,
+            .map(|v| match v {
+                PlannedVisual::Layer(p) => Visual::Layer(as_layer(p)),
+                PlannedVisual::Transition {
+                    from,
+                    to,
+                    kind,
+                    progress,
+                } => Visual::Transition {
+                    from: as_layer(from),
+                    to: as_layer(to),
+                    kind: *kind,
+                    progress: *progress,
+                },
             })
             .collect();
-        self.compositor.composite(&mut self.target, &layers, slot);
+        self.compositor
+            .composite_visuals(&mut self.target, &visuals, slot);
         self.stats.frames += 1;
         Ok(())
     }
@@ -483,6 +671,7 @@ mod tests {
             blend_mode: cutty_engine::BlendMode::Normal,
             speed: 1.0,
             volume: 1.0,
+            transition_out: None,
         }
     }
 

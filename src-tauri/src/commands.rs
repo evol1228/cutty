@@ -112,6 +112,29 @@ pub async fn paths_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// One transition shader available to drop onto a cut (from the GPU
+/// registry, via cutty-media's re-export).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionDefWire {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub default_duration: f64,
+}
+
+/// The transition catalog for the left-panel Transitions tab.
+#[tauri::command]
+pub fn transition_list() -> Vec<TransitionDefWire> {
+    cutty_media::transitions()
+        .iter()
+        .map(|t| TransitionDefWire {
+            id: t.id,
+            label: t.label,
+            default_duration: t.default_duration,
+        })
+        .collect()
+}
+
 /// Payload for `player://position` events.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

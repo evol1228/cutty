@@ -248,6 +248,8 @@ mod tests {
             source_in: 0.0,
             speed: 1.0,
             volume,
+            fade_in: None,
+            fade_out: None,
         }
     }
 

@@ -4,15 +4,18 @@
 use serde::Serialize;
 
 use crate::command::{
-    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, DeleteClip, MoveClip, MoveClipToTrack,
-    MoveTrack, RemoveMedia, RemoveTrack, RippleDelete, RippleMove, SetClipBlendMode,
-    SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag, SplitClip, TrackFlag, TrimClip,
+    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, MoveClip,
+    MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RippleDelete, RippleMove,
+    SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag,
+    SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 use crate::error::EngineError;
 use crate::model::{
-    BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track, TrackId,
-    TrackKind, Transform, EPS, MIN_CLIP_DURATION,
+    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track,
+    TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
+    MIN_TRANSITION_DURATION,
 };
+use crate::resolve::transition_duration_limit;
 
 /// Which clip edge a trim operation drags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,54 @@ impl Engine {
         Ok(())
     }
 
+    /// Execute a structural command (anything that moves, resizes, or
+    /// removes clips), pruning every transition whose cut it destroys —
+    /// as **one** atomic, undoable unit. A transition whose two clips no
+    /// longer touch after the command dangles; leaving it stored would
+    /// silently rebind it to whatever clip lands on that edge next.
+    fn execute_structural(&mut self, primary: Box<dyn Command>) -> Result<(), EngineError> {
+        // Preview the primary command to find what it leaves dangling.
+        let mut preview = self.project.clone();
+        primary.apply(&mut preview)?;
+        let prunes = Self::dangling_transitions(&preview);
+        if prunes.is_empty() {
+            return self.execute(primary);
+        }
+        let name = primary.name();
+        let mut parts: Vec<Box<dyn Command>> = vec![primary];
+        for (track_id, clip_id, old) in prunes {
+            parts.push(Box::new(SetTransition {
+                track_id,
+                clip_id,
+                old: Some(old),
+                new: None,
+            }));
+        }
+        self.execute(Box::new(Compound { name, parts }))
+    }
+
+    /// Transitions with no cut left to bind to: the owning clip has no
+    /// touching next clip on its (video) track.
+    fn dangling_transitions(project: &Project) -> Vec<(TrackId, ClipId, Transition)> {
+        let mut dangling = Vec::new();
+        for track in &project.tracks {
+            for (i, clip) in track.clips.iter().enumerate() {
+                let Some(transition) = &clip.transition_out else {
+                    continue;
+                };
+                let bound = track.kind == TrackKind::Video
+                    && track
+                        .clips
+                        .get(i + 1)
+                        .is_some_and(|next| clips_touch(clip, next));
+                if !bound {
+                    dangling.push((track.id, clip.id, transition.clone()));
+                }
+            }
+        }
+        dangling
+    }
+
     // ------------------------------------------------------------------
     // Media pool
     // ------------------------------------------------------------------
@@ -209,7 +260,7 @@ impl Engine {
                     .map(|c| (t.id, c.clone()))
             })
             .collect();
-        self.execute(Box::new(RemoveMedia { media, removed }))
+        self.execute_structural(Box::new(RemoveMedia { media, removed }))
     }
 
     // ------------------------------------------------------------------
@@ -384,6 +435,7 @@ impl Engine {
             blend_mode: BlendMode::default(),
             speed,
             volume: 1.0,
+            transition_out: None,
         };
         self.execute(Box::new(AddClip { track_id, clip }))?;
         Ok(id)
@@ -405,7 +457,7 @@ impl Engine {
             });
         }
         let new_in = timeline_in.max(0.0);
-        self.execute(Box::new(MoveClip {
+        self.execute_structural(Box::new(MoveClip {
             track_id: track.id,
             clip_id,
             old_timeline_in: clip.timeline_in,
@@ -447,7 +499,7 @@ impl Engine {
             });
         }
         let new_in = timeline_in.max(0.0);
-        self.execute(Box::new(MoveClipToTrack {
+        self.execute_structural(Box::new(MoveClipToTrack {
             clip_id,
             old_track: source.id,
             new_track: track_id,
@@ -523,7 +575,7 @@ impl Engine {
             }
         };
 
-        self.execute(Box::new(TrimClip {
+        self.execute_structural(Box::new(TrimClip {
             track_id: track.id,
             clip_id,
             old,
@@ -556,6 +608,9 @@ impl Engine {
         let mut left = original.clone();
         left.timeline_out = at;
         left.source_out = source_at;
+        // The out cut (and any transition bound to it) belongs to the
+        // right half; the left half's new cut at the split point has none.
+        left.transition_out = None;
 
         let mut right = original.clone();
         right.id = ClipId(self.next_id());
@@ -678,6 +733,88 @@ impl Engine {
         }))
     }
 
+    /// Set, replace, or remove the transition at a clip's out cut.
+    ///
+    /// Requires a video-track clip with a touching next clip (the cut the
+    /// transition binds to). The requested duration is clamped to
+    /// [`MIN_TRANSITION_DURATION`]..[`MAX_TRANSITION_DURATION`] and to what
+    /// the cut currently supports ([`transition_duration_limit`]); the
+    /// stored (clamped) duration is returned. `None` removes.
+    pub fn set_transition(
+        &mut self,
+        clip_id: ClipId,
+        transition: Option<Transition>,
+    ) -> Result<Option<f64>, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+
+        let new = match transition {
+            None => None,
+            Some(t) => {
+                if track.kind != TrackKind::Video {
+                    return Err(EngineError::InvalidTransition {
+                        clip: clip_id,
+                        reason: "transitions only apply to video clips",
+                    });
+                }
+                if t.kind.is_empty() {
+                    return Err(EngineError::InvalidTransition {
+                        clip: clip_id,
+                        reason: "empty transition kind",
+                    });
+                }
+                if !t.duration.is_finite() || t.duration <= 0.0 {
+                    return Err(EngineError::InvalidProperty {
+                        clip: clip_id,
+                        property: "transition.duration",
+                        value: t.duration,
+                    });
+                }
+                let index = track
+                    .clips
+                    .iter()
+                    .position(|c| c.id == clip_id)
+                    .expect("clip found on track");
+                let next = track
+                    .clips
+                    .get(index + 1)
+                    .filter(|next| clips_touch(clip, next))
+                    .ok_or(EngineError::InvalidTransition {
+                        clip: clip_id,
+                        reason: "no adjacent clip after the cut",
+                    })?;
+                let limit =
+                    transition_duration_limit(&self.project, clip, next).min(MAX_TRANSITION_DURATION);
+                // Floor at the standard minimum unless the cut itself
+                // supports less (two very short clips).
+                let duration = t
+                    .duration
+                    .min(limit)
+                    .max(MIN_TRANSITION_DURATION.min(limit));
+                Some(Transition {
+                    kind: t.kind,
+                    duration,
+                })
+            }
+        };
+
+        let applied = new.as_ref().map(|t| t.duration);
+        let old = clip.transition_out.clone();
+        if old == new {
+            return Ok(applied);
+        }
+        self.execute(Box::new(SetTransition {
+            track_id: track.id,
+            clip_id,
+            old,
+            new,
+        }))?;
+        Ok(applied)
+    }
+
     /// Remove a clip from its track, leaving a gap.
     pub fn delete_clip(&mut self, clip_id: ClipId) -> Result<(), EngineError> {
         self.require_clip_unlocked(clip_id)?;
@@ -685,7 +822,7 @@ impl Engine {
             .project
             .find_clip(clip_id)
             .ok_or(EngineError::UnknownClip(clip_id))?;
-        self.execute(Box::new(DeleteClip {
+        self.execute_structural(Box::new(DeleteClip {
             track_id: track.id,
             clip: clip.clone(),
         }))
@@ -713,7 +850,7 @@ impl Engine {
                 new_timeline_out: c.timeline_out - duration,
             })
             .collect();
-        self.execute(Box::new(RippleDelete {
+        self.execute_structural(Box::new(RippleDelete {
             track_id: track.id,
             clip: clip.clone(),
             moves,

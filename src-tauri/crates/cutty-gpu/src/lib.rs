@@ -22,6 +22,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+mod transition;
+
+pub use transition::{transition_kind, transitions, TransitionDef, TRANSITIONS};
+
 /// Errors from GPU initialization and compositing.
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
@@ -85,6 +89,7 @@ impl SourceTexture {
 /// `size`, rotated by `rotation_rad` (clockwise, y-down) about its
 /// center, and its center put at `center`. The caller does all editor
 /// semantics (project-space fitting etc.) — this crate is pure geometry.
+#[derive(Clone, Copy)]
 pub struct Layer<'a> {
     pub source: &'a SourceTexture,
     /// Center of the placed rectangle, output pixels.
@@ -109,24 +114,108 @@ struct LayerUniform {
     _pad: [f32; 2],
 }
 
+/// Shader blend id of the "premultiplied over" path (transition results
+/// re-entering the layer stack). Deliberately outside [`BlendMode`] —
+/// callers never request it directly.
+const BLEND_PREMUL_OVER: u32 = 5;
+
 impl LayerUniform {
     /// Build the inverse placement (output pixel center → source UV) from
-    /// a layer's forward placement.
-    fn from_layer(layer: &Layer) -> Option<Self> {
-        let (cx, cy) = layer.center;
-        let (w, h) = layer.size;
+    /// a forward placement. `None` for degenerate sizes (contributes
+    /// nothing).
+    fn from_placement(
+        center: (f32, f32),
+        size: (f32, f32),
+        rotation_rad: f32,
+        opacity: f32,
+        blend: u32,
+    ) -> Option<Self> {
+        let (cx, cy) = center;
+        let (w, h) = size;
         if !(w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite()) {
             return None; // degenerate placement: contributes nothing
         }
-        let (sin, cos) = layer.rotation_rad.sin_cos();
+        let (sin, cos) = rotation_rad.sin_cos();
         Some(Self {
             inv_row0: [cos / w, sin / w, (-cos * cx - sin * cy) / w + 0.5, 0.0],
             inv_row1: [-sin / h, cos / h, (sin * cx - cos * cy) / h + 0.5, 0.0],
-            opacity: layer.opacity.clamp(0.0, 1.0),
-            blend: layer.blend.shader_id(),
+            opacity: opacity.clamp(0.0, 1.0),
+            blend,
             _pad: [0.0; 2],
         })
     }
+
+    fn from_layer(layer: &Layer) -> Option<Self> {
+        Self::from_placement(
+            layer.center,
+            layer.size,
+            layer.rotation_rad,
+            layer.opacity,
+            layer.blend.shader_id(),
+        )
+    }
+
+    /// A full-target premultiplied-over placement (how a transition
+    /// result composites back into the stack).
+    fn fullframe_premul(width: u32, height: u32) -> Self {
+        Self::from_placement(
+            (width as f32 / 2.0, height as f32 / 2.0),
+            (width as f32, height as f32),
+            0.0,
+            1.0,
+            BLEND_PREMUL_OVER,
+        )
+        .expect("target sizes are nonzero")
+    }
+}
+
+/// Per-transition-pass uniform data, `repr(C)` matching
+/// `TransitionUniform` in the assembled transition shader.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TransitionUniform {
+    progress: f32,
+    kind: u32,
+    ratio: f32,
+    _pad0: f32,
+    /// 1 / output size in pixels (inputs may be raw source textures of
+    /// any size on the direct fast path).
+    inv_size: [f32; 2],
+    _pad1: [f32; 2],
+}
+
+/// One element of a composite: a plain layer, or two layers blended by a
+/// transition shader. The transition renders each side into an offscreen
+/// intermediate (premultiplied, over transparency), runs the registered
+/// shader `kind` at `progress`, and composites the result back into the
+/// stack as one layer — so a transition behaves exactly like the single
+/// clip it replaces at progress 0 and 1.
+///
+/// Fast path: a side that covers the full target unrotated at opacity 1
+/// skips its intermediate pass — the transition samples its source
+/// texture directly. Decoded video frames are opaque, which is what
+/// makes the skip exact; a *translucent* source texture on such a side
+/// would be read as premultiplied.
+pub enum Visual<'a> {
+    Layer(Layer<'a>),
+    Transition {
+        from: Layer<'a>,
+        to: Layer<'a>,
+        /// Dispatch index from the transition registry ([`TRANSITIONS`]).
+        kind: u32,
+        /// 0.0 → pure `from`, 1.0 → pure `to`.
+        progress: f32,
+    },
+}
+
+/// Scratch resources for transition passes, created lazily on the first
+/// transition composited into a target: FROM / TO intermediates, the
+/// transition output, and the per-pass uniform buffer.
+struct Scratch {
+    _textures: [wgpu::Texture; 3],
+    views: [wgpu::TextureView; 3],
+    uniforms: wgpu::Buffer,
+    uniform_capacity: u32,
 }
 
 /// State of one readback slot.
@@ -149,6 +238,8 @@ pub struct Target {
     slots: [Slot; 2],
     uniforms: wgpu::Buffer,
     uniform_capacity: u32,
+    /// Transition intermediates; `None` until the first transition.
+    scratch: Option<Scratch>,
 }
 
 impl Target {
@@ -170,6 +261,7 @@ impl Target {
 pub const SLOTS: usize = 2;
 
 const UNIFORM_SIZE: u64 = std::mem::size_of::<LayerUniform>() as u64;
+const TRANSITION_UNIFORM_SIZE: u64 = std::mem::size_of::<TransitionUniform>() as u64;
 
 /// The wgpu device plus the one compositing pipeline. Each render
 /// frontend owns its own `Compositor` (they live on different threads);
@@ -178,9 +270,15 @@ pub struct Compositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// Layer → premultiplied intermediate (transition inputs).
+    premul_pipeline: wgpu::RenderPipeline,
+    /// (from, to, progress) → blended intermediate.
+    transition_pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
+    transition_bind_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform_stride: u32,
+    transition_uniform_stride: u32,
     adapter_info: wgpu::AdapterInfo,
 }
 
@@ -280,31 +378,104 @@ impl Compositor {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cutty-composite-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
+        let make_pipeline = |label: &str,
+                             layout: &wgpu::PipelineLayout,
+                             module: &wgpu::ShaderModule,
+                             fs_entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs_entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("cutty-composite-pipeline", &pipeline_layout, &shader, "fs_main");
+        let premul_pipeline = make_pipeline(
+            "cutty-layer-premul-pipeline",
+            &pipeline_layout,
+            &shader,
+            "fs_layer_premul",
+        );
+
+        // The transition pass: its shader module is assembled from the
+        // scaffold + every ported gl-transition + a generated dispatcher.
+        let transition_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cutty-transitions"),
+            source: wgpu::ShaderSource::Wgsl(transition::assemble_shader().into()),
         });
+        let transition_bind_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cutty-transition-bind"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: wgpu::BufferSize::new(TRANSITION_UNIFORM_SIZE),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let transition_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cutty-transition-pl"),
+                bind_group_layouts: &[Some(&transition_bind_layout)],
+                immediate_size: 0,
+            });
+        let transition_pipeline = make_pipeline(
+            "cutty-transition-pipeline",
+            &transition_pipeline_layout,
+            &transition_shader,
+            "fs_main",
+        );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cutty-composite-sampler"),
@@ -319,15 +490,20 @@ impl Compositor {
 
         let align = device.limits().min_uniform_buffer_offset_alignment;
         let uniform_stride = (UNIFORM_SIZE as u32).div_ceil(align) * align;
+        let transition_uniform_stride = (TRANSITION_UNIFORM_SIZE as u32).div_ceil(align) * align;
 
         Ok(Self {
             adapter_info: adapter.get_info(),
             device,
             queue,
             pipeline,
+            premul_pipeline,
+            transition_pipeline,
             bind_layout,
+            transition_bind_layout,
             sampler,
             uniform_stride,
+            transition_uniform_stride,
         })
     }
 
@@ -443,7 +619,55 @@ impl Compositor {
             slots: [make_slot(), make_slot()],
             uniforms,
             uniform_capacity,
+            scratch: None,
         }
+    }
+
+    /// Ensure `target` has its transition scratch set (three
+    /// target-sized intermediates + the transition uniform buffer).
+    fn ensure_scratch(&self, target: &mut Target) {
+        if target.scratch.is_some() {
+            return;
+        }
+        let make_tex = |label: &str| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: target.width,
+                    height: target.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let textures = [
+            make_tex("cutty-transition-from"),
+            make_tex("cutty-transition-to"),
+            make_tex("cutty-transition-out"),
+        ];
+        let views = [
+            textures[0].create_view(&wgpu::TextureViewDescriptor::default()),
+            textures[1].create_view(&wgpu::TextureViewDescriptor::default()),
+            textures[2].create_view(&wgpu::TextureViewDescriptor::default()),
+        ];
+        let uniform_capacity = 4u32;
+        let uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cutty-transition-uniforms"),
+            size: u64::from(uniform_capacity * self.transition_uniform_stride),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        target.scratch = Some(Scratch {
+            _textures: textures,
+            views,
+            uniforms,
+            uniform_capacity,
+        });
     }
 
     /// Composite `layers` (bottom → top) over black into `target` and
@@ -453,19 +677,130 @@ impl Compositor {
     /// Submissions are pipelined: a second `composite` on the *other*
     /// slot may be issued before the first slot is read.
     pub fn composite(&self, target: &mut Target, layers: &[Layer], slot: usize) {
+        let visuals: Vec<Visual> = layers.iter().map(|l| Visual::Layer(*l)).collect();
+        self.composite_visuals(target, &visuals, slot);
+    }
+
+    /// Composite `visuals` (bottom → top; layers and transition pairs)
+    /// over black into `target` — the general form of
+    /// [`Compositor::composite`], same slot/readback contract.
+    pub fn composite_visuals(&self, target: &mut Target, visuals: &[Visual], slot: usize) {
         assert!(slot < SLOTS, "slot out of range");
 
-        // Degenerate placements contribute nothing; drop them up front so
-        // pass count == uniform count.
-        let uniforms: Vec<LayerUniform> =
-            layers.iter().filter_map(LayerUniform::from_layer).collect();
-        let kept: Vec<&Layer> = layers
-            .iter()
-            .filter(|l| LayerUniform::from_layer(l).is_some())
-            .collect();
+        /// One encoded render pass, planned before encoding. `uniform`
+        /// indexes `layer_uniforms` (or `transition_uniforms` for
+        /// [`Step::Transition`]); `view` indexes `layer_views`.
+        enum Step {
+            /// Accumulate a source onto the ping-pong stack.
+            Accumulate { uniform: u32, source: SourceView },
+            /// Render a layer premultiplied into scratch 0/1 (`None`
+            /// draw = degenerate side: the scratch is just cleared).
+            Premul {
+                scratch: usize,
+                draw: Option<(u32, usize)>,
+            },
+            /// Blend two inputs into scratch 2.
+            Transition {
+                uniform: u32,
+                from: SourceView,
+                to: SourceView,
+            },
+        }
+        enum SourceView {
+            Layer(usize),   // index into `layer_views`
+            Scratch(usize), // index into scratch views
+        }
 
-        if uniforms.len() as u32 > target.uniform_capacity {
-            let capacity = (uniforms.len() as u32).next_power_of_two();
+        if visuals
+            .iter()
+            .any(|v| matches!(v, Visual::Transition { .. }))
+        {
+            self.ensure_scratch(target);
+        }
+
+        // Plan: uniforms + passes, in submission order.
+        let mut layer_uniforms: Vec<LayerUniform> = Vec::new();
+        let mut transition_uniforms: Vec<TransitionUniform> = Vec::new();
+        let mut layer_views: Vec<&wgpu::TextureView> = Vec::new();
+        let mut steps: Vec<Step> = Vec::new();
+        let ratio = target.width as f32 / target.height as f32;
+
+        for visual in visuals {
+            match visual {
+                Visual::Layer(layer) => {
+                    if let Some(u) = LayerUniform::from_layer(layer) {
+                        layer_uniforms.push(u);
+                        layer_views.push(&layer.source.view);
+                        steps.push(Step::Accumulate {
+                            uniform: (layer_uniforms.len() - 1) as u32,
+                            source: SourceView::Layer(layer_views.len() - 1),
+                        });
+                    }
+                }
+                Visual::Transition {
+                    from,
+                    to,
+                    kind,
+                    progress,
+                } => {
+                    // Full-frame opaque sides whose source is exactly
+                    // target-sized skip their intermediate: the pass
+                    // samples the source directly. Gated to 1:1 because
+                    // that's where the intermediate is a bit-exact
+                    // identity (interior AND border — the edge-AA
+                    // coverage ramp is 1 at every pixel center); scaled
+                    // sources keep the premul pass so the ramp matches
+                    // the plain-layer path. This is the hot preview case
+                    // (720p proxies on the 720p canvas). See the
+                    // `Visual` docs for the alpha caveat.
+                    let direct = |layer: &Layer| {
+                        layer.rotation_rad == 0.0
+                            && layer.opacity >= 1.0
+                            && layer.center == (target.width as f32 / 2.0, target.height as f32 / 2.0)
+                            && layer.size == (target.width as f32, target.height as f32)
+                            && layer.source.width() == target.width
+                            && layer.source.height() == target.height
+                    };
+                    let mut side_views = [SourceView::Scratch(0), SourceView::Scratch(1)];
+                    for (i, side) in [from, to].into_iter().enumerate() {
+                        if direct(side) {
+                            layer_views.push(&side.source.view);
+                            side_views[i] = SourceView::Layer(layer_views.len() - 1);
+                            continue;
+                        }
+                        let draw = LayerUniform::from_layer(side).map(|u| {
+                            layer_uniforms.push(u);
+                            layer_views.push(&side.source.view);
+                            ((layer_uniforms.len() - 1) as u32, layer_views.len() - 1)
+                        });
+                        steps.push(Step::Premul { scratch: i, draw });
+                    }
+                    transition_uniforms.push(TransitionUniform {
+                        progress: progress.clamp(0.0, 1.0),
+                        kind: *kind,
+                        ratio,
+                        _pad0: 0.0,
+                        inv_size: [1.0 / target.width as f32, 1.0 / target.height as f32],
+                        _pad1: [0.0; 2],
+                    });
+                    let [from_view, to_view] = side_views;
+                    steps.push(Step::Transition {
+                        uniform: (transition_uniforms.len() - 1) as u32,
+                        from: from_view,
+                        to: to_view,
+                    });
+                    layer_uniforms.push(LayerUniform::fullframe_premul(target.width, target.height));
+                    steps.push(Step::Accumulate {
+                        uniform: (layer_uniforms.len() - 1) as u32,
+                        source: SourceView::Scratch(2),
+                    });
+                }
+            }
+        }
+
+        // Upload uniforms (growing the buffers as needed).
+        if layer_uniforms.len() as u32 > target.uniform_capacity {
+            let capacity = (layer_uniforms.len() as u32).next_power_of_two();
             target.uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cutty-layer-uniforms"),
                 size: u64::from(capacity * self.uniform_stride),
@@ -474,12 +809,32 @@ impl Compositor {
             });
             target.uniform_capacity = capacity;
         }
-        for (i, u) in uniforms.iter().enumerate() {
+        for (i, u) in layer_uniforms.iter().enumerate() {
             self.queue.write_buffer(
                 &target.uniforms,
                 u64::from(i as u32 * self.uniform_stride),
                 bytemuck::bytes_of(u),
             );
+        }
+        if !transition_uniforms.is_empty() {
+            let scratch = target.scratch.as_mut().expect("scratch ensured above");
+            if transition_uniforms.len() as u32 > scratch.uniform_capacity {
+                let capacity = (transition_uniforms.len() as u32).next_power_of_two();
+                scratch.uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("cutty-transition-uniforms"),
+                    size: u64::from(capacity * self.transition_uniform_stride),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                scratch.uniform_capacity = capacity;
+            }
+            for (i, u) in transition_uniforms.iter().enumerate() {
+                self.queue.write_buffer(
+                    &scratch.uniforms,
+                    u64::from(i as u32 * self.transition_uniform_stride),
+                    bytemuck::bytes_of(u),
+                );
+            }
         }
 
         let mut encoder = self
@@ -488,32 +843,31 @@ impl Compositor {
                 label: Some("cutty-composite"),
             });
 
-        // Clear the first accumulator to opaque black (the canvas).
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("cutty-clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.views[0],
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-
-        // One full-target pass per layer, ping-ponging accumulators.
-        for (i, layer) in kept.iter().enumerate() {
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        fn begin_pass<'e>(
+            encoder: &'e mut wgpu::CommandEncoder,
+            label: &str,
+            view: &wgpu::TextureView,
+            clear: wgpu::Color,
+        ) -> wgpu::RenderPass<'e> {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+        }
+        let layer_bind = |accum: &wgpu::TextureView, source: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("cutty-composite-bind"),
                 layout: &self.bind_layout,
                 entries: &[
@@ -527,41 +881,130 @@ impl Compositor {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&target.views[i % 2]),
+                        resource: wgpu::BindingResource::TextureView(accum),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&layer.source.view),
+                        resource: wgpu::BindingResource::TextureView(source),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cutty-layer"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.views[(i + 1) % 2],
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind, &[i as u32 * self.uniform_stride]);
-            pass.draw(0..3, 0..1);
+            })
+        };
+
+        // Clear the first accumulator to opaque black (the canvas).
+        begin_pass(
+            &mut encoder,
+            "cutty-clear",
+            &target.views[0],
+            wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        );
+
+        let transparent = wgpu::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        let mut accumulated = 0usize;
+        for step in &steps {
+            match step {
+                Step::Accumulate { uniform, source } => {
+                    let source_view = match source {
+                        SourceView::Layer(i) => layer_views[*i],
+                        SourceView::Scratch(i) => {
+                            &target.scratch.as_ref().expect("scratch ensured").views[*i]
+                        }
+                    };
+                    let bind = layer_bind(&target.views[accumulated % 2], source_view);
+                    let mut pass = begin_pass(
+                        &mut encoder,
+                        "cutty-layer",
+                        &target.views[(accumulated + 1) % 2],
+                        wgpu::Color::BLACK,
+                    );
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &bind, &[uniform * self.uniform_stride]);
+                    pass.draw(0..3, 0..1);
+                    accumulated += 1;
+                }
+                Step::Premul { scratch, draw } => {
+                    let scratch_set = target.scratch.as_ref().expect("scratch ensured");
+                    // The accumulator binding is unused by the premul
+                    // entry point; any view satisfies the layout.
+                    let bind = draw.map(|(uniform, view)| {
+                        (
+                            layer_bind(&target.views[accumulated % 2], layer_views[view]),
+                            uniform,
+                        )
+                    });
+                    let mut pass = begin_pass(
+                        &mut encoder,
+                        "cutty-transition-premul",
+                        &scratch_set.views[*scratch],
+                        transparent,
+                    );
+                    if let Some((bind, uniform)) = &bind {
+                        pass.set_pipeline(&self.premul_pipeline);
+                        pass.set_bind_group(0, bind, &[uniform * self.uniform_stride]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+                Step::Transition { uniform, from, to } => {
+                    let scratch_set = target.scratch.as_ref().expect("scratch ensured");
+                    let resolve = |source: &SourceView| match source {
+                        SourceView::Layer(i) => layer_views[*i],
+                        SourceView::Scratch(i) => &scratch_set.views[*i],
+                    };
+                    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("cutty-transition-bind"),
+                        layout: &self.transition_bind_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &scratch_set.uniforms,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(TRANSITION_UNIFORM_SIZE),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(resolve(from)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(resolve(to)),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                    let mut pass = begin_pass(
+                        &mut encoder,
+                        "cutty-transition",
+                        &scratch_set.views[2],
+                        transparent,
+                    );
+                    pass.set_pipeline(&self.transition_pipeline);
+                    pass.set_bind_group(0, &bind, &[uniform * self.transition_uniform_stride]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
         }
 
         // Copy the final accumulator into the slot's staging buffer.
-        let final_view = kept.len() % 2;
+        let final_view = accumulated % 2;
         let slot_state = &mut target.slots[slot];
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -921,6 +1364,296 @@ mod tests {
         .unwrap();
     }
 
+    /// A fade transition at progress 0 / 1 must reproduce the plain
+    /// single-layer composite bit-exactly (opaque full-frame case) — the
+    /// guarantee that entering/leaving a transition span never pops.
+    #[test]
+    fn fade_endpoints_match_plain_layers() {
+        let Some(comp) = compositor() else { return };
+        let (w, h) = (16u32, 8u32);
+        let red = solid(&comp, w, h, [255, 0, 0, 255]);
+        let blue = solid(&comp, w, h, [0, 0, 255, 255]);
+        let fade = transition_kind("fade").unwrap();
+
+        let mut expect_red = comp.create_target(w, h);
+        comp.composite(&mut expect_red, &[full_frame_layer(&red, w, h)], 0);
+        let mut expect_blue = comp.create_target(w, h);
+        comp.composite(&mut expect_blue, &[full_frame_layer(&blue, w, h)], 0);
+
+        for (progress, expected) in [(0.0f32, &mut expect_red), (1.0, &mut expect_blue)] {
+            let mut target = comp.create_target(w, h);
+            comp.composite_visuals(
+                &mut target,
+                &[Visual::Transition {
+                    from: full_frame_layer(&red, w, h),
+                    to: full_frame_layer(&blue, w, h),
+                    kind: fade,
+                    progress,
+                }],
+                0,
+            );
+            let got = comp
+                .read_slot(&mut target, 0, |d, s| {
+                    (0..h as usize)
+                        .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                        .map(|(x, y)| px(d, s, x, y))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap();
+            let want = comp
+                .read_slot(expected, 0, |d, s| {
+                    (0..h as usize)
+                        .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                        .map(|(x, y)| px(d, s, x, y))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap();
+            assert_eq!(got, want, "progress {progress}");
+        }
+    }
+
+    /// Mid-fade mixes the two sources; a directional wipe shows each
+    /// source on its own side of the edge.
+    #[test]
+    fn fade_mixes_and_wipe_splits() {
+        let Some(comp) = compositor() else { return };
+        let (w, h) = (16u32, 8u32);
+        let red = solid(&comp, w, h, [255, 0, 0, 255]);
+        let blue = solid(&comp, w, h, [0, 0, 255, 255]);
+
+        let mut target = comp.create_target(w, h);
+        comp.composite_visuals(
+            &mut target,
+            &[Visual::Transition {
+                from: full_frame_layer(&red, w, h),
+                to: full_frame_layer(&blue, w, h),
+                kind: transition_kind("fade").unwrap(),
+                progress: 0.25,
+            }],
+            0,
+        );
+        comp.read_slot(&mut target, 0, |d, s| {
+            let got = px(d, s, 8, 4);
+            assert!((i16::from(got[0]) - 191).abs() <= 1, "R {got:?}");
+            assert!((i16::from(got[2]) - 64).abs() <= 1, "B {got:?}");
+        })
+        .unwrap();
+
+        // wiperight at 0.5: incoming (blue) on the left half, outgoing
+        // (red) on the right half.
+        comp.composite_visuals(
+            &mut target,
+            &[Visual::Transition {
+                from: full_frame_layer(&red, w, h),
+                to: full_frame_layer(&blue, w, h),
+                kind: transition_kind("wiperight").unwrap(),
+                progress: 0.5,
+            }],
+            0,
+        );
+        comp.read_slot(&mut target, 0, |d, s| {
+            assert_eq!(px(d, s, 2, 4), [0, 0, 255, 255], "left = incoming");
+            assert_eq!(px(d, s, 13, 4), [255, 0, 0, 255], "right = outgoing");
+        })
+        .unwrap();
+    }
+
+    /// A transformed, translucent layer entering a transition (progress
+    /// 0) matches its direct composite within one 8-bit quantization step
+    /// — the premultiplied intermediate round-trip must not shift colors.
+    #[test]
+    fn transition_entry_matches_direct_composite_for_transformed_layers() {
+        let Some(comp) = compositor() else { return };
+        let (w, h) = (24u32, 16u32);
+        let backdrop = solid(&comp, w, h, [40, 120, 40, 255]);
+        let overlay = solid(&comp, 8, 8, [220, 60, 200, 255]);
+        let dummy_to = solid(&comp, 8, 8, [0, 0, 0, 255]);
+        let placed = Layer {
+            source: &overlay,
+            center: (10.0, 7.0),
+            size: (11.0, 7.0),
+            rotation_rad: 0.4,
+            opacity: 0.6,
+            blend: BlendMode::Normal,
+        };
+
+        let mut direct = comp.create_target(w, h);
+        comp.composite(
+            &mut direct,
+            &[full_frame_layer(&backdrop, w, h), placed],
+            0,
+        );
+        let want = comp
+            .read_slot(&mut direct, 0, |d, s| {
+                (0..h as usize)
+                    .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| px(d, s, x, y))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        let mut via_transition = comp.create_target(w, h);
+        comp.composite_visuals(
+            &mut via_transition,
+            &[
+                Visual::Layer(full_frame_layer(&backdrop, w, h)),
+                Visual::Transition {
+                    from: placed,
+                    to: Layer {
+                        source: &dummy_to,
+                        center: (10.0, 7.0),
+                        size: (11.0, 7.0),
+                        rotation_rad: 0.4,
+                        opacity: 0.6,
+                        blend: BlendMode::Normal,
+                    },
+                    kind: transition_kind("fade").unwrap(),
+                    progress: 0.0,
+                },
+            ],
+            0,
+        );
+        let got = comp
+            .read_slot(&mut via_transition, 0, |d, s| {
+                (0..h as usize)
+                    .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| px(d, s, x, y))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        for (i, (g, w_)) in got.iter().zip(want.iter()).enumerate() {
+            for c in 0..4 {
+                assert!(
+                    (i16::from(g[c]) - i16::from(w_[c])).abs() <= 1,
+                    "pixel {i} channel {c}: {g:?} vs {w_:?}"
+                );
+            }
+        }
+    }
+
+    /// Two transitions in one submission use their own uniforms (dynamic
+    /// offsets), and a half-frame transition composites over the stack
+    /// below it.
+    #[test]
+    fn multiple_transitions_per_frame_are_independent() {
+        let Some(comp) = compositor() else { return };
+        let (w, h) = (16u32, 8u32);
+        let red = solid(&comp, w, h, [255, 0, 0, 255]);
+        let blue = solid(&comp, w, h, [0, 0, 255, 255]);
+        let green = solid(&comp, 8, 8, [0, 255, 0, 255]);
+        let white = solid(&comp, 8, 8, [255, 255, 255, 255]);
+        let fade = transition_kind("fade").unwrap();
+
+        // Base: red→blue fade at 1.0 (pure blue). Overlay on the right
+        // half: green→white fade at 0.0 (pure green).
+        let overlay = |source| Layer {
+            source,
+            center: (12.0, 4.0),
+            size: (8.0, 8.0),
+            rotation_rad: 0.0,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        };
+        let mut target = comp.create_target(w, h);
+        comp.composite_visuals(
+            &mut target,
+            &[
+                Visual::Transition {
+                    from: full_frame_layer(&red, w, h),
+                    to: full_frame_layer(&blue, w, h),
+                    kind: fade,
+                    progress: 1.0,
+                },
+                Visual::Transition {
+                    from: overlay(&green),
+                    to: overlay(&white),
+                    kind: fade,
+                    progress: 0.0,
+                },
+            ],
+            0,
+        );
+        comp.read_slot(&mut target, 0, |d, s| {
+            assert_eq!(px(d, s, 3, 4), [0, 0, 255, 255], "base fade at 1.0");
+            assert_eq!(px(d, s, 12, 4), [0, 255, 0, 255], "overlay fade at 0.0");
+        })
+        .unwrap();
+    }
+
+    /// Upscaled (source smaller than target) full-frame sides through the
+    /// direct transition path must match the plain-layer composite.
+    #[test]
+    fn direct_transition_upscale_matches_plain_layer() {
+        let Some(comp) = compositor() else { return };
+        let (sw, sh) = (8u32, 4u32);
+        let (w, h) = (16u32, 8u32);
+        // Sharp per-texel pattern so half-texel shifts scream.
+        let tex = comp.create_source(sw, sh);
+        let mut data = vec![0u8; (sw * sh * 4) as usize];
+        for y in 0..sh {
+            for x in 0..sw {
+                let i = ((y * sw + x) * 4) as usize;
+                data[i] = if (x + y) % 2 == 0 { 255 } else { 0 };
+                data[i + 1] = (y * 60) as u8;
+                data[i + 2] = (x * 30) as u8;
+                data[i + 3] = 255;
+            }
+        }
+        comp.upload_rgba(&tex, &data, (sw * 4) as usize);
+        let layer = || Layer {
+            source: &tex,
+            center: (w as f32 / 2.0, h as f32 / 2.0),
+            size: (w as f32, h as f32),
+            rotation_rad: 0.0,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        };
+        let mut plain = comp.create_target(w, h);
+        comp.composite(&mut plain, &[layer()], 0);
+        let want = comp
+            .read_slot(&mut plain, 0, |d, s| {
+                (0..h as usize)
+                    .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| px(d, s, x, y))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let mut via = comp.create_target(w, h);
+        comp.composite_visuals(
+            &mut via,
+            &[Visual::Transition {
+                from: layer(),
+                to: layer(),
+                kind: 0,
+                progress: 0.0,
+            }],
+            0,
+        );
+        let got = comp
+            .read_slot(&mut via, 0, |d, s| {
+                (0..h as usize)
+                    .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| px(d, s, x, y))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let mut mismatches = 0;
+        for (i, (g, w_)) in got.iter().zip(want.iter()).enumerate() {
+            if g != w_ && mismatches < 12 {
+                eprintln!(
+                    "px {:2},{:2}: got {:?} want {:?}",
+                    i % w as usize,
+                    i / w as usize,
+                    g,
+                    w_
+                );
+                mismatches += 1;
+            }
+        }
+        assert_eq!(got, want);
+    }
+
     /// Layer stacking order: later layers paint over earlier ones.
     #[test]
     fn later_layers_paint_on_top() {
@@ -936,3 +1669,4 @@ mod tests {
         .unwrap();
     }
 }
+

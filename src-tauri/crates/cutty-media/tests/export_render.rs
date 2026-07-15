@@ -445,6 +445,7 @@ fn export_composited_timeline_end_to_end() {
                 blend_mode: cutty_engine::BlendMode::Normal,
                 speed: 1.0,
                 volume: 1.0,
+                transition_out: None,
             }],
         },
     );
