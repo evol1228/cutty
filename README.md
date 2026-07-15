@@ -85,7 +85,7 @@ cargo clippy --workspace -- -D warnings && cd .. && npm run lint
 
 ## License
 
-[Cutty Source-Available License](LICENSE) — free for personal use, and content creators are welcome to make (even monetized) videos with or about Cutty as long as they credit this repo and never present it as their own tool. Forks and mods must stay source-available under the same license and credit [@evol1228](https://github.com/evol1228) and this repository. Any commercial use requires a paid license — contact [@evol1228](https://github.com/evol1228) first.
+[Cutty Source-Available License](LICENSE) — creators can use Cutty freely, including for monetized content, with no license or credit needed just for using it. The moment your content shows or mentions Cutty, proper credit is required: the tool's name, [@evol1228](https://github.com/evol1228), and a link to this repo. Forks must stay source-available under this license with the same credit. Reusing parts of the code in open-source projects is fine with credit; closed-source reuse and any commercial use require contacting [@evol1228](https://github.com/evol1228) first (commercial use = paid license, and credit rules still apply when Cutty is shown or mentioned).
 
 ---
 

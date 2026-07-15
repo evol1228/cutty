@@ -1,5 +1,5 @@
                     CUTTY SOURCE-AVAILABLE LICENSE
-                         Version 1.0, July 2026
+                         Version 1.1, July 2026
 
 Copyright (c) 2026 love (@evol1228)
 Official repository: https://github.com/evol1228/cutty
@@ -57,18 +57,22 @@ to the terms below.
 
 5. CONTENT CREATION — NO GATEKEEPING
 
-   Creating content featuring or made with the Software (videos,
-   streams, tutorials, reviews, social media posts) is permitted and
-   encouraged, including monetized content, on the conditions that you:
+   a. Anyone may use the Software to create and publish content
+      (videos, streams, social media posts, and similar), including
+      monetized content, free of charge — no paid license and no
+      credit required — as long as the content does not show, mention,
+      or otherwise feature the Software.
 
-   a. never advertise or present the Software as your own tool; and
+   b. The moment content shows, mentions, or otherwise features the
+      Software — on screen, by name, in audio, in a description, or in
+      any other way — it must give proper credit: name the tool
+      (Cutty), credit the Author (@evol1228), and include a link to
+      the Official Repository in the content's description or another
+      place that is just as easy to find. Such content must never
+      present the Software as your own tool.
 
-   b. include a link to the Official Repository in the content's
-      description, or otherwise make it easy for your audience to find
-      the Official Repository.
-
-   Works you export or produce with the Software belong entirely to
-   you; this license claims no rights over them.
+   c. Works you export or produce with the Software belong entirely to
+      you; this license claims no rights over them.
 
 6. COMMERCIAL USE
 
@@ -76,20 +80,40 @@ to the terms below.
    the Author. Contact the Author directly (GitHub: @evol1228) to
    arrange terms before any Commercial Use.
 
-7. TERMINATION
+   A commercial license never waives the credit duty: whenever a
+   commercial user shows, mentions, or otherwise features the
+   Software, Section 5(b) applies in full — proper credit to both the
+   Author and the tool.
+
+7. CODE REUSE IN OTHER PROJECTS
+
+   a. You may incorporate portions of the Software's source code into
+      a project whose own source code is open source, provided that
+      project gives proper credit to the Author (@evol1228) and links
+      to the Official Repository in its source code, README, or
+      credits.
+
+   b. Incorporating any portion of the Software's source code into a
+      closed-source project requires prior permission from the Author
+      — contact @evol1228 first.
+
+   c. Complete forks and Modified Versions of the Software itself
+      remain governed by Section 4.
+
+8. TERMINATION
 
    Your rights under this license end automatically if you break its
    terms. They are restored if the Author says so, or if you fully cure
    the violation within 30 days of becoming aware of it.
 
-8. THIRD-PARTY COMPONENTS
+9. THIRD-PARTY COMPONENTS
 
    This license covers only the Software's own code. Third-party
    components and system libraries the Software depends on (such as
    FFmpeg) remain under their own licenses, and nothing in this license
    overrides their terms.
 
-9. NO WARRANTY
+10. NO WARRANTY
 
    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
    EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
