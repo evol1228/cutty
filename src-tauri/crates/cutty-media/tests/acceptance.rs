@@ -17,11 +17,8 @@ use cutty_engine::{Engine, ProjectSettings, TrackKind};
 use cutty_media::{generate_proxy, probe, PlayerEvent, TimelinePlayer};
 
 fn source_paths() -> [PathBuf; 3] {
-    let get = |var: &str, default: &str| {
-        std::env::var(var)
-            .unwrap_or_else(|_| default.into())
-            .into()
-    };
+    let get =
+        |var: &str, default: &str| std::env::var(var).unwrap_or_else(|_| default.into()).into();
     [
         get("CUTTY_4K_CLIP", "/home/love/Videos/cutty-test-4k30.mp4"),
         get(
@@ -208,9 +205,7 @@ fn timeline_playback_acceptance() {
         // answers *this* seek.
         let frame = loop {
             match rx.recv_timeout(deadline - Instant::now()) {
-                Ok(Evt::Frame(f))
-                    if f.pts <= target + 1e-6 && target - f.pts < 2.0 * frame_dur =>
-                {
+                Ok(Evt::Frame(f)) if f.pts <= target + 1e-6 && target - f.pts < 2.0 * frame_dur => {
                     break f;
                 }
                 Ok(_) => continue,

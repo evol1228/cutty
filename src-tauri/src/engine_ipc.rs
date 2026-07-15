@@ -2,7 +2,7 @@
 //! commands translate ids/enums, forward to the engine, map errors to
 //! strings, and emit a full-state snapshot event after every mutation.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cutty_engine::{
     ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove, TrackId, TrimEdge,
@@ -16,12 +16,15 @@ pub const ENGINE_STATE_EVENT: &str = "engine://project";
 
 /// Managed state: the single engine instance behind a mutex. Engine
 /// operations are microseconds on Phase 1 projects, so commands run
-/// synchronously on the IPC thread.
-pub struct EngineHandle(pub Mutex<Engine>);
+/// synchronously on the IPC thread. `Arc` so the autosave worker can hold
+/// a reference too.
+pub struct EngineHandle(pub Arc<Mutex<Engine>>);
 
 impl Default for EngineHandle {
     fn default() -> Self {
-        Self(Mutex::new(Engine::new(ProjectSettings::default())))
+        Self(Arc::new(Mutex::new(
+            Engine::new(ProjectSettings::default()),
+        )))
     }
 }
 
@@ -64,11 +67,15 @@ fn snapshot(engine: &mut Engine) -> EngineSnapshot {
     }
 }
 
-fn emit_state(app: &AppHandle, engine: &mut Engine) {
+/// Emit the full snapshot and fan the change out to every mirror: the
+/// playback engine and the persistence layer (dirty meta + autosave).
+/// Also used by project load/new/restore after swapping the engine.
+pub(crate) fn emit_state(app: &AppHandle, engine: &mut Engine) {
     let _ = app.emit(ENGINE_STATE_EVENT, snapshot(engine));
     // The playback engine mirrors every project change (its scrub/pump
     // paths resolve against the newest snapshot).
     crate::commands::sync_playback(app, engine.project().clone());
+    crate::project_ipc::notify_mutation(app, engine.project());
 }
 
 /// Run a mutating engine operation; on success emit the new state.

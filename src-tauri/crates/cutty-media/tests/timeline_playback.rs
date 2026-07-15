@@ -89,7 +89,9 @@ fn build_fixture() -> Fixture {
     }
 
     let mut engine = Engine::new(ProjectSettings::default());
-    let r = engine.add_media(red.display().to_string(), 10.0, true, true).unwrap();
+    let r = engine
+        .add_media(red.display().to_string(), 10.0, true, true)
+        .unwrap();
     let g = engine
         .add_media(green.display().to_string(), 10.0, true, true)
         .unwrap();
@@ -394,13 +396,13 @@ fn paused_scrubbing_shows_the_correct_frame_within_budget() {
     // Positions chosen to hop across all three sources, the gap, and a
     // never-visited region; all cold (fresh player, no playback yet).
     let targets = [
-        4.05,             // red (split region)
-        1.2,              // green
-        2.55,             // blue (jump-cut segment)
+        4.05,                // red (split region)
+        1.2,                 // green
+        2.55,                // blue (jump-cut segment)
         fixture.gap.0 + 0.3, // gap → black
-        6.5,              // red near source start
-        8.3,              // red last clip
-        0.4,              // red first clip
+        6.5,                 // red near source start
+        8.3,                 // red last clip
+        0.4,                 // red first clip
     ];
     let mut latencies = Vec::new();
     for &t in &targets {
@@ -467,7 +469,10 @@ fn frame_stepping_crosses_cut_boundaries() {
     // Step across the cut: green, at the incoming clip's first frame.
     player.step(1);
     let f = recv_frame(&rx, Duration::from_secs(2)).expect("step 2");
-    assert_eq!(f.color, "green", "stepping across the cut shows the next clip");
+    assert_eq!(
+        f.color, "green",
+        "stepping across the cut shows the next clip"
+    );
     assert!(
         (f.pts - cut).abs() < FRAME,
         "expected the incoming clip's first frame, got pts {:.3} (cut {cut:.3})",

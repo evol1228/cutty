@@ -234,7 +234,11 @@ impl AudioSource for SymphoniaSource {
             },
         )?;
         self.decoder.reset();
-        let req = ts_to_frames(seeked.required_ts, self.info.time_base, self.info.sample_rate);
+        let req = ts_to_frames(
+            seeked.required_ts,
+            self.info.time_base,
+            self.info.sample_rate,
+        );
         let act = ts_to_frames(seeked.actual_ts, self.info.time_base, self.info.sample_rate);
         self.discard_frames = req.saturating_sub(act);
         self.pending.clear();
@@ -312,7 +316,11 @@ mod tests {
         let mut buf = vec![0f32; 8];
         let n = src.read(&mut buf).unwrap();
         assert!(n > 0);
-        assert!(buf[0].abs() < 1e-4, "first sample must be ramp 0, got {}", buf[0]);
+        assert!(
+            buf[0].abs() < 1e-4,
+            "first sample must be ramp 0, got {}",
+            buf[0]
+        );
 
         // Seek to exactly 1.0s = sample 48000; 48000 % 1000 = 0 → ramp 0,
         // next sample 1/1000.

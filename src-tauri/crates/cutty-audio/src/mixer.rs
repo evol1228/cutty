@@ -280,15 +280,15 @@ fn render_block(
             if !(placed.start_frame <= s0 && s0 < placed.end_frame) {
                 continue;
             }
-            let entry = readers.entry(idx).or_insert_with(|| {
-                match open(&placed.seg) {
+            let entry = readers
+                .entry(idx)
+                .or_insert_with(|| match open(&placed.seg) {
                     Ok(source) => Some(ClipReader::new(source)),
                     Err(e) => {
                         on_error(&placed.seg, e.to_string());
                         None
                     }
-                }
-            });
+                });
             if let Some(reader) = entry {
                 if let Err(e) = reader.mix_into(&placed.seg, s0, out_rate, slice) {
                     on_error(&placed.seg, e.to_string());
@@ -857,12 +857,28 @@ mod tests {
             Ok(Box::new(IndexSource::mono(RATE, i64::MAX / 2)))
         };
         let mut out = vec![0f32; 8 * 2];
-        render_block(&placed, &mut readers, &mut open, &mut |_, _| {}, 0, RATE, &mut out);
+        render_block(
+            &placed,
+            &mut readers,
+            &mut open,
+            &mut |_, _| {},
+            0,
+            RATE,
+            &mut out,
+        );
         assert_eq!(out[0], 0.0);
         assert!((out[2] - v as f32).abs() < 1e-9);
 
         let jump = 36_000i64;
-        render_block(&placed, &mut readers, &mut open, &mut |_, _| {}, jump, RATE, &mut out);
+        render_block(
+            &placed,
+            &mut readers,
+            &mut open,
+            &mut |_, _| {},
+            jump,
+            RATE,
+            &mut out,
+        );
         for k in 0..8usize {
             let expected = v as f32 * (jump + k as i64) as f32;
             assert!(
@@ -886,10 +902,10 @@ mod tests {
         let placed = place(
             MixerTimeline {
                 segments: vec![
-                    seg(1.0, 1.0, 0.0, 1.0),          // zero-length
-                    seg(f64::NAN, 2.0, 0.0, 1.0),     // non-finite
-                    seg(3.0, 2.0, 0.0, 1.0),          // inverted
-                    seg(0.0, 1.0, 0.0, 1.0),          // valid
+                    seg(1.0, 1.0, 0.0, 1.0),      // zero-length
+                    seg(f64::NAN, 2.0, 0.0, 1.0), // non-finite
+                    seg(3.0, 2.0, 0.0, 1.0),      // inverted
+                    seg(0.0, 1.0, 0.0, 1.0),      // valid
                 ],
             },
             RATE,

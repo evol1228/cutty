@@ -99,6 +99,10 @@ interface MediaState {
   /** Drop an item's local state (blob URL etc.). Engine removal is the
    * caller's job — this runs when the snapshot no longer has the media. */
   forgetItem: (path: string) => void;
+  /** Drop items whose import is still in flight (no engine id yet) —
+   * called right before the engine swaps projects so a late probe can't
+   * register media into the wrong project. */
+  dropPendingImports: () => void;
   /** Reconcile pool items against an engine snapshot. */
   syncFromProject: (project: Project) => void;
   /** Re-check every item's source file on disk. */
@@ -177,6 +181,9 @@ export const useMediaStore = create<MediaState>((set, get) => {
       if (!info.video && !info.audio) {
         throw new Error("no decodable video or audio streams");
       }
+      // The item may have been dropped mid-probe (project switched) —
+      // don't register media into a project it wasn't imported for.
+      if (!get().items.some((i) => i.path === path)) return;
       const mediaId = await engineAddMedia(
         path,
         info.durationSec,
@@ -263,6 +270,12 @@ export const useMediaStore = create<MediaState>((set, get) => {
       }));
     },
 
+    dropPendingImports: () => {
+      for (const item of get().items) {
+        if (item.mediaId === null) get().forgetItem(item.path);
+      }
+    },
+
     syncFromProject: (project) => {
       // Real files only — the Seed-50 dev tool registers dummy:// media
       // that has no file behind it and doesn't belong in the pool.
@@ -282,9 +295,11 @@ export const useMediaStore = create<MediaState>((set, get) => {
         }
       }
 
-      // Engine media without a pool item (undo of RemoveMedia, and later
-      // project load): recreate the item and rebuild its derived state —
-      // proxy/thumbnail hit their caches, so this is near-instant.
+      // Engine media without a pool item (undo of RemoveMedia, project
+      // load, crash recovery): recreate the item and rebuild its derived
+      // state — proxy/thumbnail hit their caches, so this is near-instant.
+      // Missing files are flagged red without derived jobs (and without
+      // per-file error toasts: the project must open quietly).
       for (const m of engineMedia) {
         const existing = get().items.find((i) => i.path === m.path);
         if (existing) {
@@ -311,9 +326,25 @@ export const useMediaStore = create<MediaState>((set, get) => {
             },
           ],
         }));
-        void runDerivedJobs(m.path, m.duration, m.hasVideo).then(() =>
-          get().checkMissing(),
-        );
+        void (async () => {
+          const [exists] = await pathsExist([m.path]);
+          if (!get().items.some((i) => i.path === m.path)) return;
+          if (!exists) {
+            patchItem(set, m.path, {
+              missing: true,
+              status: "error",
+              error: "File not found",
+            });
+            set((s) => {
+              const ids = new Set(s.missingMediaIds);
+              ids.add(m.id);
+              return { missingMediaIds: ids };
+            });
+            return;
+          }
+          await runDerivedJobs(m.path, m.duration, m.hasVideo);
+          void get().checkMissing();
+        })();
       }
     },
 
@@ -328,15 +359,25 @@ export const useMediaStore = create<MediaState>((set, get) => {
       const paths = items.map((i) => i.path);
       const exists = await pathsExist(paths);
       const missingIds = new Set<number>();
+      const revived: PoolItem[] = [];
       const current = get().items;
       const updated = current.map((item) => {
         const idx = paths.indexOf(item.path);
         if (idx < 0) return item;
         const missing = !exists[idx];
         if (missing && item.mediaId !== null) missingIds.add(item.mediaId);
+        if (!missing && item.missing && item.status === "error") {
+          revived.push(item);
+        }
         return missing === item.missing ? item : { ...item, missing };
       });
       set({ items: updated, missingMediaIds: missingIds });
+      // Files that came back (drive remounted, file restored): rebuild
+      // their derived state so they become usable again.
+      for (const item of revived) {
+        patchItem(set, item.path, { status: "processing", error: null });
+        void runDerivedJobs(item.path, item.durationSec ?? 0, item.hasVideo);
+      }
     },
   };
 });

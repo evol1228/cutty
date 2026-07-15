@@ -179,5 +179,4 @@ mod tests {
         c.record_callback(500_000_000, 0); // huge latency, nothing consumed
         assert_eq!(c.position_secs(), 0.0);
     }
-
 }

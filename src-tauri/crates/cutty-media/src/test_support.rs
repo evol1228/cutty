@@ -31,4 +31,3 @@ pub fn generate_test_clip(name: &str, width: u32, height: u32, fps: u32, secs: u
     assert!(status.success(), "test clip generation failed");
     file
 }
-

@@ -191,7 +191,11 @@ fn next_boundary_after_walks_clip_edges_in_order() {
 
     let project = engine.project();
     assert_eq!(next_boundary_after(project, 0.0), Some(1.0));
-    assert_eq!(next_boundary_after(project, 1.0), Some(2.0), "strictly after");
+    assert_eq!(
+        next_boundary_after(project, 1.0),
+        Some(2.0),
+        "strictly after"
+    );
     assert_eq!(next_boundary_after(project, 2.5), Some(3.0));
     assert_eq!(next_boundary_after(project, 3.0), Some(5.0));
     assert_eq!(next_boundary_after(project, 5.0), None, "nothing after end");

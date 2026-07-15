@@ -311,7 +311,10 @@ impl Sources {
 enum Clock {
     Audio(TimelineAudio),
     /// No usable audio device: wall-clock pacing so video still plays.
-    Freewheel { base: f64, started: Option<Instant> },
+    Freewheel {
+        base: f64,
+        started: Option<Instant>,
+    },
 }
 
 impl Clock {
@@ -1206,7 +1209,13 @@ impl Engine {
         // Split point: the frame decoded past the previous cut is this
         // segment's first frame — present it, session flows on.
         if let Some(carry) = self.carryover.take() {
-            let frame_dur = 1.0 / self.sources.fps.get(&carry.media_id).copied().unwrap_or(30.0);
+            let frame_dur = 1.0
+                / self
+                    .sources
+                    .fps
+                    .get(&carry.media_id)
+                    .copied()
+                    .unwrap_or(30.0);
             if carry.media_id == seg.media_id
                 && (carry.source_pts - seg.source_in).abs() < 0.5 * frame_dur
                 && self.sessions.contains_key(&seg.media_id)

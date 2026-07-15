@@ -210,7 +210,9 @@ impl SourceDecoder {
                     self.has_decoded = true;
                     return Ok(true);
                 }
-                Err(ffmpeg::Error::Other { errno: libc::EAGAIN }) => {} // needs more input
+                Err(ffmpeg::Error::Other {
+                    errno: libc::EAGAIN,
+                }) => {} // needs more input
                 Err(ffmpeg::Error::Eof) => {
                     self.exhausted = true;
                     return Ok(false);
@@ -233,7 +235,9 @@ impl SourceDecoder {
                             .map_err(|e| ff_err(&self.path, "decoding", e))?;
                         break;
                     }
-                    Some(Err(ffmpeg::Error::Other { errno: libc::EAGAIN })) => continue,
+                    Some(Err(ffmpeg::Error::Other {
+                        errno: libc::EAGAIN,
+                    })) => continue,
                     Some(Err(e)) => return Err(ff_err(&self.path, "demuxing", e)),
                     None => {
                         // Container exhausted: switch the decoder to
@@ -251,11 +255,7 @@ impl SourceDecoder {
     }
 
     fn current_pts(&self) -> f64 {
-        self.decoded
-            .timestamp()
-            .or(self.decoded.pts())
-            .unwrap_or(0) as f64
-            * self.tb
+        self.decoded.timestamp().or(self.decoded.pts()).unwrap_or(0) as f64 * self.tb
     }
 
     /// Convert the current decoded frame to RGB and hand out a view.
@@ -377,7 +377,11 @@ mod tests {
 
         // 0.999 s: still frame 29 (0.9667), NOT frame 30.
         let f = dec.seek_to(0.999).unwrap().expect("frame");
-        assert!((f.pts_sec - 29.0 / 30.0).abs() < 1e-3, "got pts {}", f.pts_sec);
+        assert!(
+            (f.pts_sec - 29.0 / 30.0).abs() < 1e-3,
+            "got pts {}",
+            f.pts_sec
+        );
 
         // Exact grid point.
         let f = dec.seek_to(0.5).unwrap().expect("frame");
