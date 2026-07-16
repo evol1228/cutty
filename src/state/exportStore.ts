@@ -50,7 +50,15 @@ export const useExportStore = create<ExportState>((set) => ({
   error: null,
 
   openDialog: () => {
-    set({ dialogOpen: true });
+    set((state) => ({
+      dialogOpen: true,
+      // A finished/failed job's outcome is stale the moment the dialog
+      // reopens — every dismissal path (Escape, Hide, Close) must lead
+      // back to the setup form. A *running* job keeps its progress view.
+      ...(state.phase === "done" || state.phase === "error"
+        ? { phase: "idle" as const, error: null, outputPath: null, encoderUsed: null }
+        : {}),
+    }));
     // (Re-)fetch the encoder lazily; detection is warmed at startup so
     // this resolves instantly in practice.
     void ipc

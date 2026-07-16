@@ -43,6 +43,7 @@ import {
   undo,
 } from "./actions";
 import { requestDraw, setDrawCallback } from "./dirty";
+import { recordDraw } from "./perf";
 import {
   envelopeValueToY,
   envelopeYToValue,
@@ -1263,10 +1264,12 @@ export function createTimelineController(
 
   function draw(): void {
     if (disposed) return;
+    const t0 = performance.now();
     syncCanvasSize();
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     drawTimeline(ctx, container.clientWidth, container.clientHeight, overlay);
+    recordDraw(t0, performance.now() - t0);
   }
 
   /** Re-arm a one-shot listener for devicePixelRatio changes (monitor

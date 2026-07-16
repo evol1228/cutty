@@ -14,6 +14,7 @@ import {
 } from "../lib/engineIpc";
 import {
   AUDIO_EXTENSIONS,
+  defaultClipDuration,
   IMAGE_EXTENSIONS,
   useMediaStore,
   VIDEO_EXTENSIONS,
@@ -132,7 +133,9 @@ function PoolItemCard({ item }: { item: PoolItem }) {
         beginPoolDrag(e.nativeEvent, {
           mediaId: item.mediaId,
           name: item.name,
-          durationSec: item.durationSec,
+          // Stills have no intrinsic duration: the drag ghost and drop
+          // use the default still clip length.
+          durationSec: defaultClipDuration(item),
           hasVideo: item.hasVideo,
           hasAudio: item.hasAudio,
           thumbnailUrl: item.thumbnailUrl,
@@ -161,7 +164,11 @@ function PoolItemCard({ item }: { item: PoolItem }) {
         )}
         {item.durationSec !== null && !item.missing && (
           <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 text-[10px] tabular-nums text-zinc-200">
-            {formatDuration(item.durationSec)}
+            {item.kind === "image"
+              ? "Still"
+              : item.kind === "gif"
+                ? `GIF ${formatDuration(item.durationSec)}`
+                : formatDuration(item.durationSec)}
           </span>
         )}
         {label && (

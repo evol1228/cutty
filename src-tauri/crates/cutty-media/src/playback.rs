@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use cutty_audio::{MixerTimeline, TimelineAudio};
 use cutty_engine::{
-    resolve_track_visuals, resolve_video_layers, timeline_end, transition_spans, Project,
-    ProjectSettings, TrackKind, TrackVisual,
+    resolve_track_visuals, resolve_video_layers, timeline_end, transition_spans, MediaKind,
+    Project, ProjectSettings, TrackKind, TrackVisual,
 };
 
 use crate::compose::TimelineRenderer;
@@ -300,6 +300,14 @@ enum SourceFiles {
     ProxyPending,
     /// Audio-only media: decoded straight from the original.
     AudioOnly { original: PathBuf },
+    /// Media that never gets a proxy and decodes from the original even
+    /// in preview: stills, GIFs (both are small and loop/hold anyway)
+    /// and alpha-channel video (a proxy transcode would flatten the
+    /// alpha).
+    Direct {
+        original: PathBuf,
+        has_audio: bool,
+    },
 }
 
 #[derive(Default)]
@@ -312,7 +320,14 @@ impl Sources {
         self.map.clear();
         for media in &project.media {
             let path = PathBuf::from(&media.path);
-            let entry = if media.has_video {
+            let direct =
+                matches!(media.kind, MediaKind::Image | MediaKind::Gif) || media.has_alpha;
+            let entry = if media.has_video && direct {
+                SourceFiles::Direct {
+                    original: path,
+                    has_audio: media.has_audio,
+                }
+            } else if media.has_video {
                 match proxy_path_for(&path) {
                     Ok((proxy, true)) => SourceFiles::Ready {
                         proxy,
@@ -332,6 +347,7 @@ impl Sources {
     fn video_path(&self, media_id: u64) -> Option<PathBuf> {
         match self.map.get(&media_id)? {
             SourceFiles::Ready { proxy, .. } => Some(proxy.clone()),
+            SourceFiles::Direct { original, .. } => Some(original.clone()),
             _ => None,
         }
     }
@@ -343,6 +359,10 @@ impl Sources {
                 has_audio: true,
             } => Some(proxy.clone()),
             SourceFiles::AudioOnly { original } => Some(original.clone()),
+            SourceFiles::Direct {
+                original,
+                has_audio: true,
+            } => Some(original.clone()),
             _ => None,
         }
     }
@@ -567,11 +587,15 @@ struct Engine {
 
 fn run(project: Project, jpeg: JpegEncoder, sink: EventSink, cmd_rx: Receiver<Cmd>) {
     // Mixer errors cross threads via a channel; the control loop forwards
-    // them through the single sink.
+    // them through the single sink. Sources decode through the
+    // symphonia→libav chain so ac3/dts/opus originals play too.
     let (mix_err_tx, mix_err_rx) = std::sync::mpsc::channel::<String>();
-    let clock = match TimelineAudio::open(Box::new(move |msg| {
-        let _ = mix_err_tx.send(msg);
-    })) {
+    let clock = match TimelineAudio::open_with_factory(
+        Box::new(move |msg| {
+            let _ = mix_err_tx.send(msg);
+        }),
+        Box::new(crate::audio_source::open_audio_source),
+    ) {
         Ok(audio) => Clock::Audio(audio),
         Err(e) => {
             (sink)(PlayerEvent::Error(format!(
@@ -1466,6 +1490,49 @@ mod tests {
         // Proxy pending → no segments (silence until refresh).
         sources.map.insert(media_id, SourceFiles::ProxyPending);
         assert!(mixer_timeline(&p, &sources).segments.is_empty());
+    }
+
+    #[test]
+    fn stills_gifs_and_alpha_media_resolve_direct_to_originals() {
+        let mut engine = EditEngine::new(ProjectSettings::default());
+        let image = engine
+            .add_media_with_kind("/tmp/poster.png", 0.0, true, false, true, MediaKind::Image)
+            .unwrap();
+        let gif = engine
+            .add_media_with_kind("/tmp/sticker.gif", 2.0, true, false, true, MediaKind::Gif)
+            .unwrap();
+        let alpha_webm = engine
+            .add_media_with_kind("/tmp/fx.webm", 4.0, true, true, true, MediaKind::Video)
+            .unwrap();
+        let plain = engine
+            .add_media("/tmp/broll.mp4", 10.0, true, true)
+            .unwrap();
+        let p = engine.project().clone();
+
+        let mut sources = Sources::default();
+        sources.rebuild(&p);
+        // Direct media decodes originals even in preview — no proxy wait.
+        assert_eq!(
+            sources.video_path(image.0),
+            Some(PathBuf::from("/tmp/poster.png"))
+        );
+        assert_eq!(
+            sources.video_path(gif.0),
+            Some(PathBuf::from("/tmp/sticker.gif"))
+        );
+        assert_eq!(
+            sources.video_path(alpha_webm.0),
+            Some(PathBuf::from("/tmp/fx.webm"))
+        );
+        // …and its audio (when present) comes from the original too.
+        assert_eq!(
+            sources.audio_path(alpha_webm.0),
+            Some(PathBuf::from("/tmp/fx.webm"))
+        );
+        assert_eq!(sources.audio_path(image.0), None);
+        // Plain video still waits for its proxy (none exists for a fake
+        // path, so it renders black until refresh).
+        assert_eq!(sources.video_path(plain.0), None);
     }
 
     #[test]

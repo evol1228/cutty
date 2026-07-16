@@ -16,6 +16,12 @@
 //!   payloads, `mediaId` optional (absent on text clips). Pure superset
 //!   of v1; the bump exists because v1 builds cannot read files that
 //!   *use* the new constructs.
+//! - **v3** — stills & loops (Phase 2): media entries carry a `kind`
+//!   (`video`/`audio`/`image`/`gif`), and image/GIF clips may window
+//!   source time past the media duration. The bump exists because older
+//!   builds would misread such files (a still would be treated as a
+//!   bounded video and fail validation); migration derives `kind` from
+//!   `hasVideo` for old files.
 //!
 //! ## Media paths
 //!
@@ -33,10 +39,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::EngineError;
-use crate::model::{MediaId, MediaRef, Project, ProjectSettings, Track};
+use crate::model::{MediaId, MediaKind, MediaRef, Project, ProjectSettings, Track};
 
 /// The newest project-file schema version this build reads and writes.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Errors from saving or loading `.cutty` files.
 #[derive(Debug, thiserror::Error)]
@@ -59,8 +65,8 @@ pub enum ProjectFileError {
 }
 
 /// On-disk form of a [`MediaRef`]: the absolute path as registered, plus
-/// an optional path relative to the project file's directory. Shape
-/// unchanged since v1.
+/// an optional path relative to the project file's directory. `kind`
+/// landed in v3 (migration stamps it for older files).
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaEntry {
@@ -71,13 +77,17 @@ struct MediaEntry {
     duration: f64,
     has_video: bool,
     has_audio: bool,
+    #[serde(default)]
+    has_alpha: bool,
+    #[serde(default)]
+    kind: MediaKind,
 }
 
-/// Schema v2 — the current shape. Tracks and clips reuse the model's
+/// Schema v3 — the current shape. Tracks and clips reuse the model's
 /// serde shape directly; the golden-fixture tests pin it.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectFileV2 {
+struct ProjectFileV3 {
     version: u32,
     settings: ProjectSettings,
     media: Vec<MediaEntry>,
@@ -87,10 +97,11 @@ struct ProjectFileV2 {
 /// Migration scaffold: one arm per historical schema version, each
 /// lifting the raw JSON one step toward [`CURRENT_VERSION`], then one
 /// parse of the fully-lifted document.
-fn migrate(value: Value, version: u64) -> Result<ProjectFileV2, ProjectFileError> {
+fn migrate(value: Value, version: u64) -> Result<ProjectFileV3, ProjectFileError> {
     let value = match version {
-        1 => migrate_v1_to_v2(value),
-        2 => value,
+        1 => migrate_v2_to_v3(migrate_v1_to_v2(value)),
+        2 => migrate_v2_to_v3(value),
+        3 => value,
         v => {
             return Err(ProjectFileError::UnsupportedVersion {
                 found: v,
@@ -108,6 +119,25 @@ fn migrate(value: Value, version: u64) -> Result<ProjectFileV2, ProjectFileError
 fn migrate_v1_to_v2(mut value: Value) -> Value {
     if let Some(version) = value.get_mut("version") {
         *version = 2.into();
+    }
+    value
+}
+
+/// v2 → v3. v3 added `MediaEntry.kind`; pre-v3 files can only contain
+/// bounded video/audio media, so the kind is derivable from `hasVideo`.
+fn migrate_v2_to_v3(mut value: Value) -> Value {
+    if let Some(version) = value.get_mut("version") {
+        *version = 3.into();
+    }
+    if let Some(media) = value.get_mut("media").and_then(Value::as_array_mut) {
+        for entry in media {
+            let Some(map) = entry.as_object_mut() else {
+                continue;
+            };
+            let has_video = map.get("hasVideo").and_then(Value::as_bool).unwrap_or(true);
+            let kind = if has_video { "video" } else { "audio" };
+            map.entry("kind").or_insert_with(|| kind.into());
+        }
     }
     value
 }
@@ -132,9 +162,11 @@ pub fn serialize(project: &Project, project_dir: Option<&Path>) -> String {
             duration: m.duration,
             has_video: m.has_video,
             has_audio: m.has_audio,
+            has_alpha: m.has_alpha,
+            kind: m.kind,
         })
         .collect();
-    let file = ProjectFileV2 {
+    let file = ProjectFileV3 {
         version: CURRENT_VERSION,
         settings: project.settings.clone(),
         media,
@@ -168,6 +200,8 @@ pub fn deserialize(json: &str, project_dir: Option<&Path>) -> Result<Project, Pr
                 duration: entry.duration,
                 has_video: entry.has_video,
                 has_audio: entry.has_audio,
+                has_alpha: entry.has_alpha,
+                kind: entry.kind,
             }
         })
         .collect();
@@ -478,9 +512,126 @@ mod tests {
         // Round-trip: serialize → load again → identical project, and
         // the written version is the current one.
         let json = serialize(&project, None);
-        assert!(json.contains("\"version\": 2"));
+        assert!(json.contains("\"version\": 3"));
         let again = deserialize(&json, None).expect("round-trip loads");
         assert_eq!(again, project);
+    }
+
+    /// Golden v3 fixture (media kinds, stills/loops): this exact JSON
+    /// must keep loading forever. A failure means the v3 serde shape
+    /// drifted — bump [`CURRENT_VERSION`] and add a migration arm
+    /// instead of editing the fixture.
+    #[test]
+    fn golden_v3_fixture_with_media_kinds_loads() {
+        let fixture = r#"{
+          "version": 3,
+          "settings": { "width": 1080, "height": 1920, "fps": 30.0 },
+          "media": [
+            {
+              "id": 3,
+              "path": "/media/poster.png",
+              "duration": 0.0,
+              "hasVideo": true,
+              "hasAudio": false,
+              "kind": "image"
+            },
+            {
+              "id": 4,
+              "path": "/media/sticker.gif",
+              "duration": 2.0,
+              "hasVideo": true,
+              "hasAudio": false,
+              "kind": "gif"
+            }
+          ],
+          "tracks": [
+            {
+              "id": 1,
+              "kind": "video",
+              "name": "V1",
+              "locked": false,
+              "muted": false,
+              "hidden": false,
+              "clips": [
+                {
+                  "id": 5,
+                  "mediaId": 3,
+                  "timelineIn": 0.0,
+                  "timelineOut": 5.0,
+                  "sourceIn": 0.0,
+                  "sourceOut": 5.0,
+                  "transform": { "x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0 },
+                  "opacity": 1.0,
+                  "speed": 1.0,
+                  "volume": 1.0
+                },
+                {
+                  "id": 6,
+                  "mediaId": 4,
+                  "timelineIn": 5.0,
+                  "timelineOut": 13.0,
+                  "sourceIn": 0.5,
+                  "sourceOut": 8.5,
+                  "transform": { "x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0 },
+                  "opacity": 1.0,
+                  "speed": 1.0,
+                  "volume": 1.0
+                }
+              ]
+            },
+            {
+              "id": 2,
+              "kind": "audio",
+              "name": "A1",
+              "locked": false,
+              "muted": false,
+              "clips": []
+            }
+          ]
+        }"#;
+        let project = deserialize(fixture, None).expect("v3 fixture loads");
+        assert_eq!(project.media[0].kind, MediaKind::Image);
+        assert_eq!(project.media[1].kind, MediaKind::Gif);
+        // The GIF clip's source range extends far past the 2s media —
+        // legal exactly because the media loops.
+        let gif_clip = &project.tracks[0].clips[1];
+        assert!(gif_clip.source_out > project.media[1].duration);
+
+        let json = serialize(&project, None);
+        let again = deserialize(&json, None).expect("round-trip loads");
+        assert_eq!(again, project);
+    }
+
+    /// v2 → v3 migration stamps media kinds from `hasVideo`.
+    #[test]
+    fn v2_media_migrates_to_kinds() {
+        let fixture = r#"{
+          "version": 2,
+          "settings": { "width": 1920, "height": 1080, "fps": 30.0 },
+          "media": [
+            {
+              "id": 3,
+              "path": "/media/clip.mp4",
+              "duration": 10.0,
+              "hasVideo": true,
+              "hasAudio": true
+            },
+            {
+              "id": 4,
+              "path": "/media/song.mp3",
+              "duration": 30.0,
+              "hasVideo": false,
+              "hasAudio": true
+            }
+          ],
+          "tracks": [
+            { "id": 1, "kind": "video", "name": "V1", "locked": false, "muted": false, "clips": [] },
+            { "id": 2, "kind": "audio", "name": "A1", "locked": false, "muted": false, "clips": [] }
+          ]
+        }"#;
+        let project = deserialize(fixture, None).expect("v2 media loads");
+        assert_eq!(project.media[0].kind, MediaKind::Video);
+        assert_eq!(project.media[1].kind, MediaKind::Audio);
     }
 
     /// A media clip's serialized shape is unchanged from v1 except the

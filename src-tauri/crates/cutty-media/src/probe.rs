@@ -3,11 +3,16 @@
 use std::path::Path;
 use std::process::Command;
 
+use cutty_engine::MediaKind;
 use ffmpeg_sidecar::ffprobe::ffprobe_path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::MediaError;
 use crate::tools::ensure_tools;
+
+/// A GIF at or under this duration is a single frame in a trenchcoat —
+/// imported as a still, not a loop (a loop period needs real length).
+const MIN_GIF_LOOP_SEC: f64 = 0.11;
 
 /// Everything Cutty needs to know about a media file up front.
 #[derive(Debug, Clone, Serialize)]
@@ -15,12 +20,15 @@ use crate::tools::ensure_tools;
 pub struct MediaInfo {
     /// Absolute path of the probed file.
     pub path: String,
-    /// Container duration in seconds.
+    /// Container duration in seconds (`0` for still images).
     pub duration_sec: f64,
     /// Container format name as reported by ffprobe (e.g. `mov,mp4,m4a,...`).
     pub container: String,
     /// File size in bytes.
     pub size_bytes: u64,
+    /// What the timeline should treat this file as: bounded video/audio,
+    /// a still image, or a looping GIF.
+    pub kind: MediaKind,
     /// First video stream, if any.
     pub video: Option<VideoStreamInfo>,
     /// First audio stream, if any.
@@ -45,6 +53,10 @@ pub struct VideoStreamInfo {
     /// Display-matrix rotation in degrees (0 when absent) — phone footage
     /// is commonly stored landscape with a ±90 rotation tag.
     pub rotation: i32,
+    /// The stream carries an alpha channel: an alpha-capable pixel format
+    /// (PNG `rgba`, GIF `bgra`/`pal8`) or WebM's `alpha_mode` stream tag
+    /// (VP8/VP9 alpha rides a side stream the pix_fmt doesn't show).
+    pub has_alpha: bool,
 }
 
 /// Properties of an audio stream.
@@ -119,6 +131,7 @@ struct RawStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    pix_fmt: Option<String>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     sample_rate: Option<String>,
@@ -128,6 +141,35 @@ struct RawStream {
     disposition: RawDisposition,
     #[serde(default)]
     side_data_list: Vec<RawSideData>,
+    #[serde(default)]
+    tags: RawStreamTags,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawStreamTags {
+    /// `"1"` on WebM VP8/VP9 streams whose alpha rides a side stream.
+    alpha_mode: Option<String>,
+}
+
+/// Pixel formats whose RGBA conversion carries real alpha (matches the
+/// decoder's `pixel_has_alpha`; `pal8` counts for GIF transparency).
+fn pix_fmt_has_alpha(pix_fmt: &str) -> bool {
+    pix_fmt.starts_with("yuva")
+        || pix_fmt.starts_with("rgba")
+        || pix_fmt.starts_with("bgra")
+        || pix_fmt.starts_with("argb")
+        || pix_fmt.starts_with("abgr")
+        || pix_fmt.starts_with("gbrap")
+        || pix_fmt.starts_with("ya")
+        || pix_fmt == "pal8"
+}
+
+/// Containers that hold a single still image.
+fn is_image_container(container: &str) -> bool {
+    matches!(
+        container,
+        "image2" | "png_pipe" | "jpeg_pipe" | "webp_pipe" | "bmp_pipe" | "tiff_pipe"
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,6 +229,8 @@ fn parse_probe_output(json: &str, path: &Path) -> Result<MediaInfo, MediaError> 
                     .find_map(|d| d.rotation)
                     .map(|r| r.round() as i32)
                     .unwrap_or(0);
+                let has_alpha = s.pix_fmt.as_deref().is_some_and(pix_fmt_has_alpha)
+                    || s.tags.alpha_mode.as_deref() == Some("1");
                 if let (Some(width), Some(height), Some(fps)) = (s.width, s.height, fps) {
                     video = Some(VideoStreamInfo {
                         codec,
@@ -194,6 +238,7 @@ fn parse_probe_output(json: &str, path: &Path) -> Result<MediaInfo, MediaError> 
                         height,
                         fps,
                         rotation,
+                        has_alpha,
                     });
                 }
             }
@@ -226,16 +271,36 @@ fn parse_probe_output(json: &str, path: &Path) -> Result<MediaInfo, MediaError> 
         .and_then(|d| d.parse::<f64>().ok())
         .unwrap_or(stream_duration);
 
+    // Classify the file for the timeline model. Still-image containers
+    // (and degenerate single-frame GIFs) become stills with no intrinsic
+    // duration; real GIFs become loops; everything else is bounded
+    // video/audio by stream presence.
+    let container = raw.format.format_name;
+    let (kind, duration_sec) = if video.is_some() && is_image_container(&container) {
+        (MediaKind::Image, 0.0)
+    } else if video.is_some() && container == "gif" {
+        if duration_sec > MIN_GIF_LOOP_SEC {
+            (MediaKind::Gif, duration_sec)
+        } else {
+            (MediaKind::Image, 0.0)
+        }
+    } else if video.is_some() {
+        (MediaKind::Video, duration_sec)
+    } else {
+        (MediaKind::Audio, duration_sec)
+    };
+
     Ok(MediaInfo {
         path: path.display().to_string(),
         duration_sec,
-        container: raw.format.format_name,
+        container,
         size_bytes: raw
             .format
             .size
             .as_deref()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0),
+        kind,
         video,
         audio,
         streams,
@@ -294,6 +359,7 @@ mod tests {
         assert_eq!(info.duration_sec, 90.046);
         assert_eq!(info.size_bytes, 231_072_941);
         assert_eq!(info.streams.len(), 2);
+        assert_eq!(info.kind, MediaKind::Video);
 
         let v = info.video.expect("video stream");
         assert_eq!((v.width, v.height), (3840, 2160));
@@ -403,6 +469,91 @@ mod tests {
         let v = info.video.unwrap();
         assert_eq!(v.rotation, -90);
         assert_eq!((v.width, v.height), (1920, 1080));
+    }
+
+    #[test]
+    fn classifies_stills_gifs_and_alpha() {
+        // PNG: png_pipe container, no duration → a still with duration 0.
+        let png = r#"{
+            "streams": [
+                {
+                    "index": 0, "codec_name": "png", "codec_type": "video",
+                    "width": 800, "height": 600, "pix_fmt": "rgba",
+                    "r_frame_rate": "25/1", "avg_frame_rate": "25/1"
+                }
+            ],
+            "format": { "format_name": "png_pipe", "size": "1000" }
+        }"#;
+        let info = parse_probe_output(png, Path::new("poster.png")).unwrap();
+        assert_eq!(info.kind, MediaKind::Image);
+        assert_eq!(info.duration_sec, 0.0);
+        assert!(info.video.as_ref().unwrap().has_alpha, "rgba png has alpha");
+
+        // Opaque JPEG: image2 container, no alpha.
+        let jpg = r#"{
+            "streams": [
+                {
+                    "index": 0, "codec_name": "mjpeg", "codec_type": "video",
+                    "width": 800, "height": 600, "pix_fmt": "yuvj420p",
+                    "r_frame_rate": "25/1", "avg_frame_rate": "25/1"
+                }
+            ],
+            "format": { "format_name": "image2", "duration": "0.040000" }
+        }"#;
+        let info = parse_probe_output(jpg, Path::new("photo.jpg")).unwrap();
+        assert_eq!(info.kind, MediaKind::Image);
+        assert_eq!(info.duration_sec, 0.0);
+        assert!(!info.video.as_ref().unwrap().has_alpha);
+
+        // Animated GIF: a loop with its real duration.
+        let gif = r#"{
+            "streams": [
+                {
+                    "index": 0, "codec_name": "gif", "codec_type": "video",
+                    "width": 320, "height": 240, "pix_fmt": "bgra",
+                    "r_frame_rate": "12/1", "avg_frame_rate": "25/2",
+                    "duration": "2.000000"
+                }
+            ],
+            "format": { "format_name": "gif", "duration": "2.000000" }
+        }"#;
+        let info = parse_probe_output(gif, Path::new("sticker.gif")).unwrap();
+        assert_eq!(info.kind, MediaKind::Gif);
+        assert_eq!(info.duration_sec, 2.0);
+        assert!(info.video.as_ref().unwrap().has_alpha, "bgra gif has alpha");
+
+        // Single-frame GIF: no loop period — imported as a still.
+        let single = r#"{
+            "streams": [
+                {
+                    "index": 0, "codec_name": "gif", "codec_type": "video",
+                    "width": 320, "height": 240, "pix_fmt": "bgra",
+                    "r_frame_rate": "100/1", "avg_frame_rate": "100/1",
+                    "duration": "0.010000"
+                }
+            ],
+            "format": { "format_name": "gif", "duration": "0.010000" }
+        }"#;
+        let info = parse_probe_output(single, Path::new("frame.gif")).unwrap();
+        assert_eq!(info.kind, MediaKind::Image);
+        assert_eq!(info.duration_sec, 0.0);
+
+        // WebM VP9 alpha: pix_fmt lies (yuv420p) but alpha_mode tells.
+        let webm = r#"{
+            "streams": [
+                {
+                    "index": 0, "codec_name": "vp9", "codec_type": "video",
+                    "width": 480, "height": 480, "pix_fmt": "yuv420p",
+                    "r_frame_rate": "30/1", "avg_frame_rate": "30/1",
+                    "tags": { "alpha_mode": "1" }
+                }
+            ],
+            "format": { "format_name": "matroska,webm", "duration": "4.0" }
+        }"#;
+        let info = parse_probe_output(webm, Path::new("overlay.webm")).unwrap();
+        assert_eq!(info.kind, MediaKind::Video);
+        assert!(info.video.as_ref().unwrap().has_alpha, "alpha_mode counts");
+        assert_eq!(info.duration_sec, 4.0);
     }
 
     #[test]

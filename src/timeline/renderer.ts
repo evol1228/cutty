@@ -4,7 +4,7 @@
 // beyond pixel↔time conversion; clips are drawn exactly where the engine
 // says they are.
 
-import type { Clip, Project, Track, TransitionSpan } from "../lib/engineIpc";
+import type { Clip, MediaRef, Project, Track, TransitionSpan } from "../lib/engineIpc";
 import { useMediaStore } from "../state/mediaStore";
 import {
   useProjectStore,
@@ -19,6 +19,9 @@ import {
   volumeLane,
   type ClipBodyRect,
 } from "./envelope";
+import { drawFilmstrip, drawStillTiles, filmstripFor } from "./filmstrip";
+import { drawStats, hudEnabled } from "./perf";
+import { drawWaveform, peaksFor } from "./waveform";
 import {
   durationToPx,
   laneHeight,
@@ -98,6 +101,8 @@ const COLORS = {
   envelopeDotSelected: "#f59e0b", // amber-500
   fadeHandle: "#7dd3fc", // sky-300
   fadeShade: "rgba(9, 9, 11, 0.35)", // zinc-950
+  waveform: "rgba(110, 231, 183, 0.55)", // emerald-300
+  waveformSelected: "rgba(167, 243, 208, 0.65)", // emerald-200
 } as const;
 
 /** Radius of a keyframe dot on the volume line, px. */
@@ -328,6 +333,8 @@ function drawClip(
   missing: boolean,
   mediaNames: Map<number, string>,
   thumbs: Map<number, string>,
+  media: Map<number, MediaRef>,
+  canvasWidth: number,
 ): void {
   const x = timeToX(clip.timelineIn);
   const w = Math.max(durationToPx(clip.timelineOut - clip.timelineIn), 2);
@@ -347,21 +354,67 @@ function drawClip(
   roundRectPath(ctx, x, y, w, h, 5);
   ctx.fill();
 
-  // Clip visuals v1: one representative thumbnail at the clip's left edge
-  // (full filmstrips are Phase 2). Missing media shows red, no stale frame.
-  let labelIndent = 0;
-  const thumbUrl =
-    missing || clip.mediaId === undefined ? undefined : thumbs.get(clip.mediaId);
-  if (thumbUrl && w >= 40 && kind === "video") {
-    const img = thumbImage(thumbUrl);
-    if (img) {
-      const thumbW = Math.min((h / img.naturalHeight) * img.naturalWidth, w - 4);
-      ctx.save();
-      roundRectPath(ctx, x, y, w, h, 5);
-      ctx.clip();
-      ctx.drawImage(img, x + 1, y + 1, thumbW, h - 2);
-      ctx.restore();
-      labelIndent = thumbW;
+  // Clip visuals: filmstrip tiles on video lanes, waveforms on audio
+  // lanes — always from caches; anything not ready yet keeps the flat
+  // fill above as its placeholder. Missing media shows red, no stale art.
+  // Visuals draw into the body inset by 1px with integer-clamped rects —
+  // no per-clip cairo clip regions (a rounded clip per clip measurably
+  // breaks the 60fps budget at 60+ clips).
+  const mediaRef =
+    missing || clip.mediaId === undefined ? undefined : media.get(clip.mediaId);
+  if (mediaRef && kind === "video" && w >= 24) {
+    const visX0 = Math.max(x + 1, 0);
+    const visX1 = Math.min(x + w - 1, canvasWidth);
+    if (mediaRef.kind === "image") {
+      // A still has one frame: repeat its pool thumbnail.
+      const thumbUrl = thumbs.get(mediaRef.id);
+      const img = thumbUrl ? thumbImage(thumbUrl) : null;
+      if (img) drawStillTiles(ctx, img, x + 1, y + 1, w - 2, h - 2, visX0, visX1);
+    } else {
+      const strip = filmstripFor(mediaRef.path, mediaRef.duration || undefined);
+      if (strip) {
+        const loopSec = mediaRef.kind === "gif" ? mediaRef.duration : null;
+        drawFilmstrip(
+          ctx,
+          strip,
+          x + 1,
+          y + 1,
+          w - 2,
+          h - 2,
+          clip.sourceIn,
+          clip.sourceOut,
+          loopSec,
+          visX0,
+          visX1,
+        );
+      } else {
+        // Strip still generating: the Phase 1 single thumbnail bridges.
+        const thumbUrl = thumbs.get(mediaRef.id);
+        const img = thumbUrl ? thumbImage(thumbUrl) : null;
+        if (img) {
+          const thumbW = Math.min((h / img.naturalHeight) * img.naturalWidth, w - 4);
+          ctx.drawImage(img, x + 1, y + 1, thumbW, h - 2);
+        }
+      }
+    }
+  }
+  if (mediaRef?.hasAudio && kind === "audio" && w >= 8) {
+    const peaks = peaksFor(mediaRef.path);
+    if (peaks) {
+      drawWaveform(
+        ctx,
+        peaks,
+        clip.id,
+        x + 1,
+        y + 2,
+        w - 2,
+        h - 4,
+        clip.sourceIn,
+        clip.sourceOut,
+        Math.max(x + 1, 0),
+        Math.min(x + w - 1, canvasWidth),
+        selected ? COLORS.waveformSelected : COLORS.waveform,
+      );
     }
   }
 
@@ -379,7 +432,7 @@ function drawClip(
   ctx.stroke();
   ctx.lineWidth = 1;
 
-  if (w >= 28 + labelIndent) {
+  if (w >= 28) {
     // Text clips label with their content's first line, "T"-prefixed;
     // media clips with their file name.
     const label =
@@ -395,11 +448,19 @@ function drawClip(
     ctx.save();
     roundRectPath(ctx, x + 2, y, w - 4, h, 5);
     ctx.clip();
-    ctx.fillStyle = COLORS.clipLabel;
     ctx.font = kind === "text" ? "bold 10px system-ui, sans-serif" : "11px system-ui, sans-serif";
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
-    ctx.fillText(label, x + labelIndent + 7, kind === "text" ? y + 4 : y + 5);
+    // A dark chip keeps the name readable over filmstrip tiles (a text
+    // stroke would read better still, but cairo text-stroking is far too
+    // slow for 40+ clips per frame).
+    if (kind === "video") {
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = "rgba(9, 9, 11, 0.62)";
+      ctx.fillRect(x + 4, y + 3, tw + 7, 15);
+    }
+    ctx.fillStyle = COLORS.clipLabel;
+    ctx.fillText(label, x + 7, kind === "text" ? y + 4 : y + 5);
     ctx.restore();
   }
 
@@ -745,6 +806,7 @@ export function drawTimeline(
     const selected = new Set(selection);
     const names = mediaNameMap(project);
     const thumbs = mediaThumbMap();
+    const media = new Map(project.media.map((m) => [m.id, m]));
     const missingIds = useMediaStore.getState().missingMediaIds;
     const startSec = xToTime(-2);
     const endSec = xToTime(width + 2);
@@ -772,6 +834,8 @@ export function drawTimeline(
           clip.mediaId !== undefined && missingIds.has(clip.mediaId),
           names,
           thumbs,
+          media,
+          width,
         );
         if (track.kind === "audio") {
           drawVolumeEnvelope(
@@ -843,4 +907,32 @@ export function drawTimeline(
     drawSnapLine(ctx, overlay.snapLineSec, height);
   }
   drawPlayhead(ctx, playheadSec, width, height);
+
+  if (hudEnabled()) drawPerfHud(ctx, width);
+}
+
+/** Dev HUD: rolling draw cost + achieved fps, top-right under the ruler.
+ * Numbers cover the last ~180 draws; fps counts only continuous redraw
+ * streams (playback/drags), never idle gaps. */
+function drawPerfHud(ctx: CanvasRenderingContext2D, width: number): void {
+  const s = drawStats();
+  const fps = s.fps === null ? "—" : s.fps.toFixed(1);
+  const line1 = `draw ${s.avgMs.toFixed(2)} ms avg · ${s.p95Ms.toFixed(2)} p95 · ${s.worstMs.toFixed(2)} max`;
+  const line2 = `fps ${fps} · n=${s.samples}`;
+  ctx.save();
+  ctx.font = "11px ui-monospace, monospace";
+  const w = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width) + 16;
+  const x = width - w - 8;
+  const y = RULER_H + 6;
+  ctx.fillStyle = "rgba(9, 9, 11, 0.85)";
+  roundRectPath(ctx, x, y, w, 36, 4);
+  ctx.fill();
+  ctx.strokeStyle = "#3f3f46";
+  ctx.stroke();
+  ctx.fillStyle = "#fbbf24";
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.fillText(line1, x + 8, y + 5);
+  ctx.fillText(line2, x + 8, y + 19);
+  ctx.restore();
 }

@@ -79,14 +79,26 @@ pub struct RenderStats {
     pub text_rasterized: u64,
 }
 
+/// The decode side of a [`SourceState`].
+enum SourceBackend {
+    /// A live decode session (video, GIF, WebM…).
+    Stream(SourceDecoder),
+    /// A still image: its one frame was uploaded at construction and the
+    /// decoder dropped — sampling is free forever after.
+    Still,
+}
+
 /// One open source: a decoder plus its GPU texture and what's in it.
 struct SourceState {
     /// The media file this decoder reads — adoption matches on it.
     media_id: u64,
-    decoder: SourceDecoder,
+    backend: SourceBackend,
     texture: SourceTexture,
     /// Source frame index currently uploaded to `texture`.
     uploaded_idx: Option<i64>,
+    /// Uploaded texels carry real (straight) alpha — PNG/GIF/WebM-alpha.
+    /// Gates the transition direct fast path, which assumes opacity.
+    has_alpha: bool,
 }
 
 impl SourceState {
@@ -94,14 +106,50 @@ impl SourceState {
         let texture = compositor.create_source(decoder.width(), decoder.height());
         Self {
             media_id,
-            decoder,
+            backend: SourceBackend::Stream(decoder),
             texture,
             uploaded_idx: None,
+            has_alpha: false,
+        }
+    }
+
+    /// Build a still-image source: decode the file's single frame,
+    /// upload it once, and drop the decoder (off-thread — teardown joins
+    /// libav's worker pool). `Ok(None)` when the file has no frame.
+    fn new_still(
+        compositor: &Compositor,
+        media_id: u64,
+        path: &std::path::Path,
+    ) -> Result<Option<Self>, MediaError> {
+        let mut decoder = SourceDecoder::open(path)?;
+        let state = match decoder.next_frame()? {
+            Some(frame) => {
+                let texture = compositor.create_source(frame.width, frame.height);
+                compositor.upload_rgba(&texture, frame.data, frame.stride);
+                Some((texture, frame.width, frame.height))
+            }
+            None => None,
+        };
+        let has_alpha = decoder.frame_has_alpha();
+        dispose_decoder(decoder);
+        Ok(state.map(|(texture, _, _)| Self {
+            media_id,
+            backend: SourceBackend::Still,
+            texture,
+            uploaded_idx: Some(0),
+            has_alpha,
+        }))
+    }
+
+    fn stream_fps(&self) -> f64 {
+        match &self.backend {
+            SourceBackend::Stream(d) => d.fps(),
+            SourceBackend::Still => 1.0,
         }
     }
 
     fn idx_of(&self, pts: f64) -> i64 {
-        (pts * self.decoder.fps() + 0.5).floor() as i64
+        (pts * self.stream_fps() + 0.5).floor() as i64
     }
 
     /// Make `texture` hold the latest source frame with pts ≤ `src_t`.
@@ -113,7 +161,12 @@ impl SourceState {
         src_t: f64,
         stats: &mut RenderStats,
     ) -> Result<bool, MediaError> {
-        let fps = self.decoder.fps();
+        let decoder = match &mut self.backend {
+            // A still's frame is uploaded and can never change.
+            SourceBackend::Still => return Ok(true),
+            SourceBackend::Stream(d) => d,
+        };
+        let fps = decoder.fps();
         let needed = (src_t.max(0.0) * fps + PTS_EPS).floor() as i64;
 
         if self.uploaded_idx == Some(needed) {
@@ -122,14 +175,14 @@ impl SourceState {
 
         // The decoder may already hold the wanted frame un-uploaded (a
         // freshly installed prefetched decoder sits exactly here).
-        if let Some(pts) = self.decoder.current_pts_sec() {
-            if self.idx_of(pts) == needed {
+        if let Some(pts) = decoder.current_pts_sec() {
+            if (pts * fps + 0.5).floor() as i64 == needed {
                 return self.upload_current(compositor);
             }
         }
 
         // Past the end of a dried-up stream: hold the last frame.
-        if self.decoder.is_exhausted() {
+        if decoder.is_exhausted() {
             if let Some(idx) = self.uploaded_idx {
                 if needed > idx {
                     return Ok(true);
@@ -140,22 +193,20 @@ impl SourceState {
         // Near-forward target: roll the stream forward (cheaper than a
         // seek). `next_pts_hint` is exact on CFR sources (all proxies);
         // VFR originals fall back to seeking.
-        let forward_gap = self
-            .decoder
+        let forward_gap = decoder
             .next_pts_hint()
-            .map(|next| needed - self.idx_of(next));
+            .map(|next| needed - (next * fps + 0.5).floor() as i64);
         if let Some(gap) = forward_gap {
             if (0..=FORWARD_WINDOW_FRAMES).contains(&gap) {
                 loop {
-                    let next_within = self
-                        .decoder
+                    let next_within = decoder
                         .next_pts_hint()
-                        .is_some_and(|next| self.idx_of(next) <= needed);
+                        .is_some_and(|next| (next * fps + 0.5).floor() as i64 <= needed);
                     if !next_within {
                         break;
                     }
                     stats.forward_decodes += 1;
-                    if self.decoder.next_frame()?.is_none() {
+                    if decoder.next_frame()?.is_none() {
                         break; // dried up: hold what we have
                     }
                 }
@@ -167,7 +218,7 @@ impl SourceState {
         // stream): one seek positions the floor frame.
         stats.seeks += 1;
         let uploaded = {
-            let Some(frame) = self.decoder.seek_to(src_t.max(0.0))? else {
+            let Some(frame) = decoder.seek_to(src_t.max(0.0))? else {
                 return Ok(self.uploaded_idx.is_some()); // no frames at all
             };
             let idx = (frame.pts_sec * fps + 0.5).floor() as i64;
@@ -175,14 +226,19 @@ impl SourceState {
             idx
         };
         self.uploaded_idx = Some(uploaded);
+        self.has_alpha = decoder.frame_has_alpha();
         Ok(true)
     }
 
     /// Upload the decoder's current frame (if any) to the texture.
     fn upload_current(&mut self, compositor: &Compositor) -> Result<bool, MediaError> {
-        let fps = self.decoder.fps();
+        let decoder = match &mut self.backend {
+            SourceBackend::Still => return Ok(true),
+            SourceBackend::Stream(d) => d,
+        };
+        let fps = decoder.fps();
         let uploaded = {
-            let Some(frame) = self.decoder.current_frame()? else {
+            let Some(frame) = decoder.current_frame()? else {
                 return Ok(self.uploaded_idx.is_some());
             };
             let idx = (frame.pts_sec * fps + 0.5).floor() as i64;
@@ -190,6 +246,7 @@ impl SourceState {
             idx
         };
         self.uploaded_idx = Some(uploaded);
+        self.has_alpha = decoder.frame_has_alpha();
         Ok(true)
     }
 }
@@ -207,6 +264,14 @@ fn dispose_sources(dropped: Vec<SourceState>) {
     let _ = std::thread::Builder::new()
         .name("cutty-decoder-drop".into())
         .spawn(move || drop(dropped));
+}
+
+/// Off-thread teardown for a bare decoder (same reason as
+/// [`dispose_sources`] — used by the still-image one-shot decode).
+fn dispose_decoder(decoder: SourceDecoder) {
+    let _ = std::thread::Builder::new()
+        .name("cutty-decoder-drop".into())
+        .spawn(move || drop(decoder));
 }
 
 // ---------------------------------------------------------------------
@@ -367,6 +432,8 @@ struct PlannedLayer {
     rotation_rad: f32,
     opacity: f32,
     blend: GpuBlend,
+    /// Every texel of the source is opaque (see [`Layer::opaque`]).
+    opaque: bool,
 }
 
 /// One planned visual: a layer, or a sampled transition pair.
@@ -515,17 +582,21 @@ impl TimelineRenderer {
         needed_src_t: f64,
     ) {
         if let Some(existing) = self.sources.get(&clip_id) {
-            let fps = existing.decoder.fps();
-            let needed = (needed_src_t.max(0.0) * fps + PTS_EPS).floor() as i64;
-            let reachable = existing.uploaded_idx == Some(needed)
-                || existing
-                    .decoder
-                    .current_pts_sec()
-                    .is_some_and(|p| existing.idx_of(p) == needed)
-                || existing.decoder.next_pts_hint().is_some_and(|next| {
-                    let gap = needed - existing.idx_of(next);
-                    (0..=FORWARD_WINDOW_FRAMES).contains(&gap)
-                });
+            let reachable = match &existing.backend {
+                // A still never needs a replacement decoder.
+                SourceBackend::Still => true,
+                SourceBackend::Stream(d) => {
+                    let fps = d.fps();
+                    let needed = (needed_src_t.max(0.0) * fps + PTS_EPS).floor() as i64;
+                    existing.uploaded_idx == Some(needed)
+                        || d.current_pts_sec()
+                            .is_some_and(|p| existing.idx_of(p) == needed)
+                        || d.next_pts_hint().is_some_and(|next| {
+                            let gap = needed - existing.idx_of(next);
+                            (0..=FORWARD_WINDOW_FRAMES).contains(&gap)
+                        })
+                }
+            };
             if reachable {
                 return; // the running decoder already covers this clip
             }
@@ -593,8 +664,20 @@ impl TimelineRenderer {
             return Ok(None);
         };
         let key = active.clip_id.0;
-        let Some(media) = clip.media_id.map(|m| m.0) else {
+        let Some(media_ref) = clip.media_id.and_then(|m| project.media(m)) else {
             return Ok(None); // text clips never reach the decode path
+        };
+        let media = media_ref.id.0;
+        let still = media_ref.kind == cutty_engine::MediaKind::Image;
+        // A GIF loops to fill its clip: fold source time into one period.
+        // `rem_euclid` also wraps the negative pre-handle of a transition
+        // backwards through the loop.
+        let source_time = if media_ref.kind == cutty_engine::MediaKind::Gif
+            && media_ref.duration > PTS_EPS
+        {
+            active.source_time.rem_euclid(media_ref.duration)
+        } else {
+            active.source_time
         };
 
         if !self.sources.contains_key(&key) {
@@ -617,11 +700,17 @@ impl TimelineRenderer {
                     return Ok(None);
                 };
                 self.stats.cold_opens += 1;
-                match SourceDecoder::open(&path) {
-                    Ok(decoder) => {
-                        self.sources
-                            .insert(key, SourceState::new(&self.compositor, media, decoder));
+                let opened = if still {
+                    SourceState::new_still(&self.compositor, media, &path)
+                } else {
+                    SourceDecoder::open(&path)
+                        .map(|d| Some(SourceState::new(&self.compositor, media, d)))
+                };
+                match opened {
+                    Ok(Some(state)) => {
+                        self.sources.insert(key, state);
                     }
+                    Ok(None) => return Ok(None), // image with no frame
                     Err(e) => {
                         self.layer_problem(format!("open {} failed: {e}", path.display()))?;
                         return Ok(None);
@@ -631,7 +720,7 @@ impl TimelineRenderer {
         }
 
         let state = self.sources.get_mut(&key).expect("just ensured");
-        match state.sample(&self.compositor, active.source_time, &mut self.stats) {
+        match state.sample(&self.compositor, source_time, &mut self.stats) {
             Ok(true) => {
                 let (cx, cy, w, h, rot) = layer_placement(
                     state.texture.width(),
@@ -655,6 +744,7 @@ impl TimelineRenderer {
                     } else {
                         gpu_blend(clip.blend_mode)
                     },
+                    opaque: !state.has_alpha,
                 }))
             }
             Ok(false) => Ok(None), // stream with no frames
@@ -743,6 +833,7 @@ impl TimelineRenderer {
             opacity: clip.opacity as f32,
             // Text rasters are premultiplied; blend modes don't apply.
             blend: GpuBlend::PremultipliedOver,
+            opaque: false,
         })
     }
 
@@ -850,6 +941,7 @@ impl TimelineRenderer {
             rotation_rad: p.rotation_rad,
             opacity: p.opacity,
             blend: p.blend,
+            opaque: p.opaque,
         };
         let visuals: Vec<Visual> = plan
             .iter()

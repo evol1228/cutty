@@ -14,9 +14,9 @@ use crate::keyframes::{
     self, Easing, FadeSide, Keyframe, KeyframeProp, Keyframes, KEYFRAME_MIN_DT,
 };
 use crate::model::{
-    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TextSpec,
-    Track, TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION,
-    MIN_CLIP_DURATION, MIN_TRANSITION_DURATION,
+    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaKind, MediaRef, Project, ProjectSettings,
+    TextSpec, Track, TrackId, TrackKind, Transform, Transition, DEFAULT_STILL_CLIP_DURATION, EPS,
+    MAX_TRANSITION_DURATION, MIN_CLIP_DURATION, MIN_TRANSITION_DURATION,
 };
 use crate::resolve::transition_duration_limit;
 
@@ -206,7 +206,9 @@ impl Engine {
     // Media pool
     // ------------------------------------------------------------------
 
-    /// Register a media file in the project's media pool.
+    /// Register a bounded media file (video or audio) in the project's
+    /// media pool, deriving [`MediaKind`] from stream presence. Stills
+    /// and GIFs go through [`Engine::add_media_with_kind`].
     ///
     /// Media registration is not a timeline mutation and is deliberately
     /// not undoable (matching every mainstream editor); clips referencing
@@ -219,21 +221,43 @@ impl Engine {
         has_video: bool,
         has_audio: bool,
     ) -> Result<MediaId, EngineError> {
-        if !duration.is_finite() || duration <= 0.0 {
-            return Err(EngineError::InvalidProperty {
-                clip: ClipId(0),
-                property: "media.duration",
-                value: duration,
-            });
-        }
-        let id = MediaId(self.next_id());
-        self.project.media.push(MediaRef {
-            id,
+        let kind = if has_video {
+            MediaKind::Video
+        } else {
+            MediaKind::Audio
+        };
+        self.add_media_with_kind(path, duration, has_video, has_audio, false, kind)
+    }
+
+    /// Register a media file of an explicit [`MediaKind`]. Duration must
+    /// be finite and positive, except stills which store `0` (they have
+    /// no intrinsic time; pass whatever the probe reported ≥ 0).
+    pub fn add_media_with_kind(
+        &mut self,
+        path: impl Into<String>,
+        duration: f64,
+        has_video: bool,
+        has_audio: bool,
+        has_alpha: bool,
+        kind: MediaKind,
+    ) -> Result<MediaId, EngineError> {
+        let duration = if kind == MediaKind::Image {
+            0.0
+        } else {
+            duration
+        };
+        let media = MediaRef {
+            id: MediaId(self.next_id()),
             path: path.into(),
             duration,
             has_video,
             has_audio,
-        });
+            has_alpha,
+            kind,
+        };
+        Project::validate_media_entry(&media)?;
+        let id = media.id;
+        self.project.media.push(media);
         self.emit_snapshot();
         Ok(id)
     }
@@ -416,6 +440,10 @@ impl Engine {
     /// Place a new clip on a track. `timeline_out` is derived from the
     /// source range (speed is fixed at 1.0 in Phase 1). Fails if the clip
     /// would overlap an existing clip or exceed media bounds.
+    ///
+    /// Still images have no intrinsic duration, so a degenerate source
+    /// range (what a caller naturally produces from `media.duration ==
+    /// 0`) becomes the [`DEFAULT_STILL_CLIP_DURATION`] window.
     pub fn add_clip(
         &mut self,
         track_id: TrackId,
@@ -424,9 +452,16 @@ impl Engine {
         source_in: f64,
         source_out: f64,
     ) -> Result<ClipId, EngineError> {
-        self.project
+        let media = self
+            .project
             .media(media_id)
             .ok_or(EngineError::UnknownMedia(media_id))?;
+        let (source_in, source_out) =
+            if media.kind == MediaKind::Image && source_out - source_in < MIN_CLIP_DURATION {
+                (0.0, DEFAULT_STILL_CLIP_DURATION)
+            } else {
+                (source_in, source_out)
+            };
         let track = self
             .project
             .track(track_id)
@@ -645,9 +680,9 @@ impl Engine {
     /// adjusting the source range correspondingly. The requested time is
     /// clamped to media bounds and to [`MIN_CLIP_DURATION`]; the clamped
     /// edge time actually applied is returned. Fails if the result would
-    /// overlap a neighboring clip. Text clips have no medium to bound the
-    /// drag, so they trim freely in both directions (their source range
-    /// just re-normalizes to the new duration).
+    /// overlap a neighboring clip. Clips without a bounding medium — text
+    /// clips, stills, and looping GIFs — trim freely in both directions
+    /// (their source range just re-normalizes to the new duration).
     pub fn trim_clip(
         &mut self,
         clip_id: ClipId,
@@ -666,15 +701,31 @@ impl Engine {
                 timeline_out: to,
             });
         }
-        // `None` = no source medium (text clip): unbounded headroom.
-        let media_duration = match clip.media_id {
-            Some(id) => Some(
-                self.project
+        // How the medium bounds the drag. `Bounded` clamps to source
+        // handles; loops and stills extend freely but differ in what the
+        // source range means afterwards (loop phase vs nothing).
+        enum SourceBound {
+            /// Video/audio: the media duration bounds the range.
+            Bounded(f64),
+            /// GIF: unbounded, but source values carry loop phase —
+            /// folded into `[0, period)` rather than renormalized.
+            Loop(f64),
+            /// Text and stills: unbounded, source range is derived.
+            Free,
+        }
+        let bound = match clip.media_id {
+            Some(id) => {
+                let media = self
+                    .project
                     .media(id)
-                    .ok_or(EngineError::UnknownMedia(id))?
-                    .duration,
-            ),
-            None => None,
+                    .ok_or(EngineError::UnknownMedia(id))?;
+                match media.kind {
+                    MediaKind::Video | MediaKind::Audio => SourceBound::Bounded(media.duration),
+                    MediaKind::Gif => SourceBound::Loop(media.duration),
+                    MediaKind::Image => SourceBound::Free,
+                }
+            }
+            None => SourceBound::Free,
         };
         let old = ClipSpan::of(clip);
         let mut new = old;
@@ -682,9 +733,11 @@ impl Engine {
         let applied = match edge {
             TrimEdge::Start => {
                 // Media headroom to the left, and timeline 0, bound the drag.
-                let lo = match media_duration {
-                    Some(_) => (clip.timeline_in - clip.source_in / clip.speed).max(0.0),
-                    None => 0.0,
+                let lo = match bound {
+                    SourceBound::Bounded(_) => {
+                        (clip.timeline_in - clip.source_in / clip.speed).max(0.0)
+                    }
+                    _ => 0.0,
                 };
                 let hi = clip.timeline_out - MIN_CLIP_DURATION;
                 if lo > hi {
@@ -696,16 +749,26 @@ impl Engine {
                 }
                 let t = to.clamp(lo, hi);
                 new.timeline_in = t;
-                if media_duration.is_some() {
-                    new.source_in = (clip.source_in + (t - clip.timeline_in) * clip.speed).max(0.0);
+                match bound {
+                    SourceBound::Bounded(_) => {
+                        new.source_in =
+                            (clip.source_in + (t - clip.timeline_in) * clip.speed).max(0.0);
+                    }
+                    // A loop's start edge shifts its phase with the drag.
+                    SourceBound::Loop(_) => {
+                        new.source_in = clip.source_in + (t - clip.timeline_in) * clip.speed;
+                    }
+                    SourceBound::Free => {}
                 }
                 t
             }
             TrimEdge::End => {
                 let lo = clip.timeline_in + MIN_CLIP_DURATION;
-                let hi = match media_duration {
-                    Some(d) => clip.timeline_out + (d - clip.source_out) / clip.speed,
-                    None => f64::INFINITY,
+                let hi = match bound {
+                    SourceBound::Bounded(d) => {
+                        clip.timeline_out + (d - clip.source_out) / clip.speed
+                    }
+                    _ => f64::INFINITY,
                 };
                 if lo > hi {
                     return Err(EngineError::InvalidTimeRange {
@@ -716,17 +779,38 @@ impl Engine {
                 }
                 let t = to.clamp(lo, hi);
                 new.timeline_out = t;
-                if let Some(d) = media_duration {
-                    new.source_out =
-                        (clip.source_out + (t - clip.timeline_out) * clip.speed).min(d);
+                match bound {
+                    SourceBound::Bounded(d) => {
+                        new.source_out =
+                            (clip.source_out + (t - clip.timeline_out) * clip.speed).min(d);
+                    }
+                    // A loop's end edge just extends/shortens the window;
+                    // phase (source_in) is untouched.
+                    SourceBound::Loop(_) => {
+                        new.source_out = clip.source_out + (t - clip.timeline_out) * clip.speed;
+                    }
+                    SourceBound::Free => {}
                 }
                 t
             }
         };
-        if media_duration.is_none() {
-            // Text: keep the source range normalized to [0, duration).
-            new.source_in = 0.0;
-            new.source_out = new.timeline_out - new.timeline_in;
+        match bound {
+            SourceBound::Free => {
+                // No medium (text) or no intrinsic time (still): keep the
+                // source range normalized to [0, duration).
+                new.source_in = 0.0;
+                new.source_out = new.timeline_out - new.timeline_in;
+            }
+            SourceBound::Loop(period) => {
+                // Fold the pair into source_in ∈ [0, period) — renderers
+                // fold source time the same way, so playback is
+                // identical, and the model stays non-negative. Shifting
+                // both ends together preserves the span linkage.
+                let shift = new.source_in.rem_euclid(period.max(MIN_CLIP_DURATION)) - new.source_in;
+                new.source_in += shift;
+                new.source_out += shift;
+            }
+            SourceBound::Bounded(_) => {}
         }
 
         let trim = Box::new(TrimClip {

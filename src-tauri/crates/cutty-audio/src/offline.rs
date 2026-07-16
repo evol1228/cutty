@@ -54,6 +54,35 @@ pub fn render_timeline_to_wav(
     )
 }
 
+/// A per-path source opener (the seam for codec-fallback injection).
+pub type OpenPath<'a> = &'a mut dyn FnMut(&Path) -> Result<Box<dyn AudioSource>, AudioError>;
+
+/// [`render_timeline_to_wav`] with an injectable per-path source factory
+/// — `cutty-media` passes the symphonia→libav fallback chain here so
+/// exports decode codecs symphonia doesn't cover (ac3/dts/opus).
+pub fn render_timeline_to_wav_with_factory(
+    timeline: MixerTimeline,
+    out_rate: u32,
+    total_frames: u64,
+    dst: &Path,
+    cancel: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+    open_path: OpenPath<'_>,
+) -> Result<(), AudioError> {
+    let mut open = |seg: &crate::mixer::AudioSegment| -> Result<Box<dyn AudioSource>, AudioError> {
+        open_path(&seg.path)
+    };
+    render_timeline_to_wav_with(
+        timeline,
+        out_rate,
+        total_frames,
+        dst,
+        cancel,
+        on_progress,
+        &mut open,
+    )
+}
+
 /// [`render_timeline_to_wav`] with an injectable source factory (tests
 /// use synthetic sources).
 pub(crate) fn render_timeline_to_wav_with(

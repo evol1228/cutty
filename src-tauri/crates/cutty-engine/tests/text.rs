@@ -431,11 +431,11 @@ fn text_layers_resolve_above_video_in_panel_order_and_respect_hidden() {
 }
 
 #[test]
-fn text_projects_save_as_v2_and_round_trip() {
+fn text_projects_save_as_current_version_and_round_trip() {
     let mut f = engine_with_media();
     let clip = add_text(&mut f.engine, 1.0, 3.0, "persist me");
     let json = project_file::serialize(f.engine.project(), None);
-    assert!(json.contains("\"version\": 2"));
+    assert!(json.contains("\"version\": 3"));
     assert!(json.contains("\"kind\": \"text\""));
 
     let loaded = project_file::deserialize(&json, None).expect("loads");
@@ -448,12 +448,13 @@ fn text_projects_save_as_v2_and_round_trip() {
 }
 
 #[test]
-fn projects_without_text_still_declare_v2() {
+fn projects_without_text_still_declare_current_version() {
     // The writer stamps CURRENT_VERSION unconditionally — simpler than
-    // feature-sniffing, and v2 is what this build reads best.
+    // feature-sniffing, and the current version is what this build
+    // reads best.
     let engine = Engine::new(ProjectSettings::default());
     let json = project_file::serialize(engine.project(), None);
-    assert!(json.contains("\"version\": 2"));
+    assert!(json.contains("\"version\": 3"));
     assert!(project_file::deserialize(&json, None).is_ok());
 }
 

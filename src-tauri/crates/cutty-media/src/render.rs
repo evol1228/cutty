@@ -61,7 +61,7 @@ use ffmpeg_sidecar::paths::ffmpeg_path;
 use crate::compose::TimelineRenderer;
 use crate::encoders::{detected_h264_encoder, H264Encoder};
 use crate::error::MediaError;
-use crate::proxy::{parse_ffmpeg_time, proxy_path_for};
+use crate::proxy::parse_ffmpeg_time;
 use crate::tools::ensure_tools;
 
 /// CRF-style quality tiers exposed in the export dialog.
@@ -262,7 +262,15 @@ pub(crate) fn fast_path_eligible(project: &Project) -> bool {
     if tracks.next().is_some() {
         return false;
     }
-    track.clips.iter().all(visually_default)
+    // Stills, loops and alpha sources need the compositor (the ffmpeg
+    // segment pipeline neither loops GIFs, holds stills, nor preserves
+    // alpha semantics against the black base).
+    let plain_media = track.clips.iter().all(|c| {
+        c.media_id
+            .and_then(|id| project.media(id))
+            .is_some_and(|m| m.kind == cutty_engine::MediaKind::Video && !m.has_alpha)
+    });
+    plain_media && track.clips.iter().all(visually_default)
 }
 
 /// Walk the fast path's single video track into segments covering
@@ -326,13 +334,13 @@ pub(crate) fn plan_video_segments(project: &Project, fps: f64) -> Vec<PlannedSeg
 }
 
 /// The mixer input for export: every audio-contributing clip on an
-/// unmuted track, resolved to the *same files preview plays* — the proxy
-/// for video media, the original for audio-only media (see module docs).
-/// Unlike preview (which renders silence until a proxy appears), export
-/// refuses to run while a needed proxy is still generating. Transition
+/// unmuted track, resolved to **original media** — export never touches
+/// proxies (their audio is a 128k stereo AAC transcode; the original is
+/// the real thing). Codecs symphonia doesn't decode (ac3/dts/opus) go
+/// through the libav fallback in [`crate::audio_source`]. Transition
 /// crossfades and volume-keyframe envelopes come from the same
 /// [`crate::audio_layout`] resolution the live mixer uses, so the
-/// exported mix equals the preview mix. Public for the envelope
+/// exported mix has the exact preview envelope. Public for the envelope
 /// acceptance tests; `run_export` drives it internally.
 pub fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, MediaError> {
     let spans = cutty_engine::transition_spans(project);
@@ -346,24 +354,7 @@ pub fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, MediaEr
             if !media.has_audio {
                 continue;
             }
-            let src = Path::new(&media.path);
-            let path = if media.has_video {
-                let (proxy, exists) = proxy_path_for(src)?;
-                if !exists {
-                    return Err(MediaError::ExportNotReady {
-                        message: format!(
-                            "the preview proxy for {} is still generating — wait for import \
-                             jobs to finish, then export again",
-                            src.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| media.path.clone())
-                        ),
-                    });
-                }
-                proxy
-            } else {
-                src.to_path_buf()
-            };
+            let path = PathBuf::from(&media.path);
             let placement = crate::audio_layout::audio_placement(clip, &spans);
             segments.push(AudioSegment {
                 path,
@@ -854,10 +845,12 @@ pub fn run_export(
     };
 
     // --- Stage 1: the audio mix (exact video duration) ---
+    // Sources decode through the symphonia→libav chain so original-media
+    // audio works regardless of codec (ac3/dts/opus included).
     let wav = temp_dir.join("mix.wav");
     let audio_frames =
         (total_frames as f64 / spec.fps * f64::from(EXPORT_SAMPLE_RATE)).round() as u64;
-    cutty_audio::render_timeline_to_wav(
+    cutty_audio::render_timeline_to_wav_with_factory(
         audio_timeline,
         EXPORT_SAMPLE_RATE,
         audio_frames,
@@ -866,6 +859,7 @@ pub fn run_export(
         &mut |done, total| {
             progress.report(ExportStage::Audio, done as f64 / total as f64, 0.0);
         },
+        &mut crate::audio_source::open_audio_source,
     )
     .map_err(|e| match e {
         cutty_audio::AudioError::Cancelled => MediaError::ExportCancelled,

@@ -606,3 +606,83 @@ fn cancel_mid_export_kills_ffmpeg_and_cleans_up() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Flag-7 acceptance: sources whose audio symphonia can't decode
+/// (ac3/dts) export with their **original** audio through the libav
+/// fallback — no proxy transcode in the export mix, no silent tracks.
+#[test]
+fn ac3_and_dts_sources_export_original_audio() {
+    let _serial = serial();
+
+    // Video clip with AC3 audio (camcorder-style)…
+    let ac3_clip = {
+        let file = test_dir().join("export-ac3.mp4");
+        if !file.is_file() {
+            let status = Command::new(ffmpeg_path())
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=640x360:rate=30:duration=3")
+                .args(["-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:sample_rate=48000:duration=3")
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30"])
+                .args(["-c:a", "ac3", "-b:a", "192k", "-shortest"])
+                .arg(&file)
+                .status()
+                .expect("system ffmpeg required");
+            assert!(status.success());
+        }
+        file
+    };
+    // …and a DTS music bed under it.
+    let dts_music = {
+        let file = test_dir().join("export-music.dts.mkv");
+        if !file.is_file() {
+            let status = Command::new(ffmpeg_path())
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=220:sample_rate=48000:duration=3")
+                .args(["-c:a", "dca", "-strict", "-2", "-b:a", "768k"])
+                .arg(&file)
+                .status()
+                .expect("system ffmpeg required");
+            assert!(status.success());
+        }
+        file
+    };
+
+    let mut engine = Engine::new(ProjectSettings {
+        width: 640,
+        height: 360,
+        fps: 30.0,
+    });
+    let ids = track_ids(&engine);
+    let v = add_media(&mut engine, &ac3_clip);
+    let m = add_media(&mut engine, &dts_music);
+    engine.add_clip(ids.video, v, 0.0, 0.0, 2.0).unwrap();
+    engine.add_clip(ids.audio, m, 0.0, 0.5, 2.5).unwrap();
+    let project = engine.project().clone();
+
+    let dst = test_dir().join("export-ac3-out.mp4");
+    let _ = std::fs::remove_file(&dst);
+    let spec = ExportSpec {
+        width: 640,
+        height: 360,
+        fps: 30.0,
+        quality: ExportQuality::Medium,
+        dst: dst.clone(),
+    };
+    run_export(&project, &spec, &CancelToken::new(), &mut |_| {}).expect("export runs");
+
+    // Output has a real, audible AAC track of the right length…
+    let probe_json = ffprobe_json(&dst);
+    let audio = probe_json["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["codec_type"] == "audio")
+        .expect("audio stream");
+    assert_eq!(audio["codec_name"], "aac");
+    let (rate, samples) = decoded_audio(&dst);
+    let full = rms(&samples, rate, 0.1, 1.9);
+    println!("ac3+dts export rms {full:.4}");
+    assert!(full > 0.02, "mixed ac3+dts audio must be audible, rms {full}");
+    assert!(our_ffmpeg_children().is_empty(), "no ffmpeg left behind");
+}

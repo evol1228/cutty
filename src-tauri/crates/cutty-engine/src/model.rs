@@ -78,6 +78,36 @@ impl Default for ProjectSettings {
     }
 }
 
+/// What kind of source a media file is — the model's temporal semantics,
+/// not a codec detail (those stay in `cutty-media`).
+///
+/// `Image` and `Gif` landed in project schema **v3** — like
+/// [`TrackKind::Text`] in v2, a new enum discriminant in the file format
+/// bumps [`crate::project_file::CURRENT_VERSION`] (see the schema rule on
+/// [`BlendMode`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaKind {
+    /// Bounded moving picture, possibly with audio. Source range is
+    /// clamped to the media duration.
+    #[default]
+    Video,
+    /// Audio-only source. Source range is clamped to the media duration.
+    Audio,
+    /// A still image. No intrinsic timeline: clips window it freely
+    /// (`duration` is stored as `0`), and their default length is
+    /// [`DEFAULT_STILL_CLIP_DURATION`].
+    Image,
+    /// Animated image (GIF). Has an intrinsic duration but **loops to
+    /// fill the clip**, so clips extend freely past it; renderers fold
+    /// source time modulo the media duration.
+    Gif,
+}
+
+/// Default timeline length of a freshly placed still-image clip, seconds
+/// (the CapCut default). Stills extend freely afterwards.
+pub const DEFAULT_STILL_CLIP_DURATION: f64 = 5.0;
+
 /// A media file registered in the project's media pool.
 ///
 /// Only what the timeline model needs: duration for source-range clamping
@@ -89,10 +119,31 @@ pub struct MediaRef {
     pub id: MediaId,
     /// Absolute path of the original file.
     pub path: String,
-    /// Duration in seconds.
+    /// Duration in seconds. `0` exactly on still images.
     pub duration: f64,
     pub has_video: bool,
     pub has_audio: bool,
+    /// The video stream carries an alpha channel (WebM `alpha_mode`,
+    /// PNG/GIF transparency). Renderers decode such media from the
+    /// original (a proxy transcode would flatten the alpha). Additive
+    /// schema field (`serde(default)`): older files load as opaque.
+    #[serde(default)]
+    pub has_alpha: bool,
+    /// Temporal semantics of the source. Additive at the struct level
+    /// (`serde(default)` covers hand-written JSON) but a schema-v3
+    /// construct — migration stamps it from `has_video`/`has_audio` for
+    /// older files.
+    #[serde(default)]
+    pub kind: MediaKind,
+}
+
+impl MediaRef {
+    /// Whether clips of this media may use a source range beyond the
+    /// media duration: stills have no intrinsic time and GIFs loop to
+    /// fill, so neither bounds its clips.
+    pub fn unbounded_source(&self) -> bool {
+        matches!(self.kind, MediaKind::Image | MediaKind::Gif)
+    }
 }
 
 /// Kind of a track.
@@ -476,6 +527,9 @@ impl Project {
     /// state in place.
     pub fn validate(&self) -> Result<(), EngineError> {
         self.validate_unique_ids()?;
+        for media in &self.media {
+            Self::validate_media_entry(media)?;
+        }
         for track in &self.tracks {
             for clip in &track.clips {
                 self.validate_clip(track, clip)?;
@@ -528,6 +582,37 @@ impl Project {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Media-pool invariants: kind consistent with stream presence, and a
+    /// sane duration (`0` allowed exactly on stills, which have no
+    /// intrinsic time). Also used by `Engine::add_media_with_kind` to
+    /// reject bad registrations up front.
+    pub(crate) fn validate_media_entry(media: &MediaRef) -> Result<(), EngineError> {
+        let streams_ok = match media.kind {
+            MediaKind::Video => media.has_video,
+            MediaKind::Audio => media.has_audio && !media.has_video,
+            MediaKind::Image | MediaKind::Gif => media.has_video && !media.has_audio,
+        };
+        if !streams_ok {
+            return Err(EngineError::InvalidMedia {
+                media: media.id,
+                reason: "kind does not match stream presence",
+            });
+        }
+        let duration_ok = media.duration.is_finite()
+            && if media.kind == MediaKind::Image {
+                media.duration >= 0.0
+            } else {
+                media.duration > 0.0
+            };
+        if !duration_ok {
+            return Err(EngineError::InvalidMedia {
+                media: media.id,
+                reason: "invalid duration",
+            });
         }
         Ok(())
     }
@@ -590,10 +675,12 @@ impl Project {
                     media: media.id,
                 });
             }
-            if clip.source_in < -EPS
-                || clip.source_out <= clip.source_in
-                || clip.source_out > media.duration + EPS
-            {
+            // Stills and loops have no upper source bound (see
+            // [`MediaRef::unbounded_source`]); everything else stays
+            // inside the media.
+            let over_media_end =
+                !media.unbounded_source() && clip.source_out > media.duration + EPS;
+            if clip.source_in < -EPS || clip.source_out <= clip.source_in || over_media_end {
                 return Err(EngineError::SourceOutOfBounds {
                     clip: clip.id,
                     source_in: clip.source_in,

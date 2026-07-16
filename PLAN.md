@@ -115,8 +115,8 @@ Kill the biggest risk before building any editor UI.
 - [x] Transitions: fade/dissolve + ~15 ported gl-transitions; drag onto cut points; duration handle
 - [x] Text clips: font, size, color, stroke, shadow, position; a few text style presets
 - [x] Multiple audio tracks, volume keyframes, fade in/out, extract-audio-from-video
-- [ ] Image and GIF/WebM overlay support
-- [ ] Filmstrip thumbnails + waveforms rendered on clips
+- [x] Image and GIF/WebM overlay support
+- [x] Filmstrip thumbnails + waveforms rendered on clips
 
 **Acceptance:** replicate a typical CapCut-style short (b-roll, text overlays, transitions, music) end to end without leaving Cutty.
 

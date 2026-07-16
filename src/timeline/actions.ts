@@ -284,6 +284,94 @@ export async function seedCutTimeline(): Promise<void> {
 }
 
 /**
+ * Seed the Phase 2 *full-visuals* perf layout from real imported media,
+ * as one undo step: 3 video lanes × 14 clips + 2 audio lanes × 10 clips
+ * (62 clips) — every video clip draws a filmstrip and every audio clip a
+ * waveform, so this is the layout the 60fps criterion is measured on.
+ * Requires imported, ready media (unlike the dummy seed).
+ */
+export async function seedVisualLanes(): Promise<string | null> {
+  const { project } = useProjectStore.getState();
+  if (!project) return "no project";
+  const items = useMediaStore.getState().items;
+  const videos = items.filter(
+    (i) =>
+      i.mediaId !== null &&
+      i.hasVideo &&
+      !i.missing &&
+      i.status === "ready" &&
+      (i.durationSec ?? 0) >= 3,
+  );
+  const audios = items.filter(
+    (i) => i.mediaId !== null && i.hasAudio && !i.missing && i.status === "ready",
+  );
+  if (videos.length < 2 || audios.length < 1) {
+    toast("Seed visuals needs 2+ ready videos and 1+ audio-capable file.");
+    return "not enough ready media";
+  }
+
+  const rng = mulberry32(0xbeefcafe);
+  await engineBeginTransaction();
+  try {
+    const videoTrackIds = project.tracks
+      .filter((t) => t.kind === "video" && !t.locked)
+      .map((t) => t.id);
+    while (videoTrackIds.length < 3) {
+      videoTrackIds.push(await engineAddTrack("video", 0));
+    }
+    const audioTrackIds = project.tracks
+      .filter((t) => t.kind === "audio" && !t.locked)
+      .map((t) => t.id);
+    while (audioTrackIds.length < 2) {
+      audioTrackIds.push(await engineAddTrack("audio", 99));
+    }
+
+    const endOf = (id: number): number => {
+      const track = useProjectStore
+        .getState()
+        .project?.tracks.find((t) => t.id === id);
+      return track ? trackEnd(track) + (track.clips.length > 0 ? 0.4 : 0) : 0;
+    };
+
+    let n = 0;
+    for (const trackId of videoTrackIds.slice(0, 3)) {
+      let t = endOf(trackId);
+      for (let i = 0; i < 14; i++) {
+        const m = videos[n % videos.length];
+        // Clamp to the source: bounded media rejects ranges past its end.
+        const dur = Math.min(1.2 + rng() * 3.0, (m.durationSec ?? 4) - 0.2);
+        const maxIn = Math.max(0, (m.durationSec ?? dur) - dur - 0.1);
+        const sourceIn = rng() * maxIn;
+        await engineAddClip(trackId, m.mediaId!, t, sourceIn, sourceIn + dur);
+        t += dur + rng() * 0.8;
+        n++;
+      }
+    }
+    for (const trackId of audioTrackIds.slice(0, 2)) {
+      let t = endOf(trackId);
+      for (let i = 0; i < 10; i++) {
+        const m = audios[n % audios.length];
+        const dur = Math.min(2.0 + rng() * 4.0, (m.durationSec ?? 4) - 0.2);
+        const maxIn = Math.max(0, (m.durationSec ?? dur) - dur - 0.1);
+        const sourceIn = rng() * maxIn;
+        await engineAddClip(trackId, m.mediaId!, t, sourceIn, sourceIn + dur);
+        t += dur + rng() * 1.0;
+        n++;
+      }
+    }
+    await engineCommitTransaction();
+    return null;
+  } catch (err) {
+    console.error("seeding visual lanes failed", err);
+    const rollback = await engineRollbackTransaction().then(
+      () => "",
+      (e) => ` (rollback also failed: ${String(e)})`,
+    );
+    return `${String(err)}${rollback}`;
+  }
+}
+
+/**
  * Seed the Phase 2 performance-acceptance layout as one undo step: 3
  * video lanes × 20 clips plus 20 audio clips, creating the extra video
  * tracks when needed. Dev tool — real import lands elsewhere.
@@ -305,7 +393,9 @@ export async function seedDummyClips(): Promise<void> {
 
     const mediaIds: number[] = [];
     for (const def of DUMMY_MEDIA) {
-      mediaIds.push(await engineAddMedia(def.path, def.duration, true, true));
+      mediaIds.push(
+        await engineAddMedia(def.path, def.duration, true, true, false, "video"),
+      );
     }
 
     // Existing clip ends per track, so reseeding appends instead of failing.

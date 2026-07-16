@@ -20,10 +20,13 @@ import {
   redo,
   seedCutTimeline,
   seedDummyClips,
+  seedVisualLanes,
   splitAtPlayhead,
   undo,
 } from "../timeline/actions";
 import { createTimelineController } from "../timeline/controller";
+import { requestDraw } from "../timeline/dirty";
+import { toggleHud } from "../timeline/perf";
 import {
   laneHeight,
   lanesHeight,
@@ -507,6 +510,24 @@ function Timeline() {
             onClick={() => void seedCutTimeline()}
           >
             Seed cuts
+          </button>
+          <button
+            className={BUTTON}
+            disabled={!project}
+            title="Seed 3 video + 2 audio lanes × 62 real-media clips (dev — full-visuals perf acceptance)"
+            onClick={() => void seedVisualLanes()}
+          >
+            Seed visuals
+          </button>
+          <button
+            className={BUTTON}
+            title="Toggle the draw-time/fps HUD (dev)"
+            onClick={() => {
+              toggleHud();
+              requestDraw();
+            }}
+          >
+            HUD
           </button>
           <span>Zoom</span>
           <input

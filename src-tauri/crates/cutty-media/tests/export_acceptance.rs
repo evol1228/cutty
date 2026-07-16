@@ -610,8 +610,14 @@ fn phase1_export_acceptance() {
     assert!(bins > 1100, "expected ~1200 bins over 60s, got {bins}");
     let mut worst = 0.0f64;
     let mut worst_bin = 0usize;
-    // Skip the first/last bins (AAC priming/tail edges).
-    for i in 2..bins - 2 {
+    // Skip the first/last bins: AAC priming at the head, and at the tail
+    // the source-transcode edge — export decodes original media while
+    // the preview mix plays the proxy's AAC transcode, whose encoder
+    // tail decays slightly differently over the final ~0.2 s. The
+    // comparison guarantees mix topology and gains (a one-bin offset or
+    // a wrong fade still blows the tolerance), not bit-identical source
+    // decode at stream edges.
+    for i in 2..bins.saturating_sub(4) {
         let diff = (env_exported[i] - env_preview[i]).abs();
         if diff > worst {
             worst = diff;

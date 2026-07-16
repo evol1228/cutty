@@ -15,6 +15,11 @@ pub enum AudioError {
     #[error("audio decode: {0}")]
     Symphonia(#[from] symphonia::core::errors::Error),
 
+    /// Demux/decode error from an alternate decode backend (the libav
+    /// fallback lives in `cutty-media`; this carries its message).
+    #[error("audio decode: {0}")]
+    Backend(String),
+
     /// Output device error from cpal.
     #[error("audio output: {0}")]
     Cpal(#[from] cpal::Error),

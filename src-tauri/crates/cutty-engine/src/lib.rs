@@ -54,10 +54,10 @@ pub use keyframes::{
     Keyframe, KeyframeProp, Keyframes, FADE_SILENT, KEYFRAME_MIN_DT,
 };
 pub use model::{
-    clips_touch, parse_hex_color, BlendMode, Clip, ClipId, MediaId, MediaRef, Project,
+    clips_touch, parse_hex_color, BlendMode, Clip, ClipId, MediaId, MediaKind, MediaRef, Project,
     ProjectSettings, TextAlign, TextSpec, TextStyle, Track, TrackId, TrackKind, Transform,
-    Transition, EPS, MAX_TEXT_CONTENT_BYTES, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
-    MIN_TRANSITION_DURATION, TOUCH_EPS,
+    Transition, DEFAULT_STILL_CLIP_DURATION, EPS, MAX_TEXT_CONTENT_BYTES, MAX_TRANSITION_DURATION,
+    MIN_CLIP_DURATION, MIN_TRANSITION_DURATION, TOUCH_EPS,
 };
 pub use project_file::ProjectFileError;
 pub use recents::RecentProject;

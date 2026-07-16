@@ -20,7 +20,7 @@
 //! and applies pending seek rebases by draining stale samples.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -498,10 +498,30 @@ pub struct TimelineAudio {
     out_rate: u32,
 }
 
+/// Factory opening a file as an [`AudioSource`], injectable at the
+/// public mixer/offline boundaries so `cutty-media` can supply the
+/// symphonia→libav fallback chain (this crate stays libav-free).
+pub type SourceFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn AudioSource>, AudioError> + Send>;
+
+/// The default factory: symphonia only.
+pub fn symphonia_factory() -> SourceFactory {
+    Box::new(|path| Ok(Box::new(SymphoniaSource::open(path)?)))
+}
+
 impl TimelineAudio {
     /// Open the default output device and start the (empty, paused)
     /// mixer. `on_error` receives non-fatal per-clip decode problems.
+    /// Sources decode through symphonia; use
+    /// [`TimelineAudio::open_with_factory`] to inject a codec fallback.
     pub fn open(on_error: Box<dyn Fn(String) + Send>) -> Result<Self, AudioError> {
+        Self::open_with_factory(on_error, symphonia_factory())
+    }
+
+    /// [`TimelineAudio::open`] with an injectable source factory.
+    pub fn open_with_factory(
+        on_error: Box<dyn Fn(String) + Send>,
+        source_factory: SourceFactory,
+    ) -> Result<Self, AudioError> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
         let config = device.default_output_config()?;
@@ -579,7 +599,9 @@ impl TimelineAudio {
             let clock = clock.clone();
             std::thread::Builder::new()
                 .name("cutty-mixer".into())
-                .spawn(move || run_render(producer, clock, cmd_rx, out_rate, on_error))?
+                .spawn(move || {
+                    run_render(producer, clock, cmd_rx, out_rate, on_error, source_factory)
+                })?
         };
 
         Ok(Self {
@@ -646,14 +668,14 @@ fn run_render(
     commands: Receiver<MixerCmd>,
     out_rate: u32,
     on_error: Box<dyn Fn(String) + Send>,
+    mut source_factory: SourceFactory,
 ) {
     let mut segments: Vec<PlacedSegment> = Vec::new();
     let mut readers: HashMap<usize, Option<ClipReader>> = HashMap::new();
     let mut head: i64 = 0;
     let mut block = vec![0f32; BLOCK_FRAMES * 2];
-    let mut open = |seg: &AudioSegment| -> Result<Box<dyn AudioSource>, AudioError> {
-        Ok(Box::new(SymphoniaSource::open(&seg.path)?))
-    };
+    let mut open =
+        |seg: &AudioSegment| -> Result<Box<dyn AudioSource>, AudioError> { source_factory(&seg.path) };
     // Report each failing path once — a broken clip must not spam.
     let mut reported: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut on_error = move |seg: &AudioSegment, msg: String| {

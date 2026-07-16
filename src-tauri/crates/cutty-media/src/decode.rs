@@ -29,7 +29,9 @@ use crate::error::MediaError;
 /// real frame duration).
 const PTS_EPS: f64 = 1e-6;
 
-fn init_ffmpeg() {
+/// One-time libav initialization, shared by every in-process decode
+/// user in this crate (video sessions, the audio fallback, peaks).
+pub(crate) fn init_ffmpeg_once() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         if let Err(e) = ffmpeg::init() {
@@ -49,8 +51,9 @@ fn ff_err(path: &Path, context: &str, e: ffmpeg::Error) -> MediaError {
 }
 
 /// A decoded RGBA frame, borrowed from the decoder's reusable buffer.
-/// Valid until the next decoder call. Alpha is always 255 for video
-/// sources.
+/// Valid until the next decoder call. Alpha is 255 for opaque video
+/// sources; PNG/GIF/WebM-alpha sources carry real (straight, not
+/// premultiplied) alpha — see [`SourceDecoder::frame_has_alpha`].
 pub struct FrameView<'a> {
     /// Presentation time within the source, seconds.
     pub pts_sec: f64,
@@ -59,6 +62,51 @@ pub struct FrameView<'a> {
     /// Bytes per row (≥ `width * 4`; libav aligns rows).
     pub stride: usize,
     pub data: &'a [u8],
+}
+
+/// Whether a pixel format carries an alpha channel worth preserving.
+/// `PAL8` counts: GIF palettes may mark a transparent index, which
+/// swscale expands into RGBA alpha.
+fn pixel_has_alpha(format: Pixel) -> bool {
+    matches!(
+        format,
+        Pixel::YUVA420P
+            | Pixel::YUVA422P
+            | Pixel::YUVA444P
+            | Pixel::YUVA420P9BE
+            | Pixel::YUVA420P9LE
+            | Pixel::YUVA422P9BE
+            | Pixel::YUVA422P9LE
+            | Pixel::YUVA444P9BE
+            | Pixel::YUVA444P9LE
+            | Pixel::YUVA420P10BE
+            | Pixel::YUVA420P10LE
+            | Pixel::YUVA422P10BE
+            | Pixel::YUVA422P10LE
+            | Pixel::YUVA444P10BE
+            | Pixel::YUVA444P10LE
+            | Pixel::YUVA420P16BE
+            | Pixel::YUVA420P16LE
+            | Pixel::YUVA422P16BE
+            | Pixel::YUVA422P16LE
+            | Pixel::YUVA444P16BE
+            | Pixel::YUVA444P16LE
+            | Pixel::RGBA
+            | Pixel::BGRA
+            | Pixel::ARGB
+            | Pixel::ABGR
+            | Pixel::RGBA64BE
+            | Pixel::RGBA64LE
+            | Pixel::BGRA64BE
+            | Pixel::BGRA64LE
+            | Pixel::GBRAP
+            | Pixel::GBRAP16BE
+            | Pixel::GBRAP16LE
+            | Pixel::YA8
+            | Pixel::YA16BE
+            | Pixel::YA16LE
+            | Pixel::PAL8
+    )
 }
 
 /// One open decode session on a source file (normally a 720p proxy).
@@ -71,13 +119,18 @@ pub struct SourceDecoder {
     path: PathBuf,
     ictx: Input,
     decoder: ffmpeg::codec::decoder::Video,
-    scaler: scaling::Context,
+    /// RGBA converter, (re)built to match the *decoded frames'* pixel
+    /// format — codec parameters can under-report it (libvpx-vp9 alpha
+    /// streams open as `yuv420p` and deliver `yuva420p` frames).
+    scaler: Option<(Pixel, scaling::Context)>,
     stream_index: usize,
     /// Stream time base, seconds per tick.
     tb: f64,
     fps: f64,
     width: u32,
     height: u32,
+    /// The last converted frame carried a real alpha channel.
+    frame_has_alpha: bool,
     /// Receive target — `receive_frame` unrefs it on *every* call
     /// (including `Eof`), so successful frames are swapped into
     /// `decoded` to survive the drain.
@@ -102,7 +155,7 @@ unsafe impl Send for SourceDecoder {}
 impl SourceDecoder {
     /// Open a decode session at position 0.
     pub fn open(path: &Path) -> Result<Self, MediaError> {
-        init_ffmpeg();
+        init_ffmpeg_once();
         let ictx = ffmpeg::format::input(path).map_err(|e| ff_err(path, "opening", e))?;
         let stream = ictx
             .streams()
@@ -130,6 +183,20 @@ impl SourceDecoder {
             });
         }
 
+        // WebM stores VP8/VP9 alpha in a side stream that only the libvpx
+        // decoders reassemble — the native decoders silently drop it. The
+        // muxer marks such streams with the `alpha_mode` tag.
+        let codec_id = stream.parameters().id();
+        let alpha_mode = stream
+            .metadata()
+            .get("alpha_mode")
+            .is_some_and(|v| v == "1");
+        let vpx_alpha_codec = match (alpha_mode, codec_id) {
+            (true, ffmpeg::codec::Id::VP9) => ffmpeg::codec::decoder::find_by_name("libvpx-vp9"),
+            (true, ffmpeg::codec::Id::VP8) => ffmpeg::codec::decoder::find_by_name("libvpx"),
+            _ => None,
+        };
+
         let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| ff_err(path, "reading codec parameters", e))?;
         // Frame threading pipelines the GOP catch-up after a keyframe
@@ -139,10 +206,17 @@ impl SourceDecoder {
             kind: ffmpeg::codec::threading::Type::Frame,
             count: 0,
         });
-        let decoder = ctx
-            .decoder()
-            .video()
-            .map_err(|e| ff_err(path, "opening decoder", e))?;
+        let decoder = match vpx_alpha_codec {
+            Some(codec) => ctx
+                .decoder()
+                .open_as(codec)
+                .and_then(|opened| opened.video())
+                .map_err(|e| ff_err(path, "opening libvpx alpha decoder", e))?,
+            None => ctx
+                .decoder()
+                .video()
+                .map_err(|e| ff_err(path, "opening decoder", e))?,
+        };
         let (width, height) = (decoder.width(), decoder.height());
         if width == 0 || height == 0 {
             return Err(MediaError::FfmpegFailed {
@@ -150,27 +224,18 @@ impl SourceDecoder {
                 message: "stream reports zero dimensions".into(),
             });
         }
-        let scaler = scaling::Context::get(
-            decoder.format(),
-            width,
-            height,
-            Pixel::RGBA,
-            width,
-            height,
-            scaling::Flags::BILINEAR,
-        )
-        .map_err(|e| ff_err(path, "creating scaler", e))?;
 
         Ok(Self {
             path: path.to_path_buf(),
             ictx,
             decoder,
-            scaler,
+            scaler: None,
             stream_index,
             tb,
             fps,
             width,
             height,
+            frame_has_alpha: false,
             incoming: ffmpeg::frame::Video::empty(),
             decoded: ffmpeg::frame::Video::empty(),
             rgba: ffmpeg::frame::Video::empty(),
@@ -263,8 +328,27 @@ impl SourceDecoder {
     }
 
     /// Convert the current decoded frame to RGBA and hand out a view.
+    /// The scaler is (re)built to match the frame's actual pixel format,
+    /// which codec parameters may under-report (VP9 alpha) or change
+    /// mid-stream.
     fn view(&mut self) -> Result<FrameView<'_>, MediaError> {
-        self.scaler
+        let format = self.decoded.format();
+        if !matches!(&self.scaler, Some((f, _)) if *f == format) {
+            let ctx = scaling::Context::get(
+                format,
+                self.decoded.width(),
+                self.decoded.height(),
+                Pixel::RGBA,
+                self.width,
+                self.height,
+                scaling::Flags::BILINEAR,
+            )
+            .map_err(|e| ff_err(&self.path, "creating scaler", e))?;
+            self.scaler = Some((format, ctx));
+            self.frame_has_alpha = pixel_has_alpha(format);
+        }
+        let (_, scaler) = self.scaler.as_mut().expect("scaler just ensured");
+        scaler
             .run(&self.decoded, &mut self.rgba)
             .map_err(|e| ff_err(&self.path, "converting to RGBA", e))?;
         Ok(FrameView {
@@ -274,6 +358,13 @@ impl SourceDecoder {
             stride: self.rgba.stride(0),
             data: self.rgba.data(0),
         })
+    }
+
+    /// Whether decoded frames carry a real alpha channel (straight
+    /// alpha, preserved through the RGBA conversion). Meaningful once a
+    /// frame has been converted; `false` before.
+    pub fn frame_has_alpha(&self) -> bool {
+        self.frame_has_alpha
     }
 
     /// Presentation time of the frame currently held in the decode
@@ -319,8 +410,13 @@ impl SourceDecoder {
     pub fn seek_to(&mut self, target: f64) -> Result<Option<FrameView<'_>>, MediaError> {
         let target = target.max(0.0);
         // The frame visible at `target` is the one on the floor grid
-        // point; decode until the *next* frame would start after it.
-        let wanted = (target * self.fps + PTS_EPS).floor() / self.fps;
+        // point. Compare *rounded frame indices*, not raw pts sums —
+        // containers with coarse time bases (matroska's 1 ms ticks)
+        // jitter each pts by up to half a tick, and the old
+        // `pts + 1/fps > wanted` rule stopped one frame short on webm.
+        // This is the same rounding the sampler (`compose::sample`)
+        // uses, so seek and sequential arrival land identically.
+        let needed = (target * self.fps + PTS_EPS).floor() as i64;
 
         let ts = (target * f64::from(AV_TIME_BASE)).round() as i64;
         self.ictx
@@ -339,9 +435,8 @@ impl SourceDecoder {
                 break;
             }
             have_frame = true;
-            // Stop when this frame is the floor frame: the next one
-            // would start after `wanted`.
-            if self.current_pts() + 1.0 / self.fps > wanted + PTS_EPS {
+            // Stop on the floor frame (nearest-index rounding).
+            if (self.current_pts() * self.fps + 0.5).floor() as i64 >= needed {
                 break;
             }
         }

@@ -10,6 +10,9 @@ export interface VideoStreamInfo {
   fps: number;
   /** Display-matrix rotation in degrees; 0 when absent. */
   rotation: number;
+  /** The stream carries an alpha channel (PNG/GIF transparency, WebM
+   * alpha_mode). Alpha media skips the proxy and decodes originals. */
+  hasAlpha: boolean;
 }
 
 export interface AudioStreamInfo {
@@ -24,11 +27,16 @@ export interface StreamSummary {
   codec: string;
 }
 
+/** Timeline semantics of a media file (mirrors cutty-engine's MediaKind). */
+export type MediaKind = "video" | "audio" | "image" | "gif";
+
 export interface MediaInfo {
   path: string;
+  /** Container duration in seconds; 0 for still images. */
   durationSec: number;
   container: string;
   sizeBytes: number;
+  kind: MediaKind;
   video: VideoStreamInfo | null;
   audio: AudioStreamInfo | null;
   streams: StreamSummary[];
@@ -45,6 +53,21 @@ export const PROXY_PROGRESS_EVENT = "proxy://progress";
 
 export function probeMedia(path: string): Promise<MediaInfo> {
   return invoke<MediaInfo>("probe_media", { path });
+}
+
+/** Packed audio peak data for a media file (see cutty_media::peaks for
+ * the binary layout). Generates on first call, then serves the cache. */
+export function mediaPeaks(path: string): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("media_peaks", { path });
+}
+
+/** Packed filmstrip sprite for a media file (see cutty_media::filmstrip
+ * for the binary layout). Generates on first call, then serves the cache. */
+export function mediaFilmstrip(
+  path: string,
+  durationHint?: number,
+): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("media_filmstrip", { path, durationHint });
 }
 
 export function generateProxy(

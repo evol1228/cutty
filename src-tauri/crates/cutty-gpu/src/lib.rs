@@ -108,6 +108,11 @@ pub struct Layer<'a> {
     /// 0.0..=1.0.
     pub opacity: f32,
     pub blend: BlendMode,
+    /// Whether every texel of `source` is fully opaque (alpha 255).
+    /// Decoded camera/proxy video is; PNG/GIF/WebM-alpha sources are
+    /// not. Only used to gate the transition direct fast path, which
+    /// would misread a translucent source as premultiplied.
+    pub opaque: bool,
 }
 
 /// Per-layer uniform data, `repr(C)` to match `LayerUniform` in WGSL.
@@ -764,10 +769,14 @@ impl Compositor {
                     // coverage ramp is 1 at every pixel center); scaled
                     // sources keep the premul pass so the ramp matches
                     // the plain-layer path. This is the hot preview case
-                    // (720p proxies on the 720p canvas). See the
-                    // `Visual` docs for the alpha caveat.
+                    // (720p proxies on the 720p canvas). Gated on
+                    // `opaque` because the transition shader reads its
+                    // inputs as premultiplied: a translucent source
+                    // (WebM-alpha, GIF, PNG) must go through its premul
+                    // intermediate.
                     let direct = |layer: &Layer| {
-                        layer.rotation_rad == 0.0
+                        layer.opaque
+                            && layer.rotation_rad == 0.0
                             && layer.opacity >= 1.0
                             && layer.center
                                 == (target.width as f32 / 2.0, target.height as f32 / 2.0)
@@ -1156,6 +1165,7 @@ mod tests {
             rotation_rad: 0.0,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            opaque: true,
         }
     }
 
@@ -1304,6 +1314,7 @@ mod tests {
             rotation_rad: 0.0,
             opacity: 0.5,
             blend: BlendMode::Normal,
+            opaque: true,
         }];
         comp.composite_and_read(&mut target, &layers, |out, stride| {
             assert_eq!(px(out, stride, 3, 4), [0, 0, 0, 255], "left: untouched");
@@ -1348,6 +1359,7 @@ mod tests {
             rotation_rad: std::f32::consts::FRAC_PI_2,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            opaque: true,
         }];
         comp.composite_and_read(&mut target, &layers, |out, stride| {
             // The white +x edge must now sit at the *bottom* (+y edge).
@@ -1493,6 +1505,7 @@ mod tests {
             rotation_rad: 0.4,
             opacity: 0.6,
             blend: BlendMode::Normal,
+            opaque: true,
         };
 
         let mut direct = comp.create_target(w, h);
@@ -1520,6 +1533,7 @@ mod tests {
                         rotation_rad: 0.4,
                         opacity: 0.6,
                         blend: BlendMode::Normal,
+                        opaque: true,
                     },
                     kind: transition_kind("fade").unwrap(),
                     progress: 0.0,
@@ -1568,6 +1582,7 @@ mod tests {
             rotation_rad: 0.0,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            opaque: true,
         };
         let mut target = comp.create_target(w, h);
         comp.composite_visuals(
@@ -1622,6 +1637,7 @@ mod tests {
             rotation_rad: 0.0,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            opaque: true,
         };
         let mut plain = comp.create_target(w, h);
         comp.composite(&mut plain, &[layer()], 0);
@@ -1686,6 +1702,7 @@ mod tests {
             full_frame_layer(&backdrop, w, h),
             Layer {
                 blend: BlendMode::PremultipliedOver,
+                opaque: true,
                 ..full_frame_layer(&overlay, w, h)
             },
         ];

@@ -137,8 +137,11 @@ pub fn engine_get_state(state: State<'_, EngineHandle>) -> EngineSnapshot {
     snapshot(&mut state.0.lock().expect("engine state poisoned"))
 }
 
-/// Register a media file in the project's media pool.
+/// Register a media file in the project's media pool. `kind` and
+/// `has_alpha` come from the probe (`probe_media`); older callers'
+/// video/audio semantics are the `Video`/`Audio` kinds.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn engine_add_media(
     app: AppHandle,
     state: State<'_, EngineHandle>,
@@ -146,9 +149,11 @@ pub fn engine_add_media(
     duration: f64,
     has_video: bool,
     has_audio: bool,
+    has_alpha: bool,
+    kind: cutty_engine::MediaKind,
 ) -> Result<u64, String> {
     mutate(&app, &state, |e| {
-        e.add_media(path, duration, has_video, has_audio)
+        e.add_media_with_kind(path, duration, has_video, has_audio, has_alpha, kind)
             .map(|m| m.0)
     })
 }

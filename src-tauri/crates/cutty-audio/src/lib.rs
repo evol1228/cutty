@@ -16,8 +16,10 @@ pub mod source;
 pub use clock::PlaybackClock;
 pub use error::AudioError;
 pub use mixer::{
-    soft_clip, AudioSegment, Easing, EnvelopePoint, FadeRamp, MixerTimeline, TimelineAudio,
-    VolumeEnvelope, SOFT_CLIP_KNEE,
+    soft_clip, symphonia_factory, AudioSegment, Easing, EnvelopePoint, FadeRamp, MixerTimeline,
+    SourceFactory, TimelineAudio, VolumeEnvelope, SOFT_CLIP_KNEE,
 };
-pub use offline::{render_timeline_to_wav, EXPORT_SAMPLE_RATE};
+pub use offline::{
+    render_timeline_to_wav, render_timeline_to_wav_with_factory, EXPORT_SAMPLE_RATE,
+};
 pub use source::{AudioSource, SymphoniaSource};

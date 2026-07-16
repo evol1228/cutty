@@ -72,6 +72,14 @@ pub enum EngineError {
     #[error("media {media:?} is incompatible with track {track:?}")]
     IncompatibleMedia { track: TrackId, media: MediaId },
 
+    /// A media pool entry is malformed (kind inconsistent with its
+    /// streams, or an invalid duration).
+    #[error("invalid media {media:?}: {reason}")]
+    InvalidMedia {
+        media: MediaId,
+        reason: &'static str,
+    },
+
     /// Split point is not strictly inside the clip.
     #[error("split point {at} is outside clip {clip:?} (must be strictly inside)")]
     SplitOutOfRange { clip: ClipId, at: f64 },

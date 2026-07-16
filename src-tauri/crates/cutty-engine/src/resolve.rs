@@ -165,15 +165,24 @@ pub struct TransitionSpan {
 ///   zero would erase the transition entirely).
 pub fn transition_duration_limit(project: &Project, a: &Clip, b: &Clip) -> f64 {
     let mut limit = a.duration().min(b.duration());
+    // Stills and loops have unlimited handles on both sides.
     if let Some(media) = a.media_id.and_then(|id| project.media(id)) {
-        let post_handle = (media.duration - a.source_out) / a.speed;
-        if post_handle > TOUCH_EPS {
-            limit = limit.min(2.0 * post_handle);
+        if !media.unbounded_source() {
+            let post_handle = (media.duration - a.source_out) / a.speed;
+            if post_handle > TOUCH_EPS {
+                limit = limit.min(2.0 * post_handle);
+            }
         }
     }
-    let pre_handle = b.source_in / b.speed;
-    if pre_handle > TOUCH_EPS {
-        limit = limit.min(2.0 * pre_handle);
+    let b_bounded = b
+        .media_id
+        .and_then(|id| project.media(id))
+        .is_none_or(|m| !m.unbounded_source());
+    if b_bounded {
+        let pre_handle = b.source_in / b.speed;
+        if pre_handle > TOUCH_EPS {
+            limit = limit.min(2.0 * pre_handle);
+        }
     }
     limit
 }

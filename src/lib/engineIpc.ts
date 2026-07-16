@@ -12,12 +12,17 @@ export interface ProjectSettings {
   fps: number;
 }
 
+export type MediaKind = "video" | "audio" | "image" | "gif";
+
 export interface MediaRef {
   id: number;
   path: string;
+  /** Seconds; 0 exactly on still images. */
   duration: number;
   hasVideo: boolean;
   hasAudio: boolean;
+  hasAlpha: boolean;
+  kind: MediaKind;
 }
 
 export type TrackKind = "video" | "audio" | "text";
@@ -184,12 +189,16 @@ export function engineAddMedia(
   duration: number,
   hasVideo: boolean,
   hasAudio: boolean,
+  hasAlpha: boolean,
+  kind: MediaKind,
 ): Promise<number> {
   return invoke<number>("engine_add_media", {
     path,
     duration,
     hasVideo,
     hasAudio,
+    hasAlpha,
+    kind,
   });
 }
 

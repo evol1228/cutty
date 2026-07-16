@@ -9,12 +9,16 @@ import ProjectDialogs from "./components/ProjectDialogs";
 import ExportDialog from "./components/ExportDialog";
 import StartOverlay from "./components/StartOverlay";
 import { startSessionSync } from "./lib/projectActions";
+import { maybeRunBench } from "./lib/bench";
 import { startExportSync } from "./state/exportStore";
 
 function App() {
   useEffect(() => {
     startSessionSync();
     startExportSync();
+    // No-op unless the process was started with CUTTY_BENCH=1 (dev perf
+    // acceptance — see lib/bench.ts).
+    void maybeRunBench();
   }, []);
 
   return (

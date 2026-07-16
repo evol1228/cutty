@@ -104,6 +104,78 @@ pub async fn media_thumbnail(
     .map_err(|e| e.to_string())
 }
 
+/// Generate (or fetch from cache) the filmstrip sprite for a media file
+/// and return the packed bytes directly (binary IPC — see
+/// `cutty_media::filmstrip` for the format). Decode-heavy on a miss;
+/// runs on the blocking pool like proxies.
+#[tauri::command]
+pub async fn media_filmstrip(
+    path: String,
+    duration_hint: Option<f64>,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cutty_media::generate_filmstrip(path.as_ref(), duration_hint)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(tauri::ipc::Response::new)
+    .map_err(|e| e.to_string())
+}
+
+/// Generate (or fetch from cache) the audio peak data for a media file
+/// and return the packed bytes directly (binary IPC — see
+/// `cutty_media::peaks` for the format). The timeline draws waveforms
+/// from this; generation decodes through the symphonia→libav chain.
+#[tauri::command]
+pub async fn media_peaks(path: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || cutty_media::generate_peaks(path.as_ref()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Dev bench mode (timeline perf acceptance): when `CUTTY_BENCH=1`, the
+/// frontend runs the full-visuals timeline benchmark autonomously at
+/// startup — importing the `:`-separated `CUTTY_BENCH_MEDIA` files,
+/// seeding the 3-video + 2-audio × 62-clip layout, panning for a few
+/// seconds, and reporting draw stats via [`bench_report`]. `None` in
+/// normal runs (the frontend does nothing).
+#[tauri::command]
+pub fn bench_config() -> Option<Vec<String>> {
+    if std::env::var("CUTTY_BENCH").ok()?.trim() != "1" {
+        return None;
+    }
+    Some(
+        std::env::var("CUTTY_BENCH_MEDIA")
+            .ok()?
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    )
+}
+
+/// Dev bench sink: save a PNG snapshot of the timeline canvas next to
+/// the report (visual verification without any screen capture).
+#[tauri::command]
+pub fn bench_snapshot(png: Vec<u8>) -> Result<(), String> {
+    let out = std::env::var("CUTTY_BENCH_OUT")
+        .unwrap_or_else(|_| "/tmp/cutty-bench.json".to_string());
+    std::fs::write(format!("{out}.png"), png).map_err(|e| e.to_string())
+}
+
+/// Dev bench sink: write the frontend's JSON report to
+/// `CUTTY_BENCH_OUT` (default `/tmp/cutty-bench.json`) and exit.
+#[tauri::command]
+pub fn bench_report(report: String) -> Result<(), String> {
+    let out = std::env::var("CUTTY_BENCH_OUT")
+        .unwrap_or_else(|_| "/tmp/cutty-bench.json".to_string());
+    std::fs::write(&out, report).map_err(|e| e.to_string())?;
+    eprintln!("cutty-bench: report written to {out}");
+    std::process::exit(0);
+}
+
 /// Which of the given source paths currently exist (missing-media checks).
 #[tauri::command]
 pub async fn paths_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
