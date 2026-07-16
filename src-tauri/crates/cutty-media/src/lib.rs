@@ -25,7 +25,9 @@ pub(crate) mod test_support;
 pub mod thumbnail;
 pub mod tools;
 
-pub use compose::{FrameSlice, RenderStats, TimelineRenderer};
+pub use compose::{
+    measure_text_block, text_font_families, FrameSlice, RenderStats, TimelineRenderer,
+};
 pub use cutty_gpu::{transition_kind, transitions, TransitionDef};
 pub use decode::{FrameView, SourceDecoder};
 pub use encoders::{detected_h264_encoder, start_encoder_detection, H264Encoder};

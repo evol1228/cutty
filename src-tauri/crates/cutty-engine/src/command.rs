@@ -9,7 +9,7 @@
 
 use crate::error::EngineError;
 use crate::model::{
-    BlendMode, Clip, ClipId, MediaRef, Project, Track, TrackId, Transform, Transition,
+    BlendMode, Clip, ClipId, MediaRef, Project, TextSpec, Track, TrackId, Transform, Transition,
 };
 
 /// A reversible timeline mutation.
@@ -756,6 +756,50 @@ impl Command for SetClipVolume {
 
     fn name(&self) -> &'static str {
         "SetClipVolume"
+    }
+}
+
+/// Replace a text clip's whole payload (content and/or style). One
+/// command for both keeps the wire simple: the Inspector coalesces a
+/// typing burst into one transaction, and any single change is exactly
+/// reversible from the captured old payload.
+#[derive(Debug, Clone)]
+pub struct SetClipText {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub old: TextSpec,
+    pub new: TextSpec,
+}
+
+impl Command for SetClipText {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let track = project
+            .track_mut(self.track_id)
+            .ok_or(EngineError::UnknownTrack(self.track_id))?;
+        let clip = track
+            .clip_mut(self.clip_id)
+            .ok_or(EngineError::UnknownClip(self.clip_id))?;
+        if clip.text.is_none() {
+            return Err(EngineError::InvalidText {
+                clip: self.clip_id,
+                reason: "not a text clip",
+            });
+        }
+        clip.text = Some(self.new.clone());
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(SetClipText {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            old: self.new.clone(),
+            new: self.old.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "SetClipText"
     }
 }
 

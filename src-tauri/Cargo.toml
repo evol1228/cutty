@@ -4,6 +4,7 @@ members = [
     "crates/cutty-media",
     "crates/cutty-gpu",
     "crates/cutty-audio",
+    "crates/cutty-text",
 ]
 
 [workspace.package]

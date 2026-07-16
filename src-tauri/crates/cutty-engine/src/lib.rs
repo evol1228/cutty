@@ -42,21 +42,23 @@ pub use autosave::{
 pub use command::{
     AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, JoinClips,
     MoveClip, MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RestoreMedia, RippleDelete,
-    RippleInsert, RippleMove, SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume,
-    SetTrackFlag, SetTransition, SplitClip, TrackFlag, TrimClip,
+    RippleInsert, RippleMove, SetClipBlendMode, SetClipOpacity, SetClipText, SetClipTransform,
+    SetClipVolume, SetTrackFlag, SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;
 pub use model::{
-    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track,
-    TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
+    clips_touch, parse_hex_color, BlendMode, Clip, ClipId, MediaId, MediaRef, Project,
+    ProjectSettings, TextAlign, TextSpec, TextStyle, Track, TrackId, TrackKind, Transform,
+    Transition, EPS, MAX_TEXT_CONTENT_BYTES, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
     MIN_TRANSITION_DURATION, TOUCH_EPS,
 };
 pub use project_file::ProjectFileError;
 pub use recents::RecentProject;
 pub use resolve::{
-    next_boundary_after, resolve, resolve_track_visuals, resolve_video_layers, timeline_end,
-    transition_duration_limit, transition_spans, ActiveClip, TrackVisual, TransitionSpan,
+    next_boundary_after, resolve, resolve_text_layers, resolve_track_visuals, resolve_video_layers,
+    timeline_end, transition_duration_limit, transition_spans, ActiveClip, TrackVisual,
+    TransitionSpan,
 };
 pub use snap::{snap, snap_candidates, snap_clip_move, snap_time, SnappedMove};
 

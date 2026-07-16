@@ -1,19 +1,25 @@
-// Right-hand inspector. Video tab (transform / opacity / blend) and Audio
-// tab (per-clip volume) are live; the rest are Phase 3+ placeholders.
-// Every slider/scrub drag is wrapped in an engine transaction so a whole
-// gesture is exactly one undo entry — the same contract as timeline drags.
+// Right-hand inspector. Video tab (transform / opacity / blend), Audio
+// tab (per-clip volume), and Text tab (content + full style) are live;
+// the rest are Phase 3+ placeholders. Every slider/scrub drag is wrapped
+// in an engine transaction so a whole gesture is exactly one undo entry
+// — and typing in the Text tab debounces a whole burst into one entry.
 
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  cachedFontFamilies,
   engineBeginTransaction,
   engineCommitTransaction,
   engineSetClipBlendMode,
   engineSetClipOpacity,
+  engineSetClipText,
   engineSetClipTransform,
   engineSetClipVolume,
   BLEND_MODES,
   type BlendMode,
   type Clip,
+  type TextAlign,
+  type TextSpec,
+  type TextStyle,
   type Track,
   type Transform,
 } from "../lib/engineIpc";
@@ -21,7 +27,7 @@ import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
 import SelectField from "./ui/SelectField";
 
-const TABS = ["Video", "Audio", "Speed", "Animation", "Adjustment"] as const;
+const TABS = ["Video", "Audio", "Text", "Speed", "Animation", "Adjustment"] as const;
 type Tab = (typeof TABS)[number];
 
 const BLEND_LABELS: Record<BlendMode, string> = {
@@ -232,6 +238,74 @@ function GestureSlider({
 }
 
 // ---------------------------------------------------------------------
+// Shared sections
+// ---------------------------------------------------------------------
+
+/** Position / scale / rotation grid — video and text clips share the
+ * same transform placement. */
+function TransformControls({ clip }: { clip: Clip }) {
+  const applyTransform = (t: Transform) => {
+    void engineSetClipTransform(clip.id, t).catch(() => undefined);
+  };
+  return (
+    <section>
+      <div className="mb-2 flex items-center justify-between">
+        <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Transform
+        </h3>
+        <button
+          onClick={() =>
+            // A single command — its own undo entry.
+            applyTransform({ x: 0, y: 0, scale: 1, rotation: 0 })
+          }
+          className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-zinc-800"
+        >
+          Reset
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-3">
+        <DragNumber
+          label="Position X"
+          value={clip.transform.x}
+          sensitivity={1}
+          decimals={0}
+          suffix="px"
+          commit={(x) => applyTransform({ ...clip.transform, x })}
+        />
+        <DragNumber
+          label="Position Y"
+          value={clip.transform.y}
+          sensitivity={1}
+          decimals={0}
+          suffix="px"
+          commit={(y) => applyTransform({ ...clip.transform, y })}
+        />
+        <DragNumber
+          label="Scale"
+          value={clip.transform.scale * 100}
+          sensitivity={0.5}
+          decimals={0}
+          suffix="%"
+          min={1}
+          max={1000}
+          commit={(pct) =>
+            applyTransform({ ...clip.transform, scale: pct / 100 })
+          }
+        />
+        <DragNumber
+          label="Rotation"
+          value={clip.transform.rotation}
+          sensitivity={0.5}
+          decimals={1}
+          suffix="°"
+          commit={(rotation) => applyTransform({ ...clip.transform, rotation })}
+        />
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------
 // Video tab
 // ---------------------------------------------------------------------
 
@@ -248,66 +322,9 @@ function VideoTab() {
     return <Placeholder text="This clip has no video" hint="Video" />;
   }
 
-  const applyTransform = (t: Transform) => {
-    void engineSetClipTransform(clip.id, t).catch(() => undefined);
-  };
-
   return (
     <div className="w-full space-y-5 overflow-y-auto p-4">
-      <section>
-        <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-zinc-400">
-            Transform
-          </h3>
-          <button
-            onClick={() =>
-              // A single command — its own undo entry.
-              applyTransform({ x: 0, y: 0, scale: 1, rotation: 0 })
-            }
-            className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-zinc-800"
-          >
-            Reset
-          </button>
-        </div>
-        <div className="grid grid-cols-2 gap-x-3 gap-y-3">
-          <DragNumber
-            label="Position X"
-            value={clip.transform.x}
-            sensitivity={1}
-            decimals={0}
-            suffix="px"
-            commit={(x) => applyTransform({ ...clip.transform, x })}
-          />
-          <DragNumber
-            label="Position Y"
-            value={clip.transform.y}
-            sensitivity={1}
-            decimals={0}
-            suffix="px"
-            commit={(y) => applyTransform({ ...clip.transform, y })}
-          />
-          <DragNumber
-            label="Scale"
-            value={clip.transform.scale * 100}
-            sensitivity={0.5}
-            decimals={0}
-            suffix="%"
-            min={1}
-            max={1000}
-            commit={(pct) =>
-              applyTransform({ ...clip.transform, scale: pct / 100 })
-            }
-          />
-          <DragNumber
-            label="Rotation"
-            value={clip.transform.rotation}
-            sensitivity={0.5}
-            decimals={1}
-            suffix="°"
-            commit={(rotation) => applyTransform({ ...clip.transform, rotation })}
-          />
-        </div>
-      </section>
+      <TransformControls clip={clip} />
 
       <section>
         <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
@@ -409,6 +426,330 @@ function AudioTab() {
   );
 }
 
+// ---------------------------------------------------------------------
+// Text tab
+// ---------------------------------------------------------------------
+
+/** Idle time (ms) before a typing/color burst commits its undo entry. */
+const TEXT_COMMIT_MS = 700;
+
+/**
+ * A debounced engine transaction: `touch()` on every change opens the
+ * transaction (first change) and re-arms the idle timer; the commit
+ * lands once the burst pauses — so a whole typing burst is exactly one
+ * undo entry while every keystroke still previews live. `flush()`
+ * commits immediately (blur / unmount / clip switch).
+ */
+function useDebouncedTransaction(delayMs = TEXT_COMMIT_MS) {
+  const open = useRef(false);
+  const timer = useRef<number>(0);
+
+  const flush = useCallback(() => {
+    window.clearTimeout(timer.current);
+    if (!open.current) return;
+    open.current = false;
+    void engineCommitTransaction().catch(() => undefined);
+  }, []);
+
+  const touch = useCallback(() => {
+    if (!open.current) {
+      open.current = true;
+      void engineBeginTransaction().catch(() => {
+        open.current = false;
+      });
+    }
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(flush, delayMs);
+  }, [delayMs, flush]);
+
+  // Unmount (clip switch, tab switch) commits whatever is pending.
+  useEffect(() => flush, [flush]);
+  return { touch, flush };
+}
+
+/** Native color input with the debounced-transaction contract (a picker
+ * drag streams many changes; one undo entry per pause). */
+function ColorField({
+  id,
+  label,
+  value,
+  apply,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  apply: (hex: string) => void;
+}) {
+  const burst = useDebouncedTransaction();
+  return (
+    <label className="block" htmlFor={id}>
+      <span className="mb-1 block text-[11px] text-zinc-500">{label}</span>
+      <div className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-1.5 py-1">
+        <input
+          type="color"
+          id={id}
+          value={value.slice(0, 7)}
+          onChange={(e) => {
+            burst.touch();
+            apply(e.target.value);
+          }}
+          onBlur={burst.flush}
+          className="h-6 w-8 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0"
+        />
+        <span className="text-xs uppercase tabular-nums text-zinc-400">
+          {value.slice(0, 7)}
+        </span>
+      </div>
+    </label>
+  );
+}
+
+const WEIGHT_OPTIONS = [
+  { value: "400", label: "Regular" },
+  { value: "500", label: "Medium" },
+  { value: "600", label: "SemiBold" },
+  { value: "700", label: "Bold" },
+  { value: "800", label: "ExtraBold" },
+  { value: "900", label: "Black" },
+];
+
+const ALIGN_OPTIONS: Array<{ value: TextAlign; glyph: string; title: string }> = [
+  { value: "left", glyph: "⯇", title: "Align left" },
+  { value: "center", glyph: "☰", title: "Align center" },
+  { value: "right", glyph: "⯈", title: "Align right" },
+];
+
+/** All controls for one text clip. Keyed by clip id from TextTab, so a
+ * selection switch unmounts (flushing any pending typing burst). */
+function TextControls({ clip, text }: { clip: Clip; text: TextSpec }) {
+  const [families, setFamilies] = useState<string[]>([]);
+  const typing = useDebouncedTransaction();
+  // Local echo while typing: the engine snapshot chases keystrokes over
+  // IPC; the textarea must not lag or reorder.
+  const [draft, setDraft] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    cachedFontFamilies()
+      .then((list) => {
+        if (alive) setFamilies(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const send = (next: TextSpec) => {
+    void engineSetClipText(clip.id, next).catch(() => undefined);
+  };
+  const style = text.style;
+  const setStyle = (patch: Partial<TextStyle>) => {
+    send({ ...text, style: { ...style, ...patch } });
+  };
+
+  const familyOptions = [
+    { value: "", label: "Default (Sans)" },
+    { value: "serif", label: "Serif" },
+    { value: "monospace", label: "Monospace" },
+    ...families.map((f) => ({ value: f, label: f })),
+  ];
+
+  return (
+    <div className="w-full space-y-5 overflow-y-auto p-4">
+      <section>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Content
+        </h3>
+        <textarea
+          value={draft ?? text.content}
+          rows={3}
+          spellCheck={false}
+          placeholder="Type your text…"
+          onChange={(e) => {
+            setDraft(e.target.value);
+            typing.touch();
+            send({ ...text, content: e.target.value });
+          }}
+          onBlur={() => {
+            typing.flush();
+            setDraft(null);
+          }}
+          className="w-full resize-y rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-zinc-500"
+        />
+      </section>
+
+      <section>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Font
+        </h3>
+        <div className="space-y-3">
+          <SelectField
+            id="text-family"
+            value={style.fontFamily}
+            onChange={(fontFamily) => setStyle({ fontFamily })}
+            options={familyOptions}
+          />
+          <div className="grid grid-cols-2 gap-x-3">
+            <div>
+              <span className="mb-1 block text-[11px] text-zinc-500">Weight</span>
+              <SelectField
+                id="text-weight"
+                value={String(style.weight)}
+                onChange={(w) => setStyle({ weight: Number(w) })}
+                options={WEIGHT_OPTIONS}
+              />
+            </div>
+            <DragNumber
+              label="Size"
+              value={style.fontSize}
+              sensitivity={0.5}
+              decimals={0}
+              suffix="px"
+              min={8}
+              max={800}
+              commit={(fontSize) => setStyle({ fontSize })}
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            {ALIGN_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                title={opt.title}
+                onClick={() => setStyle({ align: opt.value })}
+                className={`flex-1 rounded-md border px-2 py-1 text-sm ${
+                  style.align === opt.value
+                    ? "border-sky-600 bg-sky-600/20 text-sky-300"
+                    : "border-zinc-700 text-zinc-400 hover:bg-zinc-800"
+                }`}
+              >
+                {opt.glyph}
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Color &amp; stroke
+        </h3>
+        <div className="grid grid-cols-2 gap-x-3 gap-y-3">
+          <ColorField
+            id="text-fill"
+            label="Fill"
+            value={style.fill}
+            apply={(fill) => setStyle({ fill })}
+          />
+          <ColorField
+            id="text-stroke-color"
+            label="Stroke"
+            value={style.strokeColor}
+            apply={(strokeColor) => setStyle({ strokeColor })}
+          />
+          <DragNumber
+            label="Stroke width"
+            value={style.strokeWidth}
+            sensitivity={0.2}
+            decimals={1}
+            suffix="px"
+            min={0}
+            max={60}
+            commit={(strokeWidth) => setStyle({ strokeWidth })}
+          />
+        </div>
+      </section>
+
+      <section>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Shadow
+        </h3>
+        <div className="space-y-3">
+          <GestureSlider
+            id="text-shadow-alpha"
+            label="Opacity"
+            value={style.shadowAlpha}
+            min={0}
+            max={1}
+            step={0.01}
+            format={(v) => `${Math.round(v * 100)}%`}
+            apply={(shadowAlpha) => setStyle({ shadowAlpha })}
+          />
+          <div className="grid grid-cols-3 items-end gap-x-3">
+            <ColorField
+              id="text-shadow-color"
+              label="Color"
+              value={style.shadowColor}
+              apply={(shadowColor) => setStyle({ shadowColor })}
+            />
+            <DragNumber
+              label="Offset X"
+              value={style.shadowOffsetX}
+              sensitivity={0.2}
+              decimals={1}
+              suffix="px"
+              min={-200}
+              max={200}
+              commit={(shadowOffsetX) => setStyle({ shadowOffsetX })}
+            />
+            <DragNumber
+              label="Offset Y"
+              value={style.shadowOffsetY}
+              sensitivity={0.2}
+              decimals={1}
+              suffix="px"
+              min={-200}
+              max={200}
+              commit={(shadowOffsetY) => setStyle({ shadowOffsetY })}
+            />
+          </div>
+        </div>
+      </section>
+
+      <TransformControls clip={clip} />
+
+      <section>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+          Blending
+        </h3>
+        <GestureSlider
+          id="text-opacity"
+          label="Opacity"
+          value={clip.opacity}
+          min={0}
+          max={1}
+          step={0.01}
+          format={(v) => `${Math.round(v * 100)}%`}
+          apply={(v) => {
+            void engineSetClipOpacity(clip.id, v).catch(() => undefined);
+          }}
+        />
+      </section>
+    </div>
+  );
+}
+
+function TextTab() {
+  const selected = useSelectedClip();
+  if (selected === null || !selected.clip.text) {
+    return (
+      <Placeholder
+        text="Select a text clip — or press T to add one at the playhead"
+        hint="Text"
+      />
+    );
+  }
+  // Keyed by clip id: switching clips remounts and flushes any pending
+  // typing burst into its own undo entry.
+  return (
+    <TextControls
+      key={selected.clip.id}
+      clip={selected.clip}
+      text={selected.clip.text}
+    />
+  );
+}
+
 function Placeholder({ text, hint }: { text: string; hint: string }) {
   return (
     <div className="flex flex-1 items-center justify-center p-4 text-center text-zinc-600">
@@ -423,6 +764,15 @@ function Placeholder({ text, hint }: { text: string; hint: string }) {
 
 function Inspector() {
   const [tab, setTab] = useState<Tab>("Video");
+  const selected = useSelectedClip();
+  const isText = selected?.clip.text != null;
+
+  // Context-sensitive tab, derived (no state sync): a selected text clip
+  // shows Text where Video would show (Video is meaningless for text),
+  // and Text falls back to Video when the selection isn't text. Every
+  // other manual tab choice is honored as-is.
+  const displayTab: Tab =
+    isText && tab === "Video" ? "Text" : !isText && tab === "Text" ? "Video" : tab;
 
   return (
     <aside className="flex w-80 shrink-0 flex-col border-l border-zinc-800 bg-zinc-900">
@@ -432,7 +782,7 @@ function Inspector() {
             key={t}
             onClick={() => setTab(t)}
             className={`rounded-t px-2.5 py-1.5 text-xs ${
-              tab === t
+              displayTab === t
                 ? "bg-zinc-800 text-zinc-100"
                 : "text-zinc-500 hover:text-zinc-300"
             }`}
@@ -441,12 +791,17 @@ function Inspector() {
           </button>
         ))}
       </nav>
-      {tab === "Video" ? (
+      {displayTab === "Video" ? (
         <VideoTab />
-      ) : tab === "Audio" ? (
+      ) : displayTab === "Audio" ? (
         <AudioTab />
+      ) : displayTab === "Text" ? (
+        <TextTab />
       ) : (
-        <Placeholder text={`${tab} controls land in Phase 3+`} hint={tab} />
+        <Placeholder
+          text={`${displayTab} controls land in Phase 3+`}
+          hint={displayTab}
+        />
       )}
     </aside>
   );

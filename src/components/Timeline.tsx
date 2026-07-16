@@ -180,7 +180,8 @@ function TrackContextMenu({
 
   if (!track) return null;
   const sameKind = tracks.filter((t) => t.kind === track.kind);
-  const lastOfKind = sameKind.length <= 1;
+  // Text lanes exist on demand — the last one is removable.
+  const lastOfKind = sameKind.length <= 1 && track.kind !== "text";
 
   const run = (op: Promise<unknown>) => {
     op.catch((err) => toast(String(err), "error"));
@@ -198,19 +199,19 @@ function TrackContextMenu({
         style={{ left: menu.x, top: Math.min(menu.y, window.innerHeight - 180) }}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        {track.kind === "video" ? (
-          <button
-            className={ITEM}
-            onClick={() => run(engineAddTrack("video", index))}
-          >
-            Add video track above
-          </button>
-        ) : (
+        {track.kind === "audio" ? (
           <button
             className={ITEM}
             onClick={() => run(engineAddTrack("audio", index + 1))}
           >
             Add audio track below
+          </button>
+        ) : (
+          <button
+            className={ITEM}
+            onClick={() => run(engineAddTrack(track.kind, index))}
+          >
+            Add {track.kind} track above
           </button>
         )}
         <div className="my-1 h-px bg-zinc-800" />
@@ -257,17 +258,21 @@ function TrackHeader({
   track: Track;
   onMenu: (e: React.MouseEvent) => void;
 }) {
+  // Text lanes are slim: name and flags share one row.
+  const compact = track.kind === "text";
   return (
     <div
       style={{ height: laneHeight(track.kind) }}
       onContextMenu={onMenu}
-      className={`flex shrink-0 flex-col justify-center gap-0.5 border-b border-zinc-800/60 px-2 ${
-        track.hidden ? "opacity-60" : ""
-      }`}
+      className={`flex shrink-0 border-b border-zinc-800/60 px-2 ${
+        compact
+          ? "flex-row items-center justify-between gap-1"
+          : "flex-col justify-center gap-0.5"
+      } ${track.hidden ? "opacity-60" : ""}`}
     >
-      <div className="flex items-center justify-between">
+      <div className="flex min-w-0 items-center justify-between gap-1">
         <span
-          className={`text-xs font-medium ${
+          className={`truncate text-xs font-medium ${
             track.locked ? "text-zinc-500" : "text-zinc-300"
           }`}
         >
@@ -286,15 +291,17 @@ function TrackHeader({
         >
           <LockIcon locked={track.locked} />
         </FlagButton>
-        <FlagButton
-          active={track.muted}
-          activeClass="text-red-400"
-          title={track.muted ? "Unmute track" : "Mute track audio"}
-          onClick={() => setFlag(track, "muted", !track.muted)}
-        >
-          <MuteIcon muted={track.muted} />
-        </FlagButton>
-        {track.kind === "video" && (
+        {track.kind !== "text" && (
+          <FlagButton
+            active={track.muted}
+            activeClass="text-red-400"
+            title={track.muted ? "Unmute track" : "Mute track audio"}
+            onClick={() => setFlag(track, "muted", !track.muted)}
+          >
+            <MuteIcon muted={track.muted} />
+          </FlagButton>
+        )}
+        {track.kind !== "audio" && (
           <FlagButton
             active={track.hidden}
             activeClass="text-sky-400"

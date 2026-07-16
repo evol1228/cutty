@@ -21,9 +21,11 @@ import {
 } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
+import { addTextAtPlayhead } from "../timeline/actions";
+import { TEXT_PRESETS } from "../lib/textPresets";
 import { beginPoolDrag, beginTransitionDrag } from "../timeline/poolDrag";
 
-const TABS = ["Import", "Transitions", "Library"] as const;
+const TABS = ["Import", "Text", "Transitions", "Library"] as const;
 type Tab = (typeof TABS)[number];
 
 
@@ -196,6 +198,53 @@ function PoolItemCard({ item }: { item: PoolItem }) {
   );
 }
 
+/** The Text tab: "Add text" plus the built-in style presets. Clicking a
+ * tile drops a clip at the playhead (the engine picks/creates the lane);
+ * `T` on the timeline does the same with the default style. */
+function TextPanel() {
+  const hasProject = useProjectStore((s) => s.project !== null);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3 p-3">
+      <button
+        onClick={() => void addTextAtPlayhead()}
+        disabled={!hasProject}
+        className="shrink-0 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-200 hover:bg-zinc-700 disabled:cursor-default disabled:text-zinc-600 disabled:hover:bg-zinc-800"
+        title="Add a default text clip at the playhead (T)"
+      >
+        + Add text
+      </button>
+      <p className="shrink-0 text-[11px] leading-snug text-zinc-500">
+        Click a style to add it at the playhead. Press{" "}
+        <kbd className="rounded border border-zinc-700 bg-zinc-800 px-1">T</kbd>{" "}
+        on the timeline for the default style.
+      </p>
+      <div className="grid min-h-0 flex-1 auto-rows-min grid-cols-2 gap-2 overflow-y-auto pb-2">
+        {TEXT_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            onClick={() => void addTextAtPlayhead(preset)}
+            disabled={!hasProject}
+            className="group text-left disabled:cursor-default"
+            title={`${preset.label} — add at the playhead`}
+          >
+            <div className="flex aspect-video items-center justify-center overflow-hidden rounded-md border border-zinc-800 bg-gradient-to-br from-zinc-900 via-zinc-950 to-black px-1.5 group-hover:border-orange-600">
+              <span
+                className="max-w-full select-none whitespace-pre text-center text-sm leading-tight"
+                style={preset.css}
+              >
+                {preset.sampleContent}
+              </span>
+            </div>
+            <div className="mt-1 truncate text-center text-[11px] text-zinc-300">
+              {preset.label}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** A schematic per-kind glyph: A→B panels with the transition's motion. */
 function TransitionGlyph({ id }: { id: string }) {
   const arrow = (d: string) => (
@@ -352,7 +401,9 @@ function MediaPool() {
           </button>
         ))}
       </nav>
-      {tab === "Transitions" ? (
+      {tab === "Text" ? (
+        <TextPanel />
+      ) : tab === "Transitions" ? (
         <TransitionsPanel />
       ) : tab === "Import" ? (
         <div

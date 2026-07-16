@@ -180,7 +180,10 @@ fn spans_center_on_the_cut_and_clamp_live() {
     assert_eq!(spans.len(), 1);
     let s = &spans[0];
     assert!((s.end - s.start - 0.4).abs() < 1e-9, "span {s:?}");
-    assert!((s.requested - 1.0).abs() < 1e-9, "stored duration untouched");
+    assert!(
+        (s.requested - 1.0).abs() < 1e-9,
+        "stored duration untouched"
+    );
 
     // Undoing the trim restores the full span — nothing stored changed.
     f.engine.undo().unwrap();
@@ -221,7 +224,9 @@ fn track_visuals_pair_inside_the_span_with_extended_sources() {
     // Inside, post-cut (t = 2.25): A extended past its source_out
     // (3.0 → 3.25 — handle media), B normal. Progress 0.75.
     match &resolve_track_visuals(p, 2.25)[..] {
-        [TrackVisual::Transition { from, to, progress, .. }] => {
+        [TrackVisual::Transition {
+            from, to, progress, ..
+        }] => {
             assert!((from.source_time - 3.25).abs() < 1e-9);
             assert!((to.source_time - 5.25).abs() < 1e-9);
             assert!((progress - 0.75).abs() < 1e-9);
@@ -257,7 +262,9 @@ fn consecutive_transitions_do_not_overlap() {
     let p = f.engine.project();
     for (t, from, to) in [(1.5, a, b), (2.9, a, b), (3.1, b, c), (4.9, b, c)] {
         match &resolve_track_visuals(p, t)[..] {
-            [TrackVisual::Transition { from: fr, to: t2, .. }] => {
+            [TrackVisual::Transition {
+                from: fr, to: t2, ..
+            }] => {
                 assert_eq!((fr.clip_id, t2.clip_id), (from, to), "at {t}");
             }
             other => panic!("expected pair at {t}, got {other:?}"),
@@ -355,7 +362,10 @@ fn moving_either_neighbor_away_prunes() {
     assert_eq!(serialized(&f.engine), before);
 
     // Moving to another track breaks the cut the same way.
-    let v2 = f.engine.add_track(cutty_engine::TrackKind::Video, 0).unwrap();
+    let v2 = f
+        .engine
+        .add_track(cutty_engine::TrackKind::Video, 0)
+        .unwrap();
     f.engine.move_clip_to_track(b, v2, 2.0).unwrap();
     assert_eq!(transition_of(&f, a), None);
 }

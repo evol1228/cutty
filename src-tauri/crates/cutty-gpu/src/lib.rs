@@ -40,8 +40,8 @@ pub enum GpuError {
 }
 
 /// How a layer combines with the accumulated layers below it. Mirrors the
-/// engine's clip-level enum; kept separate so this crate stays free of
-/// editor model types.
+/// engine's clip-level enum (plus the premultiplied path); kept separate
+/// so this crate stays free of editor model types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
     #[default]
@@ -50,6 +50,12 @@ pub enum BlendMode {
     Screen,
     Overlay,
     Add,
+    /// Straight "premultiplied over": the source texture's RGB is
+    /// premultiplied by its alpha (text rasters, transition
+    /// intermediates). The other modes read the source as straight
+    /// alpha — feeding them a premultiplied texture double-darkens its
+    /// translucent edges.
+    PremultipliedOver,
 }
 
 impl BlendMode {
@@ -60,6 +66,7 @@ impl BlendMode {
             BlendMode::Screen => 2,
             BlendMode::Overlay => 3,
             BlendMode::Add => 4,
+            BlendMode::PremultipliedOver => BLEND_PREMUL_OVER,
         }
     }
 }
@@ -114,9 +121,9 @@ struct LayerUniform {
     _pad: [f32; 2],
 }
 
-/// Shader blend id of the "premultiplied over" path (transition results
-/// re-entering the layer stack). Deliberately outside [`BlendMode`] —
-/// callers never request it directly.
+/// Shader blend id of the "premultiplied over" path: transition results
+/// re-entering the layer stack, and premultiplied source textures
+/// ([`BlendMode::PremultipliedOver`] — text rasters).
 const BLEND_PREMUL_OVER: u32 = 5;
 
 impl LayerUniform {
@@ -408,7 +415,12 @@ impl Compositor {
                 cache: None,
             })
         };
-        let pipeline = make_pipeline("cutty-composite-pipeline", &pipeline_layout, &shader, "fs_main");
+        let pipeline = make_pipeline(
+            "cutty-composite-pipeline",
+            &pipeline_layout,
+            &shader,
+            "fs_main",
+        );
         let premul_pipeline = make_pipeline(
             "cutty-layer-premul-pipeline",
             &pipeline_layout,
@@ -641,7 +653,8 @@ impl Compositor {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
         };
@@ -756,7 +769,8 @@ impl Compositor {
                     let direct = |layer: &Layer| {
                         layer.rotation_rad == 0.0
                             && layer.opacity >= 1.0
-                            && layer.center == (target.width as f32 / 2.0, target.height as f32 / 2.0)
+                            && layer.center
+                                == (target.width as f32 / 2.0, target.height as f32 / 2.0)
                             && layer.size == (target.width as f32, target.height as f32)
                             && layer.source.width() == target.width
                             && layer.source.height() == target.height
@@ -789,7 +803,8 @@ impl Compositor {
                         from: from_view,
                         to: to_view,
                     });
-                    layer_uniforms.push(LayerUniform::fullframe_premul(target.width, target.height));
+                    layer_uniforms
+                        .push(LayerUniform::fullframe_premul(target.width, target.height));
                     steps.push(Step::Accumulate {
                         uniform: (layer_uniforms.len() - 1) as u32,
                         source: SourceView::Scratch(2),
@@ -1233,6 +1248,9 @@ mod tests {
                     }
                 }
                 BlendMode::Add => (s + b).min(1.0),
+                // Covered by its own reference test (premultiplied
+                // sources; this loop feeds straight-alpha ones).
+                BlendMode::PremultipliedOver => unreachable!(),
             };
             b + (blended - b) * opacity
         };
@@ -1478,11 +1496,7 @@ mod tests {
         };
 
         let mut direct = comp.create_target(w, h);
-        comp.composite(
-            &mut direct,
-            &[full_frame_layer(&backdrop, w, h), placed],
-            0,
-        );
+        comp.composite(&mut direct, &[full_frame_layer(&backdrop, w, h), placed], 0);
         let want = comp
             .read_slot(&mut direct, 0, |d, s| {
                 (0..h as usize)
@@ -1654,6 +1668,42 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// A premultiplied source layer (the text-raster path) composites as
+    /// "premultiplied over": translucent texels mix by their alpha, and
+    /// fully transparent texels leave the backdrop untouched even though
+    /// their RGB is zero (the straight-alpha Normal path would too, but
+    /// *half*-covered premultiplied texels only stay un-darkened through
+    /// blend 5).
+    #[test]
+    fn premultiplied_over_matches_cpu_reference() {
+        let Some(comp) = compositor() else { return };
+        let (w, h) = (8u32, 8u32);
+        let backdrop = solid(&comp, w, h, [40, 120, 200, 255]);
+        // A 60%-alpha premultiplied white: rgb = 153 = 255 * 0.6.
+        let overlay = solid(&comp, w, h, [153, 153, 153, 153]);
+        let mut target = comp.create_target(w, h);
+        let layers = [
+            full_frame_layer(&backdrop, w, h),
+            Layer {
+                blend: BlendMode::PremultipliedOver,
+                ..full_frame_layer(&overlay, w, h)
+            },
+        ];
+        comp.composite_and_read(&mut target, &layers, |out, stride| {
+            let got = px(out, stride, 4, 4);
+            // out = src + dst * (1 - a) = 153 + dst * 0.4
+            for (c, dst) in [40u8, 120, 200].iter().enumerate() {
+                let want = 153.0 + f64::from(*dst) * (1.0 - 153.0 / 255.0);
+                assert!(
+                    (f64::from(got[c]) - want).abs() <= 1.0,
+                    "channel {c}: got {} want {want}",
+                    got[c]
+                );
+            }
+        })
+        .unwrap();
+    }
+
     /// Layer stacking order: later layers paint over earlier ones.
     #[test]
     fn later_layers_paint_on_top() {
@@ -1669,4 +1719,3 @@ mod tests {
         .unwrap();
     }
 }
-

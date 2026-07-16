@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use cutty_engine::{
     transition_spans, BlendMode, ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove,
-    TrackFlag, TrackId, TrackKind, Transform, Transition, TrimEdge,
+    TextSpec, TrackFlag, TrackId, TrackKind, Transform, Transition, TrimEdge,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -184,6 +184,43 @@ pub fn engine_add_clip(
         )
         .map(|c| c.0)
     })
+}
+
+/// Place a new text clip. `track_id: null` = CapCut placement (topmost
+/// text lane with room, else a new lane on top — one undo step). The
+/// preset transform places lower-thirds etc. Returns the new clip's id.
+#[tauri::command]
+pub fn engine_add_text_clip(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    timeline_in: f64,
+    duration: f64,
+    text: TextSpec,
+    transform: Option<Transform>,
+    track_id: Option<u64>,
+) -> Result<u64, String> {
+    mutate(&app, &state, |e| {
+        e.add_text_clip(
+            timeline_in,
+            duration,
+            text,
+            transform.unwrap_or_default(),
+            track_id.map(TrackId),
+        )
+        .map(|c| c.0)
+    })
+}
+
+/// Replace a text clip's payload (content and/or style). Equal payloads
+/// are a no-op (no undo entry).
+#[tauri::command]
+pub fn engine_set_clip_text(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    text: TextSpec,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| e.set_clip_text(ClipId(clip_id), text))
 }
 
 /// Move a clip to a new timeline position.

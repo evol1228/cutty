@@ -231,7 +231,7 @@ fn preview_mix_timeline(project: &cutty_engine::Project) -> MixerTimeline {
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
         for clip in &track.clips {
-            let media = project.media(clip.media_id).unwrap();
+            let media = clip.media_id.and_then(|id| project.media(id)).unwrap();
             if !media.has_audio {
                 continue;
             }
@@ -308,7 +308,7 @@ fn phase2_compositor_export_acceptance() {
             hidden: false,
             clips: vec![cutty_engine::Clip {
                 id: cutty_engine::ClipId(clip_id),
-                media_id: rec,
+                media_id: Some(rec),
                 timeline_in: 0.0,
                 timeline_out: LEN,
                 source_in,
@@ -324,6 +324,7 @@ fn phase2_compositor_export_acceptance() {
                 speed: 1.0,
                 volume: 0.0,
                 transition_out: None,
+                text: None,
             }],
         }
     };

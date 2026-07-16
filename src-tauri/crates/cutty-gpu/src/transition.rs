@@ -21,6 +21,7 @@ pub struct TransitionDef {
 
 /// Every available transition. `kind` must equal the entry's index —
 /// asserted by a unit test, relied on by the dispatcher generator.
+#[rustfmt::skip] // one row per transition reads as the table it is
 pub const TRANSITIONS: &[TransitionDef] = &[
     TransitionDef { id: "fade", label: "Fade", kind: 0, shader_fn: "tr_fade", default_duration: 0.5 },
     TransitionDef { id: "wipeleft", label: "Wipe Left", kind: 1, shader_fn: "tr_wipeleft", default_duration: 0.5 },
@@ -79,7 +80,9 @@ pub(crate) fn assemble_shader() -> String {
         src.push('\n');
         src.push_str(source);
     }
-    src.push_str("\nfn transition_color(kind: u32, p: vec2<f32>) -> vec4<f32> {\n    switch kind {\n");
+    src.push_str(
+        "\nfn transition_color(kind: u32, p: vec2<f32>) -> vec4<f32> {\n    switch kind {\n",
+    );
     for def in TRANSITIONS {
         src.push_str(&format!(
             "        case {}u: {{ return {}(p); }}\n",
@@ -111,7 +114,10 @@ mod tests {
                 def.shader_fn
             );
             assert!(
-                src.contains(&format!("case {}u: {{ return {}(p); }}", def.kind, def.shader_fn)),
+                src.contains(&format!(
+                    "case {}u: {{ return {}(p); }}",
+                    def.kind, def.shader_fn
+                )),
                 "{} missing from the dispatcher",
                 def.id
             );

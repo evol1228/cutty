@@ -9,6 +9,7 @@ blake3 = "1.8.5"
 cutty-audio = { version = "0.1.0", path = "../cutty-audio" }
 cutty-engine = { version = "0.1.0", path = "../cutty-engine" }
 cutty-gpu = { version = "0.1.0", path = "../cutty-gpu" }
+cutty-text = { version = "0.1.0", path = "../cutty-text" }
 dirs = "6.0.0"
 # CLI ffmpeg for transcode-shaped jobs (probe, proxy, thumbs, export)…
 ffmpeg-sidecar = { version = "2.5.2", default-features = false }

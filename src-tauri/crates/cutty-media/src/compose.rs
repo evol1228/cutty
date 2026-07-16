@@ -40,10 +40,15 @@
 //! composites as one normal layer); opacity and transforms apply.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-use cutty_engine::{resolve_track_visuals, ActiveClip, Clip, Project, ProjectSettings, TrackVisual};
+use cutty_engine::{
+    parse_hex_color, resolve_text_layers, resolve_track_visuals, ActiveClip, Clip, Project,
+    ProjectSettings, TextAlign, TextSpec, TrackVisual,
+};
 use cutty_gpu::{BlendMode as GpuBlend, Compositor, Layer, SourceTexture, Target, Visual};
+use cutty_text::{RasterSpec, TextRasterizer};
 
 use crate::decode::SourceDecoder;
 use crate::error::MediaError;
@@ -68,6 +73,10 @@ pub struct RenderStats {
     pub seeks: u64,
     /// Frames decoded rolling forward.
     pub forward_decodes: u64,
+    /// Text blocks rasterized (cache misses). Steady-state playback of a
+    /// static text layer must not grow this — the texture cache serves
+    /// every following frame.
+    pub text_rasterized: u64,
 }
 
 /// One open source: a decoder plus its GPU texture and what's in it.
@@ -200,11 +209,159 @@ fn dispose_sources(dropped: Vec<SourceState>) {
         .spawn(move || drop(dropped));
 }
 
+// ---------------------------------------------------------------------
+// Text layers: rasterized once, cached as GPU textures
+// ---------------------------------------------------------------------
+
+/// Text texture cache budget, bytes (a full-screen 4K raster is ~33 MB;
+/// preview rasters are a couple MB — this comfortably holds a busy
+/// timeline's worth).
+const TEXT_CACHE_BYTES: usize = 256 << 20;
+
+/// One cached rasterization: `None` texture = the content rasterized to
+/// nothing (empty/whitespace), cached too so empty clips don't re-shape
+/// every frame.
+struct TextEntry {
+    texture: Option<(SourceTexture, (f32, f32))>, // texture + block center
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Rasterized-text textures keyed by content + style + raster scale —
+/// invalidation is by key change (an edit or zoom mints a new key; stale
+/// entries age out by LRU under the byte budget).
+struct TextCache {
+    rasterizer: TextRasterizer,
+    entries: HashMap<u64, TextEntry>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl TextCache {
+    fn new() -> Self {
+        Self {
+            rasterizer: TextRasterizer::new(),
+            entries: HashMap::new(),
+            bytes: 0,
+            tick: 0,
+        }
+    }
+
+    /// Evict least-recently-used entries (never ones touched this tick)
+    /// until the byte budget holds.
+    fn enforce_budget(&mut self) {
+        while self.bytes > TEXT_CACHE_BYTES {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.last_used < self.tick)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| *k);
+            let Some(key) = victim else { break };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes -= entry.bytes;
+            }
+        }
+    }
+}
+
+/// Cache key for one rasterization: content, full style, and the
+/// quantized pixel scale (output scale × clip scale — the raster is
+/// resolution-exact, never upscaled).
+fn text_raster_key(text: &TextSpec, px_scale: f64) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.content.hash(&mut hasher);
+    let style = &text.style;
+    style.font_family.hash(&mut hasher);
+    style.weight.hash(&mut hasher);
+    for v in [
+        style.font_size,
+        style.stroke_width,
+        style.shadow_offset_x,
+        style.shadow_offset_y,
+        style.shadow_alpha,
+    ] {
+        v.to_bits().hash(&mut hasher);
+    }
+    style.fill.hash(&mut hasher);
+    style.stroke_color.hash(&mut hasher);
+    style.shadow_color.hash(&mut hasher);
+    (style.align as u8).hash(&mut hasher);
+    // ~0.1% steps: fine enough that quantization is invisible, coarse
+    // enough that a scale drag reuses entries when it revisits values.
+    ((px_scale * 1024.0).round() as u64).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Model style → rasterizer request, everything scaled to device pixels.
+/// Colors were validated by the engine; a hand-edited file that slipped
+/// through renders white/transparent rather than failing the frame.
+fn raster_spec(text: &TextSpec, px_scale: f64) -> RasterSpec {
+    let style = &text.style;
+    let color = |s: &str, fallback: [u8; 4]| parse_hex_color(s).unwrap_or(fallback);
+    RasterSpec {
+        font_family: style.font_family.clone(),
+        weight: style.weight,
+        font_size: (style.font_size * px_scale) as f32,
+        fill: color(&style.fill, [255, 255, 255, 255]),
+        stroke_color: color(&style.stroke_color, [0, 0, 0, 0]),
+        stroke_width: (style.stroke_width * px_scale) as f32,
+        shadow_color: color(&style.shadow_color, [0, 0, 0, 0]),
+        shadow_offset: (
+            (style.shadow_offset_x * px_scale) as f32,
+            (style.shadow_offset_y * px_scale) as f32,
+        ),
+        shadow_alpha: style.shadow_alpha as f32,
+        align: match style.align {
+            TextAlign::Left => cutty_text::TextAlign::Left,
+            TextAlign::Center => cutty_text::TextAlign::Center,
+            TextAlign::Right => cutty_text::TextAlign::Right,
+        },
+    }
+}
+
+/// Shared rasterizer for UI queries (font list, gizmo block measure).
+/// The render paths own per-thread rasterizers; this one exists so the
+/// IPC layer never blocks a render thread for a dropdown.
+static UI_TEXT: std::sync::OnceLock<std::sync::Mutex<TextRasterizer>> = std::sync::OnceLock::new();
+
+fn ui_text() -> &'static std::sync::Mutex<TextRasterizer> {
+    UI_TEXT.get_or_init(|| std::sync::Mutex::new(TextRasterizer::new()))
+}
+
+/// Distinct system font family names, sorted (the Inspector dropdown).
+pub fn text_font_families() -> Vec<String> {
+    ui_text()
+        .lock()
+        .expect("text rasterizer poisoned")
+        .font_families()
+}
+
+/// Size of a text block in **project pixels** at transform scale 1 — the
+/// box the player gizmo draws. Uses the exact layout the renderer
+/// rasterizes, so the box always hugs the pixels.
+pub fn measure_text_block(text: &TextSpec) -> (f64, f64) {
+    let spec = raster_spec(text, 1.0);
+    let (w, h) = ui_text()
+        .lock()
+        .expect("text rasterizer poisoned")
+        .measure(&text.content, &spec);
+    (f64::from(w), f64::from(h))
+}
+
+/// What a planned layer samples from: a decode session's texture (video)
+/// or a cached text raster.
+enum PlannedSource {
+    /// Clip id — the decode-session key.
+    Media(u64),
+    /// Text-raster cache key.
+    Text(u64),
+}
+
 /// A layer resolved and sampled, ready to composite (phase 1 of
 /// `begin_frame`; phase 2 turns these into borrowed [`Layer`]s).
 struct PlannedLayer {
-    /// Clip id — the decode-session key.
-    key: u64,
+    source: PlannedSource,
     center: (f32, f32),
     size: (f32, f32),
     rotation_rad: f32,
@@ -295,6 +452,9 @@ pub struct TimelineRenderer {
     /// adoption). A clip name outlives its decoder only until the GC
     /// (`sync_sources`) runs.
     sources: HashMap<u64, SourceState>,
+    /// Rasterized-text textures. `None` until the first text layer — a
+    /// project without text never loads the font database.
+    text: Option<TextCache>,
     /// Transition kinds already reported as unknown (fallback to fade).
     unknown_kinds: HashSet<String>,
     issues: Vec<String>,
@@ -313,6 +473,7 @@ impl TimelineRenderer {
             out_h,
             strict,
             sources: HashMap::new(),
+            text: None,
             unknown_kinds: HashSet::new(),
             issues: Vec::new(),
             stats: RenderStats::default(),
@@ -369,8 +530,10 @@ impl TimelineRenderer {
                 return; // the running decoder already covers this clip
             }
         }
-        self.sources
-            .insert(clip_id, SourceState::new(&self.compositor, media_id, decoder));
+        self.sources.insert(
+            clip_id,
+            SourceState::new(&self.compositor, media_id, decoder),
+        );
     }
 
     /// Reconcile decode sessions with what plays now and soon: sessions
@@ -430,7 +593,9 @@ impl TimelineRenderer {
             return Ok(None);
         };
         let key = active.clip_id.0;
-        let media = clip.media_id.0;
+        let Some(media) = clip.media_id.map(|m| m.0) else {
+            return Ok(None); // text clips never reach the decode path
+        };
 
         if !self.sources.contains_key(&key) {
             // Adopt a same-media session no planned clip owns (the
@@ -477,7 +642,7 @@ impl TimelineRenderer {
                     self.out_h,
                 );
                 Ok(Some(PlannedLayer {
-                    key,
+                    source: PlannedSource::Media(key),
                     center: (cx, cy),
                     size: (w, h),
                     rotation_rad: rot,
@@ -500,6 +665,85 @@ impl TimelineRenderer {
                 Ok(None)
             }
         }
+    }
+
+    /// Plan one text layer: rasterize (or reuse) the styled block at the
+    /// exact device pixel scale — output scale × clip scale, so 4K
+    /// exports get 4K-sharp glyphs, never an upscaled preview raster —
+    /// and place the texture 1:1 with output pixels. `None` = nothing
+    /// visible (empty content, degenerate scale).
+    fn plan_text_layer(&mut self, project: &Project, active: &ActiveClip) -> Option<PlannedLayer> {
+        let (_, clip) = project.find_clip(active.clip_id)?;
+        let text = clip.text.as_ref()?;
+        let settings = &project.settings;
+        let (pw, ph) = (settings.width as f64, settings.height as f64);
+        let (ow, oh) = (f64::from(self.out_w), f64::from(self.out_h));
+        let s = (ow / pw).min(oh / ph);
+        let off_x = (ow - pw * s) / 2.0;
+        let off_y = (oh - ph * s) / 2.0;
+        let px_scale = s * clip.transform.scale;
+        if !px_scale.is_finite() || px_scale <= 0.0 {
+            return None;
+        }
+
+        let key = text_raster_key(text, px_scale);
+        let cache = self.text.get_or_insert_with(TextCache::new);
+        if !cache.entries.contains_key(&key) {
+            self.stats.text_rasterized += 1;
+            let raster = cache
+                .rasterizer
+                .rasterize(&text.content, &raster_spec(text, px_scale));
+            let entry = match raster {
+                Some(r) => {
+                    let texture = self.compositor.create_source(r.width, r.height);
+                    self.compositor
+                        .upload_rgba(&texture, &r.data, r.width as usize * 4);
+                    TextEntry {
+                        bytes: r.data.len(),
+                        texture: Some((texture, r.block_center)),
+                        last_used: cache.tick,
+                    }
+                }
+                // Nothing shaped: cache the negative so empty clips
+                // don't re-shape every frame.
+                None => TextEntry {
+                    bytes: 0,
+                    texture: None,
+                    last_used: cache.tick,
+                },
+            };
+            cache.bytes += entry.bytes;
+            cache.entries.insert(key, entry);
+            cache.enforce_budget();
+        }
+        let entry = cache.entries.get_mut(&key)?;
+        entry.last_used = cache.tick;
+        let (texture, block_center) = entry.texture.as_ref()?;
+
+        // The raster is 1:1 with output pixels (scale is baked into the
+        // rasterization), so the quad is exactly texture-sized; only
+        // rotation remains for the GPU. The texture rect is ink-sized
+        // and not centered on the text block, so shift the quad center
+        // by the (rotated) block→texture center offset to anchor the
+        // *block* center at the clip transform.
+        let (tw, th) = (texture.width() as f32, texture.height() as f32);
+        let anchor_x = ((pw / 2.0 + clip.transform.x) * s + off_x) as f32;
+        let anchor_y = ((ph / 2.0 + clip.transform.y) * s + off_y) as f32;
+        let rot = clip.transform.rotation.to_radians() as f32;
+        let (dx, dy) = (tw / 2.0 - block_center.0, th / 2.0 - block_center.1);
+        let (sin, cos) = rot.sin_cos();
+        Some(PlannedLayer {
+            source: PlannedSource::Text(key),
+            center: (
+                anchor_x + dx * cos - dy * sin,
+                anchor_y + dx * sin + dy * cos,
+            ),
+            size: (tw, th),
+            rotation_rad: rot,
+            opacity: clip.opacity as f32,
+            // Text rasters are premultiplied; blend modes don't apply.
+            blend: GpuBlend::PremultipliedOver,
+        })
     }
 
     /// Dispatch index for a transition kind, falling back to fade (and
@@ -531,6 +775,9 @@ impl TimelineRenderer {
         path_of: &dyn Fn(u64) -> Option<PathBuf>,
         slot: usize,
     ) -> Result<(), MediaError> {
+        if let Some(cache) = &mut self.text {
+            cache.tick += 1; // LRU clock; entries touched this frame are never evicted
+        }
         let track_visuals = resolve_track_visuals(project, t);
         let needed: HashSet<u64> = track_visuals
             .iter()
@@ -545,7 +792,8 @@ impl TimelineRenderer {
         for visual in &track_visuals {
             match visual {
                 TrackVisual::Single(active) => {
-                    if let Some(layer) = self.sample_side(project, active, &needed, path_of, false)?
+                    if let Some(layer) =
+                        self.sample_side(project, active, &needed, path_of, false)?
                     {
                         plan.push(PlannedVisual::Layer(layer));
                     }
@@ -577,9 +825,26 @@ impl TimelineRenderer {
             }
         }
 
+        // Text layers stack above every video track, in resolver order.
+        for active in resolve_text_layers(project, t) {
+            if let Some(layer) = self.plan_text_layer(project, &active) {
+                plan.push(PlannedVisual::Layer(layer));
+            }
+        }
+
         // Phase 2 (immutable): build texture refs and composite.
         let as_layer = |p: &PlannedLayer| Layer {
-            source: &self.sources[&p.key].texture,
+            source: match &p.source {
+                PlannedSource::Media(key) => &self.sources[key].texture,
+                PlannedSource::Text(key) => {
+                    let cache = self.text.as_ref().expect("cache exists: text was planned");
+                    let (texture, _) = cache.entries[key]
+                        .texture
+                        .as_ref()
+                        .expect("planned text has a texture");
+                    texture
+                }
+            },
             center: p.center,
             size: p.size,
             rotation_rad: p.rotation_rad,
@@ -661,7 +926,7 @@ mod tests {
     fn clip(transform: Transform) -> Clip {
         Clip {
             id: ClipId(1),
-            media_id: MediaId(1),
+            media_id: Some(MediaId(1)),
             timeline_in: 0.0,
             timeline_out: 1.0,
             source_in: 0.0,
@@ -672,6 +937,7 @@ mod tests {
             speed: 1.0,
             volume: 1.0,
             transition_out: None,
+            text: None,
         }
     }
 

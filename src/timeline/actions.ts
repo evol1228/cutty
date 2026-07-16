@@ -8,6 +8,7 @@ import type { Clip, Project, Track, TrimEdge } from "../lib/engineIpc";
 import {
   engineAddClip,
   engineAddMedia,
+  engineAddTextClip,
   engineAddTrack,
   engineBeginTransaction,
   engineCommitTransaction,
@@ -20,6 +21,11 @@ import {
   engineUndo,
 } from "../lib/engineIpc";
 import { playbackSeek, playbackStep } from "../lib/ipc";
+import {
+  DEFAULT_TEXT_DURATION,
+  TEXT_PRESETS,
+  type TextPreset,
+} from "../lib/textPresets";
 import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
@@ -128,6 +134,37 @@ export async function trimSelectedToPlayhead(edge: TrimEdge): Promise<void> {
       }
     }
   });
+}
+
+/**
+ * Add a text clip at the playhead (the `T` shortcut and the Text tab).
+ * The engine picks/creates the lane; preset placement is fractional so
+ * lower-thirds land right in every aspect. Selects the new clip so the
+ * Inspector opens on it.
+ */
+export async function addTextAtPlayhead(preset?: TextPreset): Promise<void> {
+  const { project, playheadSec, setSelection } = useProjectStore.getState();
+  if (!project) return;
+  const p = preset ?? TEXT_PRESETS[0];
+  const transform = p.place
+    ? {
+        x: p.place.xFrac * project.settings.width,
+        y: p.place.yFrac * project.settings.height,
+        scale: 1,
+        rotation: 0,
+      }
+    : undefined;
+  try {
+    const clipId = await engineAddTextClip(
+      playheadSec,
+      DEFAULT_TEXT_DURATION,
+      { content: p.sampleContent, style: { ...p.style } },
+      transform,
+    );
+    setSelection([clipId]);
+  } catch (err) {
+    toast(`Could not add text: ${String(err)}`, "error");
+  }
 }
 
 export async function undo(): Promise<void> {

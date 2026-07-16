@@ -240,10 +240,18 @@ fn sole_video_track(project: &Project) -> Option<&cutty_engine::Track> {
 }
 
 /// Whether the Phase 1 per-segment pipeline renders this project exactly:
-/// nothing to composite (at most one visible video track holding clips)
-/// and every clip visually default. Everything else goes through the GPU
-/// compositor.
+/// nothing to composite (at most one visible video track holding clips,
+/// no visible text) and every clip visually default. Everything else
+/// goes through the GPU compositor.
 pub(crate) fn fast_path_eligible(project: &Project) -> bool {
+    // Any visible text is composited — the segment pipeline can't draw it.
+    if project
+        .tracks
+        .iter()
+        .any(|t| t.kind == TrackKind::Text && !t.hidden && !t.clips.is_empty())
+    {
+        return false;
+    }
     let mut tracks = project
         .tracks
         .iter()
@@ -284,9 +292,10 @@ pub(crate) fn plan_video_segments(project: &Project, fps: f64) -> Vec<PlannedSeg
                 cursor = start_frame;
             }
             if end_frame > cursor {
-                let media = project
-                    .media(clip.media_id)
-                    .expect("validated clip has media");
+                let media = clip
+                    .media_id
+                    .and_then(|id| project.media(id))
+                    .expect("validated video clip has media");
                 // The first output frame sits at start_frame/fps, which
                 // can differ from timeline_in by up to half a frame;
                 // shift the source in-point to match.
@@ -328,7 +337,8 @@ pub(crate) fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, 
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
         for clip in &track.clips {
-            let Some(media) = project.media(clip.media_id) else {
+            // Text clips (`media_id: None`) contribute no audio.
+            let Some(media) = clip.media_id.and_then(|id| project.media(id)) else {
                 continue;
             };
             if !media.has_audio {
@@ -792,7 +802,7 @@ pub fn run_export(
         let used = project
             .tracks
             .iter()
-            .any(|t| t.clips.iter().any(|c| c.media_id == media.id));
+            .any(|t| t.clips.iter().any(|c| c.media_id == Some(media.id)));
         if used && !Path::new(&media.path).is_file() {
             return Err(MediaError::ExportNotReady {
                 message: format!("source file is missing: {}", media.path),
@@ -1205,6 +1215,7 @@ mod tests {
             match t.kind {
                 TrackKind::Video => video = Some(t.id),
                 TrackKind::Audio => audio = Some(t.id),
+                TrackKind::Text => {}
             }
         }
         engine.add_clip(video.unwrap(), av, 0.0, 0.0, 2.0).unwrap();

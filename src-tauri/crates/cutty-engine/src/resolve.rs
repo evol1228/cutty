@@ -13,13 +13,14 @@ pub struct ActiveClip {
     pub source_time: f64,
 }
 
-/// Whether a track contributes anything perceivable: video tracks are out
-/// when hidden (no picture), audio tracks when muted (no sound). A muted
-/// *video* track still shows its picture — mute only silences the clips'
-/// embedded audio, which the mixer handles separately.
+/// Whether a track contributes anything perceivable: video and text
+/// tracks are out when hidden (no picture), audio tracks when muted (no
+/// sound). A muted *video* track still shows its picture — mute only
+/// silences the clips' embedded audio, which the mixer handles
+/// separately.
 fn perceivable(track: &Track) -> bool {
     match track.kind {
-        TrackKind::Video => !track.hidden,
+        TrackKind::Video | TrackKind::Text => !track.hidden,
         TrackKind::Audio => !track.muted,
     }
 }
@@ -93,6 +94,36 @@ pub fn resolve_video_layers(project: &Project, t: f64) -> Vec<ActiveClip> {
         .collect()
 }
 
+/// The text layer stack at time `t`, in **compositing order: bottom
+/// layer first** — the exact convention of [`resolve_video_layers`],
+/// applied to text tracks. The whole text stack composites **above every
+/// video track** (renderers append these after the video layers), so a
+/// text track's panel position relative to video tracks never hides text
+/// behind footage. Hidden text tracks are skipped. `source_time` is the
+/// time into the clip (`t - timeline_in`; text has no source medium).
+pub fn resolve_text_layers(project: &Project, t: f64) -> Vec<ActiveClip> {
+    if !t.is_finite() {
+        return Vec::new();
+    }
+    project
+        .tracks
+        .iter()
+        .rev()
+        .filter(|track| track.kind == TrackKind::Text && !track.hidden)
+        .filter_map(|track| {
+            track
+                .clips
+                .iter()
+                .rfind(|clip| clip.timeline_in <= t && t < clip.timeline_out)
+                .map(|clip| ActiveClip {
+                    track_id: track.id,
+                    clip_id: clip.id,
+                    source_time: clip.source_in + (t - clip.timeline_in) * clip.speed,
+                })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------
 // Transitions: cut-bound spans and the per-track visual stack
 // ---------------------------------------------------------------------
@@ -134,7 +165,7 @@ pub struct TransitionSpan {
 ///   zero would erase the transition entirely).
 pub fn transition_duration_limit(project: &Project, a: &Clip, b: &Clip) -> f64 {
     let mut limit = a.duration().min(b.duration());
-    if let Some(media) = project.media(a.media_id) {
+    if let Some(media) = a.media_id.and_then(|id| project.media(id)) {
         let post_handle = (media.duration - a.source_out) / a.speed;
         if post_handle > TOUCH_EPS {
             limit = limit.min(2.0 * post_handle);
@@ -152,11 +183,7 @@ pub fn transition_duration_limit(project: &Project, a: &Clip, b: &Clip) -> f64 {
 /// their chips); renderers skip hidden tracks themselves.
 pub fn transition_spans(project: &Project) -> Vec<TransitionSpan> {
     let mut spans = Vec::new();
-    for track in project
-        .tracks
-        .iter()
-        .filter(|t| t.kind == TrackKind::Video)
-    {
+    for track in project.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
         for pair in track.clips.windows(2) {
             let (a, b) = (&pair[0], &pair[1]);
             let Some(transition) = &a.transition_out else {

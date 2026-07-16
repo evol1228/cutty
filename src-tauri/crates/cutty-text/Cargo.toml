@@ -1,0 +1,8 @@
+[package]
+name = "cutty-text"
+description = "Text shaping + rasterization: styled text → premultiplied RGBA bitmaps"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cosmic-text = "0.19"

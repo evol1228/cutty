@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use cutty_engine::{
-    BlendMode, Clip, ClipId, Engine, Project, ProjectSettings, Track, TrackId, TrackKind, Transform,
+    BlendMode, Clip, ClipId, Engine, Project, ProjectSettings, TextAlign, TextSpec, TextStyle,
+    Track, TrackId, TrackKind, Transform,
 };
 use cutty_media::{for_each_composited_frame, FrameSlice, TimelineRenderer};
 
@@ -115,7 +116,7 @@ fn fixture_project() -> (Project, i64) {
         let t_in = 0.5 + i as f64 * 0.5;
         project.tracks[0].clips.push(Clip {
             id: ClipId(200 + i as u64),
-            media_id: b,
+            media_id: Some(b),
             timeline_in: t_in,
             timeline_out: t_in + 0.5,
             source_in: 0.2,
@@ -130,12 +131,77 @@ fn fixture_project() -> (Project, i64) {
             blend_mode: *mode,
             speed: 1.0,
             volume: 1.0,
-                transition_out: None,
+            transition_out: None,
+            text: None,
         });
     }
     project.validate().expect("fixture is valid");
 
     let total_frames = (3.2 * FPS).round() as i64;
+    (project, total_frames)
+}
+
+/// Two styled text lanes over the video fixture: a big stroked+shadowed
+/// center title (rotated, scaled) and a left-aligned lower third — the
+/// full style surface (fill, stroke, shadow, alignment, multi-line,
+/// transform placement) exercised through both frontends.
+fn text_fixture_project() -> (Project, i64) {
+    let (mut project, _) = fixture_project();
+    let mut engine = Engine::from_project(project.clone()).expect("fixture is valid");
+    engine
+        .add_text_clip(
+            0.0,
+            3.0,
+            TextSpec {
+                content: "GOLDEN\nFRAMES".into(),
+                style: TextStyle {
+                    font_size: 96.0,
+                    stroke_width: 8.0,
+                    shadow_alpha: 0.6,
+                    shadow_offset_x: 5.0,
+                    shadow_offset_y: 5.0,
+                    ..TextStyle::default()
+                },
+            },
+            Transform {
+                x: 0.0,
+                y: -60.0,
+                scale: 1.2,
+                rotation: -6.0,
+            },
+            None,
+        )
+        .expect("title clip");
+    engine
+        .add_text_clip(
+            0.5,
+            2.5,
+            TextSpec {
+                content: "lower third — cutty".into(),
+                style: TextStyle {
+                    font_size: 40.0,
+                    weight: 400,
+                    fill: "#ffdd00".into(),
+                    stroke_width: 0.0,
+                    shadow_alpha: 0.8,
+                    shadow_offset_x: 2.0,
+                    shadow_offset_y: 3.0,
+                    align: TextAlign::Left,
+                    ..TextStyle::default()
+                },
+            },
+            Transform {
+                x: -320.0,
+                y: 260.0,
+                scale: 1.0,
+                rotation: 0.0,
+            },
+            None,
+        )
+        .expect("lower-third clip");
+    project = engine.project().clone();
+    project.validate().expect("text fixture is valid");
+    let total_frames = (3.0 * FPS).round() as i64;
     (project, total_frames)
 }
 
@@ -359,6 +425,209 @@ fn preview_renderer_throughput_probe() {
         total_frames as f64 / elapsed.as_secs_f64(),
         readback.as_secs_f64() * 1e3 / total_frames as f64,
         (bytes as f64 / 1e9) / readback.as_secs_f64(),
+    );
+}
+
+/// System fonts are an environment dependency of the text tests; skip
+/// visibly where none exist (minimal CI containers).
+fn fonts_available() -> bool {
+    if cutty_text::TextRasterizer::new().font_families().is_empty() {
+        eprintln!("golden text tests: skipping, no system fonts");
+        return false;
+    }
+    true
+}
+
+/// The text acceptance fixture: two styled text layers over video render
+/// bit-identically through the preview frontend and the literal export
+/// frame generator — and actually change the picture (an implementation
+/// that dropped text layers would pass the identity check trivially).
+#[test]
+fn text_layers_composite_identically_in_both_frontends() {
+    if !gpu_available() || !fonts_available() {
+        return;
+    }
+    let (project, total_frames) = text_fixture_project();
+    let resolver = originals_resolver(&project);
+
+    let mut preview = TimelineRenderer::new(OUT_W, OUT_H, false).expect("gpu");
+    let mut preview_hashes: Vec<blake3::Hash> = Vec::new();
+    for idx in 0..total_frames {
+        let t = idx as f64 / FPS;
+        let hash = preview
+            .render_with(&project, t, &resolver, |frame| hash_frame(&frame))
+            .expect("preview frame renders");
+        preview_hashes.push(hash);
+    }
+    assert!(
+        preview.take_issues().is_empty(),
+        "preview must render every layer"
+    );
+
+    // Text must be *visible*: the same frame without the text lanes
+    // hashes differently.
+    let mut without_text = project.clone();
+    without_text.tracks.retain(|t| t.kind != TrackKind::Text);
+    let probe = 15usize; // both text clips active
+    let plain_hash = preview
+        .render_with(&without_text, probe as f64 / FPS, &resolver, |frame| {
+            hash_frame(&frame)
+        })
+        .expect("renders");
+    assert_ne!(
+        preview_hashes[probe], plain_hash,
+        "text layers must change the composite"
+    );
+
+    let mut export_hashes: HashMap<i64, blake3::Hash> = HashMap::new();
+    for_each_composited_frame(
+        &project,
+        OUT_W,
+        OUT_H,
+        FPS,
+        total_frames,
+        &|| false,
+        &mut |idx, data, stride| {
+            let frame = FrameSlice {
+                width: OUT_W,
+                height: OUT_H,
+                stride,
+                data,
+            };
+            export_hashes.insert(idx, hash_frame(&frame));
+            Ok(())
+        },
+    )
+    .expect("export frames render");
+
+    assert_eq!(export_hashes.len() as i64, total_frames);
+    let mismatches = preview_hashes
+        .iter()
+        .enumerate()
+        .filter(|(idx, h)| export_hashes[&(*idx as i64)] != **h)
+        .count();
+    assert_eq!(
+        mismatches, 0,
+        "{mismatches} of {total_frames} frames differ between preview and export"
+    );
+}
+
+/// Crispness: the raster is generated at the *output* resolution, never
+/// upscaled from preview size. Measured by the anti-aliased edge band of
+/// big white glyphs — a crisp raster keeps the gray-edge : solid-core
+/// pixel ratio roughly constant across output sizes, while a 720p raster
+/// bilinearly stretched to 4K widens the band by the upscale factor
+/// (3×). Also covers "presets render crisply at 1080p and 4K".
+#[test]
+fn text_rasterizes_at_output_resolution() {
+    if !gpu_available() || !fonts_available() {
+        return;
+    }
+    let mut engine = Engine::new(ProjectSettings {
+        width: 1920,
+        height: 1080,
+        fps: FPS,
+    });
+    engine
+        .add_text_clip(
+            0.0,
+            1.0,
+            TextSpec {
+                content: "OXO".into(),
+                style: TextStyle {
+                    font_size: 300.0,
+                    stroke_width: 0.0,
+                    shadow_alpha: 0.0,
+                    ..TextStyle::default()
+                },
+            },
+            Transform::default(),
+            None,
+        )
+        .expect("text clip");
+    let project = engine.project().clone();
+    let resolver = originals_resolver(&project);
+
+    // (edge pixels, core pixels) of white-on-black text.
+    let edge_ratio = |w: u32, h: u32| -> f64 {
+        let mut renderer = TimelineRenderer::new(w, h, false).expect("gpu");
+        renderer
+            .render_with(&project, 0.5, &resolver, |frame| {
+                let (mut edge, mut core) = (0u64, 0u64);
+                for row in 0..frame.height as usize {
+                    let line = &frame.data[row * frame.stride..];
+                    for x in 0..frame.width as usize {
+                        match line[x * 4] {
+                            250.. => core += 1,
+                            16..=239 => edge += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(core > 500, "glyph cores visible at {w}x{h}: {core}");
+                edge as f64 / core as f64
+            })
+            .expect("renders")
+    };
+
+    let r720 = edge_ratio(1280, 720);
+    let r4k = edge_ratio(3840, 2160);
+    assert!(
+        r4k < r720 * 1.6,
+        "4K text looks upscaled: edge/core {r4k:.4} at 4K vs {r720:.4} at 720p \
+         (a 3× bilinear upscale would triple it)"
+    );
+}
+
+/// The texture cache: static text rasterizes once, not per frame — a
+/// 10-text-clip timeline costs 10 rasterizations for a whole preview
+/// run, and steady-state playback adds none (the full-fps guarantee).
+#[test]
+fn static_text_rasterizes_once_not_per_frame() {
+    if !gpu_available() || !fonts_available() {
+        return;
+    }
+    let mut engine = Engine::new(ProjectSettings::default());
+    for i in 0..10 {
+        engine
+            .add_text_clip(
+                0.0,
+                2.0,
+                TextSpec {
+                    content: format!("layer {i}"),
+                    style: TextStyle::default(),
+                },
+                Transform {
+                    x: 0.0,
+                    y: -450.0 + f64::from(i) * 100.0,
+                    scale: 1.0,
+                    rotation: 0.0,
+                },
+                None,
+            )
+            .expect("text clip");
+    }
+    let project = engine.project().clone();
+    assert_eq!(
+        project
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Text)
+            .count(),
+        10,
+        "non-overlapping placement still stacks by request order"
+    );
+    let resolver = originals_resolver(&project);
+    let mut renderer = TimelineRenderer::new(OUT_W, OUT_H, false).expect("gpu");
+    for idx in 0..60 {
+        renderer
+            .render_with(&project, idx as f64 / FPS, &resolver, |_| ())
+            .expect("renders");
+    }
+    let stats = renderer.stats();
+    assert_eq!(
+        stats.text_rasterized, 10,
+        "10 unique blocks → exactly 10 rasterizations across 60 frames"
     );
 }
 

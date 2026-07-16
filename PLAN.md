@@ -113,7 +113,7 @@ Kill the biggest risk before building any editor UI.
 
 - [x] Multi-track video with compositing (opacity, blend modes)
 - [x] Transitions: fade/dissolve + ~15 ported gl-transitions; drag onto cut points; duration handle
-- [ ] Text clips: font, size, color, stroke, shadow, position; a few text style presets
+- [x] Text clips: font, size, color, stroke, shadow, position; a few text style presets
 - [ ] Multiple audio tracks, volume keyframes, fade in/out, extract-audio-from-video
 - [ ] Image and GIF/WebM overlay support
 - [ ] Filmstrip thumbnails + waveforms rendered on clips

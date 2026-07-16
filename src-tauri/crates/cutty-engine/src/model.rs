@@ -94,13 +94,22 @@ pub struct MediaRef {
     pub has_audio: bool,
 }
 
-/// Kind of a track. Phase 1 is exactly one `Video` + one `Audio` track;
-/// `Text` tracks arrive in Phase 2.
+/// Kind of a track.
+///
+/// `Text` landed in project schema **v2** — old builds cannot read files
+/// that use it, which is exactly why adding a `TrackKind` variant bumps
+/// [`crate::project_file::CURRENT_VERSION`] (see the schema rule on
+/// [`BlendMode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TrackKind {
     Video,
     Audio,
+    /// Styled text overlays. Text tracks stack **above every video
+    /// track** in the composite; among themselves they follow panel
+    /// order like video tracks do (see
+    /// [`crate::resolve::resolve_text_layers`]).
+    Text,
 }
 
 /// 2D placement of a clip in the frame.
@@ -165,6 +174,104 @@ pub enum BlendMode {
     Add,
 }
 
+/// Horizontal alignment of the lines of a multi-line text block (the
+/// block itself is placed by the clip's [`Transform`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextAlign {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Styled text payload of a clip on a [`TrackKind::Text`] track.
+///
+/// Splitting a text clip duplicates this whole payload — each half is an
+/// independent full text afterwards (there is no "source range" into a
+/// text; see the text-clip invariants on [`Clip`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextSpec {
+    /// The text itself; `\n` separates lines. May be empty (renders
+    /// nothing but keeps the clip editable).
+    pub content: String,
+    pub style: TextStyle,
+}
+
+/// Visual style of a text clip. All pixel quantities are **project
+/// pixels** at transform scale 1.0 — the rasterizer multiplies them by
+/// the output scale (and the clip's scale) so text stays crisp at every
+/// output resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStyle {
+    /// Font family as fontconfig knows it. Empty selects the default
+    /// sans; the generic names `serif` / `sans-serif` / `monospace`
+    /// resolve through font fallback.
+    pub font_family: String,
+    /// Weight 100–900 (400 = regular, 700 = bold).
+    pub weight: u16,
+    /// Font size in project pixels.
+    pub font_size: f64,
+    /// Fill color, `#RRGGBB` or `#RRGGBBAA`.
+    pub fill: String,
+    /// Outline color, `#RRGGBB` or `#RRGGBBAA`.
+    pub stroke_color: String,
+    /// Outline width in project pixels; 0 disables the stroke.
+    pub stroke_width: f64,
+    /// Drop-shadow color, `#RRGGBB` or `#RRGGBBAA`.
+    pub shadow_color: String,
+    /// Shadow offset in project pixels, +x right / +y down.
+    pub shadow_offset_x: f64,
+    pub shadow_offset_y: f64,
+    /// Shadow opacity 0..=1 (multiplies the shadow color's alpha); 0
+    /// disables the shadow.
+    pub shadow_alpha: f64,
+    pub align: TextAlign,
+}
+
+impl Default for TextStyle {
+    /// The CapCut-ish default: bold white with a black outline and a
+    /// soft drop shadow, sized for a 1080p project.
+    fn default() -> Self {
+        Self {
+            font_family: String::new(),
+            weight: 700,
+            font_size: 72.0,
+            fill: "#ffffff".into(),
+            stroke_color: "#000000".into(),
+            stroke_width: 6.0,
+            shadow_color: "#000000".into(),
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 4.0,
+            shadow_alpha: 0.35,
+            align: TextAlign::Center,
+        }
+    }
+}
+
+/// Parse `#RRGGBB` / `#RRGGBBAA` into straight (non-premultiplied) RGBA.
+/// `None` for anything else — validation rejects such styles, so
+/// renderers may treat stored colors as always parseable.
+pub fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
+    let hex = s.strip_prefix('#')?;
+    if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok();
+    Some([
+        channel(0)?,
+        channel(1)?,
+        channel(2)?,
+        if hex.len() == 8 { channel(3)? } else { 255 },
+    ])
+}
+
+/// Longest accepted text content, bytes (a full-screen paragraph is a few
+/// hundred; this only exists to keep rasters bounded).
+pub const MAX_TEXT_CONTENT_BYTES: usize = 4096;
+
 /// A transition bound to the cut at its owning clip's out edge.
 ///
 /// The span is `duration` seconds **centered on the cut**; the effective
@@ -181,20 +288,29 @@ pub struct Transition {
     pub duration: f64,
 }
 
-/// A clip: a window into a media file, placed on the timeline.
+/// A clip on the timeline: a window into a media file, or (on text
+/// tracks) a styled text overlay.
 ///
 /// Invariants (enforced by [`Project::validate`]):
 /// - `timeline_in < timeline_out`, both finite and `>= 0`
-/// - `0 <= source_in < source_out <= media.duration`
-/// - `(timeline_out - timeline_in) * speed == source_out - source_in`
+/// - media clips (`media_id: Some`, `text: None`, every video/audio
+///   track): `0 <= source_in < source_out <= media.duration` and
+///   `(timeline_out - timeline_in) * speed == source_out - source_in`
 ///   (within [`EPS`]) — `speed` is modeled but fixed at `1.0` in Phase 1
+/// - text clips (`media_id: None`, `text: Some`, text tracks only):
+///   there is no source medium, so the source range is kept normalized
+///   to `[0, duration)` at `speed == 1.0` (trims/splits re-derive it) —
+///   a text clip trims freely in both directions
 /// - no overlap with other clips on the same track (touching edges are fine)
 /// - `transition_out` only on video tracks, only with a touching next clip
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
     pub id: ClipId,
-    pub media_id: MediaId,
+    /// The media this clip windows into; `None` exactly on text clips.
+    /// v1 files always store a number here and load as `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<MediaId>,
     /// Start position on the timeline, seconds (inclusive).
     pub timeline_in: f64,
     /// End position on the timeline, seconds (exclusive).
@@ -220,6 +336,10 @@ pub struct Clip {
     /// transitions serialize byte-identically to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_out: Option<Transition>,
+    /// Styled text payload — present exactly on text-track clips (schema
+    /// v2; see [`TrackKind::Text`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextSpec>,
 }
 
 impl Clip {
@@ -244,10 +364,10 @@ pub struct Track {
     /// Audio silenced. Applies to audio tracks and to the embedded audio
     /// of clips on video tracks; it never affects the picture.
     pub muted: bool,
-    /// Excluded from the video composite (preview and export take the
-    /// same `resolve_video_layers` path, so both respect it). Meaningful
-    /// on video tracks only. Additive schema field: pre-Phase 2 files
-    /// load as `false`.
+    /// Excluded from the composite (preview and export resolve layers
+    /// through the same paths, so both respect it). Meaningful on video
+    /// and text tracks. Additive schema field: pre-Phase 2 files load as
+    /// `false`.
     #[serde(default)]
     pub hidden: bool,
     pub clips: Vec<Clip>,
@@ -422,29 +542,57 @@ impl Project {
             });
         }
 
-        let media = self
-            .media(clip.media_id)
-            .ok_or(EngineError::UnknownMedia(clip.media_id))?;
-        let compatible = match track.kind {
-            TrackKind::Video => media.has_video,
-            TrackKind::Audio => media.has_audio,
-        };
-        if !compatible {
-            return Err(EngineError::IncompatibleMedia {
-                track: track.id,
-                media: media.id,
-            });
+        // Content: text tracks hold text clips, every other track holds
+        // media clips — never both payloads, never neither.
+        match (track.kind, clip.media_id, &clip.text) {
+            (TrackKind::Text, None, Some(text)) => Self::validate_text(clip, text)?,
+            (TrackKind::Text, _, _) => {
+                return Err(EngineError::InvalidText {
+                    clip: clip.id,
+                    reason: "text-track clips carry a text payload and no media",
+                });
+            }
+            (_, _, Some(_)) => {
+                return Err(EngineError::InvalidText {
+                    clip: clip.id,
+                    reason: "text clips live on text tracks",
+                });
+            }
+            (_, None, None) => {
+                return Err(EngineError::InvalidText {
+                    clip: clip.id,
+                    reason: "clip has neither media nor a text payload",
+                });
+            }
+            (_, Some(_), None) => {}
         }
-        if clip.source_in < -EPS
-            || clip.source_out <= clip.source_in
-            || clip.source_out > media.duration + EPS
-        {
-            return Err(EngineError::SourceOutOfBounds {
-                clip: clip.id,
-                source_in: clip.source_in,
-                source_out: clip.source_out,
-                media_duration: media.duration,
-            });
+
+        if let Some(media_id) = clip.media_id {
+            let media = self
+                .media(media_id)
+                .ok_or(EngineError::UnknownMedia(media_id))?;
+            let compatible = match track.kind {
+                TrackKind::Video => media.has_video,
+                TrackKind::Audio => media.has_audio,
+                TrackKind::Text => false, // unreachable: matched above
+            };
+            if !compatible {
+                return Err(EngineError::IncompatibleMedia {
+                    track: track.id,
+                    media: media.id,
+                });
+            }
+            if clip.source_in < -EPS
+                || clip.source_out <= clip.source_in
+                || clip.source_out > media.duration + EPS
+            {
+                return Err(EngineError::SourceOutOfBounds {
+                    clip: clip.id,
+                    source_in: clip.source_in,
+                    source_out: clip.source_out,
+                    media_duration: media.duration,
+                });
+            }
         }
 
         if !clip.speed.is_finite() || clip.speed <= 0.0 {
@@ -504,6 +652,69 @@ impl Project {
                 property: "transform.scale",
                 value: t.scale,
             });
+        }
+        Ok(())
+    }
+
+    /// Text-clip payload checks. The shared numeric checks in
+    /// [`Project::validate_clip`] (times, opacity, transform, the
+    /// speed/source linkage) still run; this adds what is text-specific.
+    fn validate_text(clip: &Clip, text: &TextSpec) -> Result<(), EngineError> {
+        // No source medium: speed is meaningless and pinned, and the
+        // source range must stay normalized to [0, duration) (the
+        // linkage check then forces source_out == duration).
+        if clip.speed != 1.0 {
+            return Err(EngineError::InvalidText {
+                clip: clip.id,
+                reason: "text clips play at speed 1.0",
+            });
+        }
+        if clip.source_in.abs() > EPS {
+            return Err(EngineError::InvalidText {
+                clip: clip.id,
+                reason: "text clips keep source_in == 0",
+            });
+        }
+        if text.content.len() > MAX_TEXT_CONTENT_BYTES {
+            return Err(EngineError::InvalidText {
+                clip: clip.id,
+                reason: "text content is too long",
+            });
+        }
+        let style = &text.style;
+        for (property, value, lo, hi) in [
+            ("text.fontSize", style.font_size, 1.0, 1000.0),
+            ("text.strokeWidth", style.stroke_width, 0.0, 100.0),
+            ("text.shadowOffsetX", style.shadow_offset_x, -1000.0, 1000.0),
+            ("text.shadowOffsetY", style.shadow_offset_y, -1000.0, 1000.0),
+            ("text.shadowAlpha", style.shadow_alpha, 0.0, 1.0),
+        ] {
+            if !value.is_finite() || value < lo || value > hi {
+                return Err(EngineError::InvalidProperty {
+                    clip: clip.id,
+                    property,
+                    value,
+                });
+            }
+        }
+        if !(100..=1000).contains(&style.weight) {
+            return Err(EngineError::InvalidProperty {
+                clip: clip.id,
+                property: "text.weight",
+                value: f64::from(style.weight),
+            });
+        }
+        for (color, reason) in [
+            (&style.fill, "unparseable fill color"),
+            (&style.stroke_color, "unparseable stroke color"),
+            (&style.shadow_color, "unparseable shadow color"),
+        ] {
+            if parse_hex_color(color).is_none() {
+                return Err(EngineError::InvalidText {
+                    clip: clip.id,
+                    reason,
+                });
+            }
         }
         Ok(())
     }

@@ -430,7 +430,7 @@ fn export_composited_timeline_end_to_end() {
             hidden: false,
             clips: vec![cutty_engine::Clip {
                 id: cutty_engine::ClipId(501),
-                media_id: overlay,
+                media_id: Some(overlay),
                 timeline_in: 0.5,
                 timeline_out: 1.5,
                 source_in: 0.0,
@@ -446,6 +446,7 @@ fn export_composited_timeline_end_to_end() {
                 speed: 1.0,
                 volume: 1.0,
                 transition_out: None,
+                text: None,
             }],
         },
     );

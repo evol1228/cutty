@@ -974,8 +974,8 @@ mod tests {
         for k in 0..64usize {
             let t = (head + k as i64) as f64 / f64::from(RATE);
             let x = (t - ramp.start) / (ramp.end - ramp.start);
-            let expected =
-                v as f32 * ((x * std::f64::consts::FRAC_PI_2).cos() as f32
+            let expected = v as f32
+                * ((x * std::f64::consts::FRAC_PI_2).cos() as f32
                     + (x * std::f64::consts::FRAC_PI_2).sin() as f32);
             assert!(
                 (out[k * 2] - expected).abs() < 1e-5,

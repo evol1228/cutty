@@ -207,6 +207,7 @@ fn upcoming_video_starts(project: &Project, t: f64, horizon: f64) -> Vec<Upcomin
         .flat_map(|track| {
             let spans = &spans;
             track.clips.iter().filter_map(move |clip| {
+                let media_id = clip.media_id?; // video-track clips always have media
                 let span = spans.iter().find(|s| s.to_clip == clip.id);
                 let (start, source_in, via_transition) = match span {
                     Some(s) => (
@@ -218,7 +219,7 @@ fn upcoming_video_starts(project: &Project, t: f64, horizon: f64) -> Vec<Upcomin
                 };
                 (t < start && start <= t + horizon).then_some(UpcomingClip {
                     clip_id: clip.id.0,
-                    media_id: clip.media_id.0,
+                    media_id: media_id.0,
                     timeline_in: start,
                     source_in,
                     via_transition,
@@ -236,7 +237,7 @@ fn upcoming_video_starts(project: &Project, t: f64, horizon: f64) -> Vec<Upcomin
 fn is_continuation(project: &Project, upcoming: &UpcomingClip, t: f64) -> bool {
     resolve_video_layers(project, t).iter().any(|active| {
         project.find_clip(active.clip_id).is_some_and(|(_, cur)| {
-            cur.media_id.0 == upcoming.media_id
+            cur.media_id.map(|m| m.0) == Some(upcoming.media_id)
                 && (cur.timeline_out - upcoming.timeline_in).abs() < CONTINUITY_EPS
                 && (cur.source_out - upcoming.source_in).abs() < CONTINUITY_EPS
         })
@@ -255,13 +256,17 @@ fn mixer_timeline(project: &Project, sources: &Sources) -> MixerTimeline {
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
         for clip in &track.clips {
-            let Some(media) = project.media(clip.media_id) else {
+            // Text clips (`media_id: None`) contribute no audio.
+            let Some((media_id, media)) = clip
+                .media_id
+                .and_then(|id| project.media(id).map(|m| (id, m)))
+            else {
                 continue;
             };
             if !media.has_audio {
                 continue;
             }
-            let Some(path) = sources.audio_path(clip.media_id.0) else {
+            let Some(path) = sources.audio_path(media_id.0) else {
                 continue; // proxy not ready yet — silent until refresh
             };
             let placement = crate::audio_layout::audio_placement(clip, &spans);
@@ -913,7 +918,10 @@ impl Engine {
     /// `None` = black (gap, no renderer, or a failed compose — failures
     /// are reported). Callers guarantee no frame is in flight.
     fn compose_frame(&mut self, idx: i64) -> Option<EncodedFrame> {
-        debug_assert!(self.inflight.is_none(), "sync compose with a frame in flight");
+        debug_assert!(
+            self.inflight.is_none(),
+            "sync compose with a frame in flight"
+        );
         let fps = self.project_fps();
         let t = idx as f64 / fps;
 
@@ -1230,7 +1238,7 @@ impl Engine {
             .filter_map(|a| {
                 self.project
                     .find_clip(a.clip_id)
-                    .map(|(_, c)| (a.clip_id.0, c.media_id.0, a.source_time))
+                    .and_then(|(_, c)| c.media_id.map(|m| (a.clip_id.0, m.0, a.source_time)))
             })
             .collect();
 

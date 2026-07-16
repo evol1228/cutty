@@ -4,11 +4,18 @@
 //! ## Format
 //!
 //! A `.cutty` file is pretty-printed JSON with a top-level `version`
-//! integer. Loading parses the version first, then dispatches to the
-//! matching schema arm in [`migrate`] — the migration scaffold. **If the
-//! model's serde shape ever changes, bump [`CURRENT_VERSION`] and add a
-//! migration arm**; the golden-fixture test in this module fails when the
-//! v1 shape drifts silently.
+//! integer. Loading parses the version first, then lifts the raw JSON
+//! through [`migrate`] one version step at a time up to
+//! [`CURRENT_VERSION`]. **If the model's serde shape ever changes, bump
+//! [`CURRENT_VERSION`] and add a migration arm**; the golden-fixture
+//! tests in this module fail when an historical shape stops loading.
+//!
+//! Version history:
+//! - **v1** — Phase 1 shape: video/audio tracks, media clips.
+//! - **v2** — text (Phase 2): `TrackKind::Text`, per-clip `text`
+//!   payloads, `mediaId` optional (absent on text clips). Pure superset
+//!   of v1; the bump exists because v1 builds cannot read files that
+//!   *use* the new constructs.
 //!
 //! ## Media paths
 //!
@@ -29,7 +36,7 @@ use crate::error::EngineError;
 use crate::model::{MediaId, MediaRef, Project, ProjectSettings, Track};
 
 /// The newest project-file schema version this build reads and writes.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Errors from saving or loading `.cutty` files.
 #[derive(Debug, thiserror::Error)]
@@ -52,10 +59,11 @@ pub enum ProjectFileError {
 }
 
 /// On-disk form of a [`MediaRef`]: the absolute path as registered, plus
-/// an optional path relative to the project file's directory.
+/// an optional path relative to the project file's directory. Shape
+/// unchanged since v1.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MediaEntryV1 {
+struct MediaEntry {
     id: MediaId,
     path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,29 +73,43 @@ struct MediaEntryV1 {
     has_audio: bool,
 }
 
-/// Schema v1. Tracks and clips reuse the model's serde shape directly;
-/// the golden-fixture test pins that shape.
+/// Schema v2 — the current shape. Tracks and clips reuse the model's
+/// serde shape directly; the golden-fixture tests pin it.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectFileV1 {
+struct ProjectFileV2 {
     version: u32,
     settings: ProjectSettings,
-    media: Vec<MediaEntryV1>,
+    media: Vec<MediaEntry>,
     tracks: Vec<Track>,
 }
 
-/// Migration scaffold: one arm per historical schema version, each lifting
-/// the raw JSON one step toward [`CURRENT_VERSION`]. v1 is the only arm
-/// today; when v2 lands, the `1` arm becomes a `v1_to_v2` transform and
-/// every old file keeps loading.
-fn migrate(value: Value, version: u64) -> Result<ProjectFileV1, ProjectFileError> {
-    match version {
-        1 => serde_json::from_value(value).map_err(ProjectFileError::Parse),
-        v => Err(ProjectFileError::UnsupportedVersion {
-            found: v,
-            max: CURRENT_VERSION,
-        }),
+/// Migration scaffold: one arm per historical schema version, each
+/// lifting the raw JSON one step toward [`CURRENT_VERSION`], then one
+/// parse of the fully-lifted document.
+fn migrate(value: Value, version: u64) -> Result<ProjectFileV2, ProjectFileError> {
+    let value = match version {
+        1 => migrate_v1_to_v2(value),
+        2 => value,
+        v => {
+            return Err(ProjectFileError::UnsupportedVersion {
+                found: v,
+                max: CURRENT_VERSION,
+            })
+        }
+    };
+    serde_json::from_value(value).map_err(ProjectFileError::Parse)
+}
+
+/// v1 → v2. v2 added `TrackKind::Text`, per-clip `text` payloads, and
+/// made `mediaId` optional — a pure superset of v1, so the lift is the
+/// version stamp alone (every v1 document is already a valid v2
+/// document).
+fn migrate_v1_to_v2(mut value: Value) -> Value {
+    if let Some(version) = value.get_mut("version") {
+        *version = 2.into();
     }
+    value
 }
 
 /// Serialize a project to `.cutty` JSON. `project_dir` is the directory
@@ -101,7 +123,7 @@ pub fn serialize(project: &Project, project_dir: Option<&Path>) -> String {
     let media = project
         .media
         .iter()
-        .map(|m| MediaEntryV1 {
+        .map(|m| MediaEntry {
             id: m.id,
             path: m.path.clone(),
             relative_path: project_dir
@@ -112,7 +134,7 @@ pub fn serialize(project: &Project, project_dir: Option<&Path>) -> String {
             has_audio: m.has_audio,
         })
         .collect();
-    let file = ProjectFileV1 {
+    let file = ProjectFileV2 {
         version: CURRENT_VERSION,
         settings: project.settings.clone(),
         media,
@@ -315,10 +337,10 @@ mod tests {
         }
     }
 
-    /// Golden v1 fixture: this exact JSON must keep loading forever. If
-    /// this test fails, the model's serde shape changed — bump
-    /// [`CURRENT_VERSION`] and add a migration arm instead of editing the
-    /// fixture.
+    /// Golden v1 fixture: this exact JSON must keep loading forever —
+    /// through the `migrate_v1_to_v2` arm now. If this test fails, a
+    /// migration arm regressed (or the current shape stopped being a
+    /// superset); never fix it by editing the fixture.
     #[test]
     fn golden_v1_fixture_loads() {
         let fixture = r#"{
@@ -372,5 +394,106 @@ mod tests {
         assert_eq!(project.media[0].path, "/media/clip.mp4");
         assert_eq!(project.tracks[0].clips.len(), 1);
         assert_eq!(project.tracks[0].clips[0].source_in, 2.0);
+        assert_eq!(
+            project.tracks[0].clips[0].media_id,
+            Some(crate::model::MediaId(3))
+        );
+    }
+
+    /// Golden v2 fixture (text tracks/clips): this exact JSON must keep
+    /// loading forever. A failure means the v2 serde shape drifted —
+    /// bump [`CURRENT_VERSION`] and add a migration arm instead of
+    /// editing the fixture.
+    #[test]
+    fn golden_v2_fixture_with_text_loads() {
+        // r## — the hex colors inside contain `"#`, which would end a
+        // plain r#-string.
+        let fixture = r##"{
+          "version": 2,
+          "settings": { "width": 1920, "height": 1080, "fps": 30.0 },
+          "media": [],
+          "tracks": [
+            {
+              "id": 1,
+              "kind": "text",
+              "name": "T1",
+              "locked": false,
+              "muted": false,
+              "hidden": false,
+              "clips": [
+                {
+                  "id": 2,
+                  "timelineIn": 1.0,
+                  "timelineOut": 4.0,
+                  "sourceIn": 0.0,
+                  "sourceOut": 3.0,
+                  "transform": { "x": 0.0, "y": 120.0, "scale": 1.0, "rotation": 0.0 },
+                  "opacity": 1.0,
+                  "speed": 1.0,
+                  "volume": 1.0,
+                  "text": {
+                    "content": "Hello\nCutty",
+                    "style": {
+                      "fontFamily": "",
+                      "weight": 700,
+                      "fontSize": 72.0,
+                      "fill": "#ffffff",
+                      "strokeColor": "#000000",
+                      "strokeWidth": 6.0,
+                      "shadowColor": "#000000",
+                      "shadowOffsetX": 0.0,
+                      "shadowOffsetY": 4.0,
+                      "shadowAlpha": 0.35,
+                      "align": "center"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "id": 3,
+              "kind": "video",
+              "name": "V1",
+              "locked": false,
+              "muted": false,
+              "clips": []
+            },
+            {
+              "id": 4,
+              "kind": "audio",
+              "name": "A1",
+              "locked": false,
+              "muted": false,
+              "clips": []
+            }
+          ]
+        }"##;
+        let project = deserialize(fixture, None).expect("v2 fixture loads");
+        let clip = &project.tracks[0].clips[0];
+        assert_eq!(clip.media_id, None);
+        let text = clip.text.as_ref().expect("text payload");
+        assert_eq!(text.content, "Hello\nCutty");
+        assert_eq!(text.style.weight, 700);
+
+        // Round-trip: serialize → load again → identical project, and
+        // the written version is the current one.
+        let json = serialize(&project, None);
+        assert!(json.contains("\"version\": 2"));
+        let again = deserialize(&json, None).expect("round-trip loads");
+        assert_eq!(again, project);
+    }
+
+    /// A media clip's serialized shape is unchanged from v1 except the
+    /// version stamp — `mediaId` still writes as a bare number and no
+    /// `text` key appears.
+    #[test]
+    fn media_clips_serialize_without_text_noise() {
+        let mut engine = crate::engine::Engine::new(ProjectSettings::default());
+        let media = engine.add_media("/m/a.mp4", 10.0, true, true).unwrap();
+        let video = engine.project().tracks[0].id;
+        engine.add_clip(video, media, 0.0, 0.0, 5.0).unwrap();
+        let json = serialize(engine.project(), None);
+        assert!(json.contains("\"mediaId\": 3"), "{json}");
+        assert!(!json.contains("\"text\""), "{json}");
     }
 }

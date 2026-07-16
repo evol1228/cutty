@@ -62,7 +62,9 @@ const COLORS = {
   videoBorder: "#0369a1", // sky-700
   audioFill: "#064e3b", // emerald-900
   audioBorder: "#047857", // emerald-700
-  selectedFill: { video: "#075985", audio: "#065f46" },
+  textFill: "#7c2d12", // orange-900
+  textBorder: "#c2410c", // orange-700
+  selectedFill: { video: "#075985", audio: "#065f46", text: "#9a3412" },
   selectedBorder: "#f59e0b", // amber-500
   missingFill: "#450a0a", // red-950
   missingBorder: "#b91c1c", // red-700
@@ -314,14 +316,17 @@ function drawClip(
       ? COLORS.selectedFill[kind]
       : kind === "video"
         ? COLORS.videoFill
-        : COLORS.audioFill;
+        : kind === "text"
+          ? COLORS.textFill
+          : COLORS.audioFill;
   roundRectPath(ctx, x, y, w, h, 5);
   ctx.fill();
 
   // Clip visuals v1: one representative thumbnail at the clip's left edge
   // (full filmstrips are Phase 2). Missing media shows red, no stale frame.
   let labelIndent = 0;
-  const thumbUrl = missing ? undefined : thumbs.get(clip.mediaId);
+  const thumbUrl =
+    missing || clip.mediaId === undefined ? undefined : thumbs.get(clip.mediaId);
   if (thumbUrl && w >= 40 && kind === "video") {
     const img = thumbImage(thumbUrl);
     if (img) {
@@ -342,22 +347,34 @@ function drawClip(
       ? COLORS.missingBorder
       : kind === "video"
         ? COLORS.videoBorder
-        : COLORS.audioBorder;
+        : kind === "text"
+          ? COLORS.textBorder
+          : COLORS.audioBorder;
   roundRectPath(ctx, x, y, w, h, 5);
   ctx.stroke();
   ctx.lineWidth = 1;
 
   if (w >= 28 + labelIndent) {
-    const name = mediaNames.get(clip.mediaId) ?? `clip ${clip.id}`;
-    const label = missing ? `⚠ ${name}` : name;
+    // Text clips label with their content's first line, "T"-prefixed;
+    // media clips with their file name.
+    const label =
+      kind === "text"
+        ? `T  ${(clip.text?.content ?? "").split("\n")[0] || "(empty)"}`
+        : (() => {
+            const name =
+              (clip.mediaId !== undefined
+                ? mediaNames.get(clip.mediaId)
+                : undefined) ?? `clip ${clip.id}`;
+            return missing ? `⚠ ${name}` : name;
+          })();
     ctx.save();
     roundRectPath(ctx, x + 2, y, w - 4, h, 5);
     ctx.clip();
     ctx.fillStyle = COLORS.clipLabel;
-    ctx.font = "11px system-ui, sans-serif";
+    ctx.font = kind === "text" ? "bold 10px system-ui, sans-serif" : "11px system-ui, sans-serif";
     ctx.textBaseline = "top";
     ctx.textAlign = "left";
-    ctx.fillText(label, x + labelIndent + 7, y + 5);
+    ctx.fillText(label, x + labelIndent + 7, kind === "text" ? y + 4 : y + 5);
     ctx.restore();
   }
 
@@ -587,7 +604,7 @@ export function drawTimeline(
           laneY,
           laneH,
           selected.has(clip.id),
-          missingIds.has(clip.mediaId),
+          clip.mediaId !== undefined && missingIds.has(clip.mediaId),
           names,
           thumbs,
         );

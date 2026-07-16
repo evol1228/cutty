@@ -122,6 +122,25 @@ pub struct TransitionDefWire {
     pub default_duration: f64,
 }
 
+/// Distinct system font families (fontconfig), sorted — the Inspector's
+/// font dropdown. First call loads the font database; run it off the IPC
+/// thread.
+#[tauri::command]
+pub async fn text_font_families() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(cutty_media::text_font_families)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Measure a text block in project pixels at transform scale 1 (the
+/// player gizmo's box), using the renderer's own layout.
+#[tauri::command]
+pub async fn text_measure(text: cutty_engine::TextSpec) -> Result<(f64, f64), String> {
+    tauri::async_runtime::spawn_blocking(move || cutty_media::measure_text_block(&text))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The transition catalog for the left-panel Transitions tab.
 #[tauri::command]
 pub fn transition_list() -> Vec<TransitionDefWire> {

@@ -30,7 +30,16 @@ fn make_source(name: &str, pattern: &str, fps: u32, secs: u32) -> PathBuf {
     let status = Command::new("ffmpeg")
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
         .arg(format!("{pattern}=size=640x360:rate={fps}:duration={secs}"))
-        .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-pix_fmt", "yuv420p"])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+        ])
         .arg(&file)
         .status()
         .expect("system ffmpeg required");

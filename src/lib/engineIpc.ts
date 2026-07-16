@@ -20,7 +20,7 @@ export interface MediaRef {
   hasAudio: boolean;
 }
 
-export type TrackKind = "video" | "audio";
+export type TrackKind = "video" | "audio" | "text";
 
 /** Per-track toggle switches (mirrors the engine's TrackFlag). */
 export type TrackFlag = "locked" | "muted" | "hidden";
@@ -47,9 +47,36 @@ export interface Transition {
   duration: number;
 }
 
+export type TextAlign = "left" | "center" | "right";
+
+/** Visual style of a text clip. Pixel quantities are project pixels at
+ * transform scale 1; colors are #RRGGBB or #RRGGBBAA. */
+export interface TextStyle {
+  fontFamily: string;
+  /** 100–900 (400 regular, 700 bold). */
+  weight: number;
+  fontSize: number;
+  fill: string;
+  strokeColor: string;
+  strokeWidth: number;
+  shadowColor: string;
+  shadowOffsetX: number;
+  shadowOffsetY: number;
+  /** 0..1; 0 disables the shadow. */
+  shadowAlpha: number;
+  align: TextAlign;
+}
+
+/** Styled text payload of a clip on a text track. */
+export interface TextSpec {
+  content: string;
+  style: TextStyle;
+}
+
 export interface Clip {
   id: number;
-  mediaId: number;
+  /** Absent exactly on text clips (which carry `text` instead). */
+  mediaId?: number;
   timelineIn: number;
   timelineOut: number;
   sourceIn: number;
@@ -61,6 +88,8 @@ export interface Clip {
   volume: number;
   /** Transition into the next clip on the same track (absent = none). */
   transitionOut?: Transition | null;
+  /** Present exactly on text-track clips. */
+  text?: TextSpec | null;
 }
 
 export interface Track {
@@ -161,6 +190,52 @@ export function engineAddClip(
     sourceIn,
     sourceOut,
   });
+}
+
+/** Place a new text clip. `trackId: null` = CapCut placement: topmost
+ * text lane with room, else a new lane on top (one undo step). Returns
+ * the new clip's id. */
+export function engineAddTextClip(
+  timelineIn: number,
+  duration: number,
+  text: TextSpec,
+  transform?: Transform,
+  trackId?: number,
+): Promise<number> {
+  return invoke<number>("engine_add_text_clip", {
+    timelineIn,
+    duration,
+    text,
+    transform: transform ?? null,
+    trackId: trackId ?? null,
+  });
+}
+
+/** Replace a text clip's content and/or style (equal payloads no-op). */
+export function engineSetClipText(
+  clipId: number,
+  text: TextSpec,
+): Promise<void> {
+  return invoke("engine_set_clip_text", { clipId, text });
+}
+
+/** Distinct system font families, sorted. First call loads the font
+ * database backend-side; cache the promise. */
+export function textFontFamilies(): Promise<string[]> {
+  return invoke<string[]>("text_font_families");
+}
+
+let fontFamiliesCache: Promise<string[]> | null = null;
+
+/** [`textFontFamilies`], fetched once and shared. */
+export function cachedFontFamilies(): Promise<string[]> {
+  fontFamiliesCache ??= textFontFamilies();
+  return fontFamiliesCache;
+}
+
+/** Measure a text block in project pixels at scale 1 (gizmo box size). */
+export function textMeasure(text: TextSpec): Promise<[number, number]> {
+  return invoke<[number, number]>("text_measure", { text });
 }
 
 export function engineMoveClip(

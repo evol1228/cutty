@@ -14,12 +14,17 @@ export const MAX_PX_PER_SEC = 800;
 // Layout shared between the canvas renderer and the React track headers.
 export const RULER_H = 26;
 /** Lane heights by track kind — video lanes carry thumbnails, audio
- * lanes are compact (the CapCut proportions). */
+ * lanes are compact, text lanes slimmer still (the CapCut proportions). */
 export const VIDEO_LANE_H = 56;
 export const AUDIO_LANE_H = 36;
+export const TEXT_LANE_H = 28;
 
 export function laneHeight(kind: TrackKind): number {
-  return kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H;
+  return kind === "video"
+    ? VIDEO_LANE_H
+    : kind === "audio"
+      ? AUDIO_LANE_H
+      : TEXT_LANE_H;
 }
 
 /** Top of lane `index` in *content* space (0 = directly below the ruler

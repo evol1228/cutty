@@ -453,9 +453,7 @@ fn five_consecutive_transitions_play_without_hitching() {
     let mut colors = Vec::new();
     for i in 0..6 {
         let t = i as f64 * 1.2;
-        let clip = engine
-            .add_clip(video, media[i % 3], t, 0.5, 1.7)
-            .unwrap();
+        let clip = engine.add_clip(video, media[i % 3], t, 0.5, 1.7).unwrap();
         clips.push(clip);
         colors.push(sources[i % 3].0);
     }
@@ -518,12 +516,19 @@ fn five_consecutive_transitions_play_without_hitching() {
             pair[0].pts
         );
     }
-    println!("5-transition playback: {} frames, worst gap {worst_gap:?}", frames.len());
+    println!(
+        "5-transition playback: {} frames, worst gap {worst_gap:?}",
+        frames.len()
+    );
 
     // Content sanity: outside every span the presented frame shows its
     // clip's solid color; inside a span it shows one/both neighbors
     // (blends classify as either side), never black.
-    let in_span = |pts: f64| spans.iter().any(|&(s, e)| pts >= s - 1e-6 && pts < e + 1e-6);
+    let in_span = |pts: f64| {
+        spans
+            .iter()
+            .any(|&(s, e)| pts >= s - 1e-6 && pts < e + 1e-6)
+    };
     for f in frames.iter().skip(3) {
         if in_span(f.pts) {
             assert_ne!(f.color, "black", "span frame at {:.3} went black", f.pts);

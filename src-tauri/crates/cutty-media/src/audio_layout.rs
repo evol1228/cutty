@@ -66,8 +66,13 @@ mod tests {
 
     /// A|B touching at 2.0 with a 1s fade; A has handle audio past its
     /// out, B starts `b_source_in` into its source.
-    fn fixture(b_source_in: f64) -> (cutty_engine::Project, cutty_engine::ClipId, cutty_engine::ClipId)
-    {
+    fn fixture(
+        b_source_in: f64,
+    ) -> (
+        cutty_engine::Project,
+        cutty_engine::ClipId,
+        cutty_engine::ClipId,
+    ) {
         let mut engine = Engine::new(ProjectSettings::default());
         let media = engine.add_media("/tmp/a.mp4", 10.0, true, true).unwrap();
         let video = engine
@@ -130,7 +135,10 @@ mod tests {
         let spans = transition_spans(&project);
         let (_, clip) = project.find_clip(b).unwrap();
         let p = audio_placement(clip, &spans);
-        assert!((p.timeline_in - 2.0).abs() < 1e-9, "no audio before source 0");
+        assert!(
+            (p.timeline_in - 2.0).abs() < 1e-9,
+            "no audio before source 0"
+        );
         assert_eq!(p.source_in, 0.0);
         let ramp = p.fade_in.unwrap();
         assert!((ramp.gain_in(2.0) - std::f64::consts::FRAC_1_SQRT_2 as f32).abs() < 1e-6);

@@ -6,14 +6,14 @@ use serde::Serialize;
 use crate::command::{
     AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, MoveClip,
     MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RippleDelete, RippleMove,
-    SetClipBlendMode, SetClipOpacity, SetClipTransform, SetClipVolume, SetTrackFlag,
+    SetClipBlendMode, SetClipOpacity, SetClipText, SetClipTransform, SetClipVolume, SetTrackFlag,
     SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 use crate::error::EngineError;
 use crate::model::{
-    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, Track,
-    TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION, MIN_CLIP_DURATION,
-    MIN_TRANSITION_DURATION,
+    clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TextSpec,
+    Track, TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION,
+    MIN_CLIP_DURATION, MIN_TRANSITION_DURATION,
 };
 use crate::resolve::transition_duration_limit;
 
@@ -245,7 +245,7 @@ impl Engine {
         // Removal deletes clips, and deleting from a locked track is an
         // edit like any other — unlock first.
         for track in &self.project.tracks {
-            if track.clips.iter().any(|c| c.media_id == media_id) {
+            if track.clips.iter().any(|c| c.media_id == Some(media_id)) {
                 Self::require_track_unlocked(track)?;
             }
         }
@@ -256,7 +256,7 @@ impl Engine {
             .flat_map(|t| {
                 t.clips
                     .iter()
-                    .filter(|c| c.media_id == media_id)
+                    .filter(|c| c.media_id == Some(media_id))
                     .map(|c| (t.id, c.clone()))
             })
             .collect();
@@ -288,12 +288,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Auto-name for a new track: `V<n>`/`A<n>`, one past the highest
-    /// existing number of that kind (so removals never cause collisions).
+    /// Auto-name for a new track: `V<n>`/`A<n>`/`T<n>`, one past the
+    /// highest existing number of that kind (so removals never cause
+    /// collisions).
     fn next_track_name(&self, kind: TrackKind) -> String {
         let prefix = match kind {
             TrackKind::Video => 'V',
             TrackKind::Audio => 'A',
+            TrackKind::Text => 'T',
         };
         let max_n = self
             .project
@@ -321,8 +323,9 @@ impl Engine {
     }
 
     /// Remove a track with all its clips (undo restores everything).
-    /// Rejected on a locked track and for the last track of its kind —
-    /// the editor always keeps at least one video and one audio lane.
+    /// Rejected on a locked track and for the last *video*/*audio* track
+    /// — the editor always keeps at least one of each. Text tracks are
+    /// exempt: they exist on demand and a project may have none.
     pub fn remove_track(&mut self, track_id: TrackId) -> Result<(), EngineError> {
         let index = self
             .project
@@ -338,12 +341,13 @@ impl Engine {
             .iter()
             .filter(|t| t.kind == track.kind)
             .count();
-        if siblings <= 1 {
+        if siblings <= 1 && track.kind != TrackKind::Text {
             return Err(EngineError::LastTrackOfKind {
                 track: track_id,
                 kind: match track.kind {
                     TrackKind::Video => "video",
                     TrackKind::Audio => "audio",
+                    TrackKind::Text => "text", // unreachable: exempt above
                 },
             });
         }
@@ -425,7 +429,7 @@ impl Engine {
         let id = ClipId(self.next_id());
         let clip = Clip {
             id,
-            media_id,
+            media_id: Some(media_id),
             timeline_in,
             timeline_out: timeline_in + (source_out - source_in) / speed,
             source_in,
@@ -436,9 +440,127 @@ impl Engine {
             speed,
             volume: 1.0,
             transition_out: None,
+            text: None,
         };
         self.execute(Box::new(AddClip { track_id, clip }))?;
         Ok(id)
+    }
+
+    /// Place a new text clip at `timeline_in` for `duration` seconds.
+    ///
+    /// `track`: a specific text track, or `None` for CapCut-style
+    /// placement — the topmost unlocked text track with room takes the
+    /// clip; when none has room (or none exists) a new text lane is
+    /// created at the top of the panel, and track + clip land as **one**
+    /// undo entry. Returns the new clip's id.
+    pub fn add_text_clip(
+        &mut self,
+        timeline_in: f64,
+        duration: f64,
+        text: TextSpec,
+        transform: Transform,
+        track: Option<TrackId>,
+    ) -> Result<ClipId, EngineError> {
+        if !timeline_in.is_finite() || !duration.is_finite() || duration < MIN_CLIP_DURATION {
+            return Err(EngineError::InvalidTimeRange {
+                clip: ClipId(0),
+                timeline_in,
+                timeline_out: timeline_in + duration,
+            });
+        }
+        let timeline_in = timeline_in.max(0.0);
+        let timeline_out = timeline_in + duration;
+
+        let span_free = |t: &Track| {
+            t.clips
+                .iter()
+                .all(|c| c.timeline_out <= timeline_in + EPS || c.timeline_in >= timeline_out - EPS)
+        };
+        let target = match track {
+            Some(id) => {
+                let t = self
+                    .project
+                    .track(id)
+                    .ok_or(EngineError::UnknownTrack(id))?;
+                if t.kind != TrackKind::Text {
+                    return Err(EngineError::InvalidText {
+                        clip: ClipId(0),
+                        reason: "target is not a text track",
+                    });
+                }
+                Self::require_track_unlocked(t)?;
+                Some(id)
+            }
+            None => self
+                .project
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Text && !t.locked && span_free(t))
+                .map(|t| t.id),
+        };
+
+        let clip_id = ClipId(self.next_id());
+        let clip = Clip {
+            id: clip_id,
+            media_id: None,
+            timeline_in,
+            timeline_out,
+            source_in: 0.0,
+            source_out: duration,
+            transform,
+            opacity: 1.0,
+            blend_mode: BlendMode::default(),
+            speed: 1.0,
+            volume: 1.0,
+            transition_out: None,
+            text: Some(text),
+        };
+
+        match target {
+            Some(track_id) => self.execute(Box::new(AddClip { track_id, clip }))?,
+            None => {
+                // No text lane has room: create one at the top, as one
+                // atomic, undoable unit with the clip placement.
+                let track_id = TrackId(self.next_id());
+                let track = Track::new(
+                    track_id,
+                    TrackKind::Text,
+                    self.next_track_name(TrackKind::Text),
+                );
+                self.execute(Box::new(Compound {
+                    name: "AddTextClip",
+                    parts: vec![
+                        Box::new(AddTrack { index: 0, track }),
+                        Box::new(AddClip { track_id, clip }),
+                    ],
+                }))?;
+            }
+        }
+        Ok(clip_id)
+    }
+
+    /// Replace a text clip's payload (content and/or style). Equal
+    /// payloads are a no-op (no undo entry) so UI echoes don't pollute
+    /// the stack.
+    pub fn set_clip_text(&mut self, clip_id: ClipId, text: TextSpec) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        let old = clip.text.clone().ok_or(EngineError::InvalidText {
+            clip: clip_id,
+            reason: "not a text clip",
+        })?;
+        if old == text {
+            return Ok(());
+        }
+        self.execute(Box::new(SetClipText {
+            track_id: track.id,
+            clip_id,
+            old,
+            new: text,
+        }))
     }
 
     /// Move a clip to a new timeline position (clamped to `>= 0`); duration
@@ -514,7 +636,9 @@ impl Engine {
     /// adjusting the source range correspondingly. The requested time is
     /// clamped to media bounds and to [`MIN_CLIP_DURATION`]; the clamped
     /// edge time actually applied is returned. Fails if the result would
-    /// overlap a neighboring clip.
+    /// overlap a neighboring clip. Text clips have no medium to bound the
+    /// drag, so they trim freely in both directions (their source range
+    /// just re-normalizes to the new duration).
     pub fn trim_clip(
         &mut self,
         clip_id: ClipId,
@@ -533,17 +657,26 @@ impl Engine {
                 timeline_out: to,
             });
         }
-        let media = self
-            .project
-            .media(clip.media_id)
-            .ok_or(EngineError::UnknownMedia(clip.media_id))?;
+        // `None` = no source medium (text clip): unbounded headroom.
+        let media_duration = match clip.media_id {
+            Some(id) => Some(
+                self.project
+                    .media(id)
+                    .ok_or(EngineError::UnknownMedia(id))?
+                    .duration,
+            ),
+            None => None,
+        };
         let old = ClipSpan::of(clip);
         let mut new = old;
 
         let applied = match edge {
             TrimEdge::Start => {
                 // Media headroom to the left, and timeline 0, bound the drag.
-                let lo = (clip.timeline_in - clip.source_in / clip.speed).max(0.0);
+                let lo = match media_duration {
+                    Some(_) => (clip.timeline_in - clip.source_in / clip.speed).max(0.0),
+                    None => 0.0,
+                };
                 let hi = clip.timeline_out - MIN_CLIP_DURATION;
                 if lo > hi {
                     return Err(EngineError::InvalidTimeRange {
@@ -554,12 +687,17 @@ impl Engine {
                 }
                 let t = to.clamp(lo, hi);
                 new.timeline_in = t;
-                new.source_in = (clip.source_in + (t - clip.timeline_in) * clip.speed).max(0.0);
+                if media_duration.is_some() {
+                    new.source_in = (clip.source_in + (t - clip.timeline_in) * clip.speed).max(0.0);
+                }
                 t
             }
             TrimEdge::End => {
                 let lo = clip.timeline_in + MIN_CLIP_DURATION;
-                let hi = clip.timeline_out + (media.duration - clip.source_out) / clip.speed;
+                let hi = match media_duration {
+                    Some(d) => clip.timeline_out + (d - clip.source_out) / clip.speed,
+                    None => f64::INFINITY,
+                };
                 if lo > hi {
                     return Err(EngineError::InvalidTimeRange {
                         clip: clip_id,
@@ -569,11 +707,18 @@ impl Engine {
                 }
                 let t = to.clamp(lo, hi);
                 new.timeline_out = t;
-                new.source_out =
-                    (clip.source_out + (t - clip.timeline_out) * clip.speed).min(media.duration);
+                if let Some(d) = media_duration {
+                    new.source_out =
+                        (clip.source_out + (t - clip.timeline_out) * clip.speed).min(d);
+                }
                 t
             }
         };
+        if media_duration.is_none() {
+            // Text: keep the source range normalized to [0, duration).
+            new.source_in = 0.0;
+            new.source_out = new.timeline_out - new.timeline_in;
+        }
 
         self.execute_structural(Box::new(TrimClip {
             track_id: track.id,
@@ -585,10 +730,11 @@ impl Engine {
     }
 
     /// Split a clip at timeline time `at` into two clips sharing the same
-    /// media, transform, and properties. The left half keeps the original
-    /// id; the new right half's id is returned. `at` must be strictly
-    /// inside the clip (at least [`MIN_CLIP_DURATION`] from each edge) —
-    /// splitting at an exact clip edge is rejected.
+    /// media (or, for text clips, duplicating the full text payload —
+    /// each half is an independent complete text). The left half keeps
+    /// the original id; the new right half's id is returned. `at` must be
+    /// strictly inside the clip (at least [`MIN_CLIP_DURATION`] from each
+    /// edge) — splitting at an exact clip edge is rejected.
     pub fn split_clip(&mut self, clip_id: ClipId, at: f64) -> Result<ClipId, EngineError> {
         self.require_clip_unlocked(clip_id)?;
         let (track, clip) = self
@@ -616,6 +762,14 @@ impl Engine {
         right.id = ClipId(self.next_id());
         right.timeline_in = at;
         right.source_in = source_at;
+        if original.text.is_some() {
+            // No source medium: each half re-normalizes to [0, duration)
+            // and keeps the whole (duplicated) text payload.
+            left.source_in = 0.0;
+            left.source_out = left.timeline_out - left.timeline_in;
+            right.source_in = 0.0;
+            right.source_out = right.timeline_out - right.timeline_in;
+        }
         let right_id = right.id;
 
         self.execute(Box::new(SplitClip {
@@ -786,8 +940,8 @@ impl Engine {
                         clip: clip_id,
                         reason: "no adjacent clip after the cut",
                     })?;
-                let limit =
-                    transition_duration_limit(&self.project, clip, next).min(MAX_TRANSITION_DURATION);
+                let limit = transition_duration_limit(&self.project, clip, next)
+                    .min(MAX_TRANSITION_DURATION);
                 // Floor at the standard minimum unless the cut itself
                 // supports less (two very short clips).
                 let duration = t

@@ -81,6 +81,12 @@ pub enum EngineError {
     #[error("invalid transition on clip {clip:?}: {reason}")]
     InvalidTransition { clip: ClipId, reason: &'static str },
 
+    /// A text payload is malformed, or a clip's payload doesn't match
+    /// its track kind (text clips live on text tracks and carry no
+    /// media; every other clip is a media clip).
+    #[error("invalid text on clip {clip:?}: {reason}")]
+    InvalidText { clip: ClipId, reason: &'static str },
+
     /// The operation targets a locked track. `name` is carried so the UI
     /// can say which track without a second lookup.
     #[error("track \"{name}\" is locked — unlock it to edit")]

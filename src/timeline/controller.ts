@@ -22,6 +22,7 @@ import { useMediaStore } from "../state/mediaStore";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
 import {
+  addTextAtPlayhead,
   deleteSelection,
   goToEnd,
   goToStart,
@@ -682,12 +683,12 @@ export function createTimelineController(
         }
         const hit = hitTest(x, y);
         canvas.style.cursor = cursorFor(hit);
-        // Missing-media tooltip on hovered clips.
+        // Missing-media tooltip on hovered clips (text clips have none).
         let title = "";
         if (hit.region === "lane" && hit.clip) {
           const mediaId = hit.clip.mediaId;
           const media = useMediaStore.getState();
-          if (media.missingMediaIds.has(mediaId)) {
+          if (mediaId !== undefined && media.missingMediaIds.has(mediaId)) {
             const item = media.items.find((i) => i.mediaId === mediaId);
             title = `Missing media: ${item?.path ?? "source file not found"}`;
           }
@@ -914,6 +915,10 @@ export function createTimelineController(
       case "s":
       case "S":
         void splitAtPlayhead();
+        break;
+      case "t":
+      case "T":
+        void addTextAtPlayhead();
         break;
       case "Delete":
       case "Backspace": {

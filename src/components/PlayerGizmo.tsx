@@ -1,10 +1,11 @@
-// Transform gizmo over the player canvas: the selected video clip gets a
-// bounding box — drag the body to reposition, corner handles for uniform
-// scale, the lollipop above the box to rotate. All geometry mirrors the
-// compositor's layer placement (project space → canvas box, contain,
-// centered), so the box hugs the rendered pixels; every mutation goes
-// through the engine's transaction API (one drag = one undo entry), and
-// the paused-frame re-composite makes the picture chase the box live.
+// Transform gizmo over the player canvas: the selected video *or text*
+// clip gets a bounding box — drag the body to reposition, corner handles
+// for uniform scale, the lollipop above the box to rotate. All geometry
+// mirrors the compositor's layer placement (video: contain-fit in the
+// project canvas; text: the engine-measured block box), so the box hugs
+// the rendered pixels; every mutation goes through the engine's
+// transaction API (one drag = one undo entry), and the paused-frame
+// re-composite makes the picture chase the box live.
 
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
@@ -13,6 +14,7 @@ import {
   engineCommitTransaction,
   engineRollbackTransaction,
   engineSetClipTransform,
+  textMeasure,
   type Clip,
   type Track,
   type Transform,
@@ -64,13 +66,18 @@ function useCanvasRect(
   return rect;
 }
 
-/** The selected clip when it is exactly one, on a video track. */
-function selectedVideoClip(): { clip: Clip; track: Track } | null {
+/** The selected clip when it is exactly one, on a video or text track
+ * (the kinds the gizmo can place). */
+function selectedGizmoClip(): { clip: Clip; track: Track } | null {
   const { project, selection } = useProjectStore.getState();
   if (!project || selection.length !== 1) return null;
   for (const track of project.tracks) {
     const clip = track.clips.find((c) => c.id === selection[0]);
-    if (clip) return track.kind === "video" ? { clip, track } : null;
+    if (clip) {
+      return track.kind === "video" || track.kind === "text"
+        ? { clip, track }
+        : null;
+    }
   }
   return null;
 }
@@ -109,6 +116,30 @@ function PlayerGizmo({
   // Live transform during a drag: the engine echoes state back per step,
   // but driving the box from local state keeps it glitch-free.
   const [dragTransform, setDragTransform] = useState<Transform | null>(null);
+  // Measured block size (project px) of the selected *text* clip — the
+  // engine's own layout, so the box hugs the rendered glyphs. Keyed by
+  // the payload; re-measures on content/style edits.
+  const [textBlock, setTextBlock] = useState<{
+    key: string;
+    w: number;
+    h: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const text = selectedGizmoClip()?.clip.text;
+    if (!text) return;
+    const key = JSON.stringify(text);
+    if (textBlock?.key === key) return;
+    let alive = true;
+    textMeasure(text)
+      .then(([w, h]) => {
+        if (alive) setTextBlock({ key, w, h });
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  });
 
   // Escape cancels an in-flight gesture (engine state rolls back).
   useEffect(() => {
@@ -125,11 +156,15 @@ function PlayerGizmo({
   }, []);
 
   if (!project || !rect || selection.length !== 1) return null;
-  const selected = selectedVideoClip();
+  const selected = selectedGizmoClip();
   if (!selected) return null;
   const { clip, track } = selected;
-  const media = project.media.find((m) => m.id === clip.mediaId);
-  if (!media?.hasVideo || track.hidden || track.locked) return null;
+  const isText = track.kind === "text";
+  const media = isText
+    ? null
+    : project.media.find((m) => m.id === clip.mediaId);
+  if (!isText && !media?.hasVideo) return null;
+  if (track.hidden || track.locked) return null;
   // The box only makes sense while the clip is on screen.
   if (playheadSec < clip.timelineIn || playheadSec >= clip.timelineOut) {
     return null;
@@ -142,16 +177,31 @@ function PlayerGizmo({
   const offX = rect.left + (rect.width - pw * s) / 2;
   const offY = rect.top + (rect.height - ph * s) / 2;
 
-  // Source frame fit inside the project canvas (contain, centered); the
-  // pool's probe supplies dimensions, project-shaped until it lands.
-  const info = mediaItems.find((i) => i.mediaId === clip.mediaId)?.info;
-  const srcW = info?.video?.width ?? pw;
-  const srcH = info?.video?.height ?? ph;
-  const base = Math.min(pw / srcW, ph / srcH);
+  // Base box in project px: for video, the source frame fit inside the
+  // project canvas (contain, centered — probe supplies dimensions); for
+  // text, the engine-measured block at scale 1 (no canvas fit).
+  let srcW: number;
+  let srcH: number;
+  let base: number;
+  if (isText) {
+    if (!clip.text || textBlock?.key !== JSON.stringify(clip.text)) {
+      return null; // measure in flight — the box appears next frame
+    }
+    srcW = textBlock.w;
+    srcH = textBlock.h;
+    base = 1;
+  } else {
+    const info = mediaItems.find((i) => i.mediaId === clip.mediaId)?.info;
+    srcW = info?.video?.width ?? pw;
+    srcH = info?.video?.height ?? ph;
+    base = Math.min(pw / srcW, ph / srcH);
+  }
 
   const t = dragTransform ?? clip.transform;
-  const boxW = srcW * base * t.scale * s;
-  const boxH = srcH * base * t.scale * s;
+  // Empty text measures 0×0 — keep a grabbable minimum so the clip can
+  // still be placed while its content is blank.
+  const boxW = Math.max(srcW * base * t.scale * s, isText ? 24 : 0);
+  const boxH = Math.max(srcH * base * t.scale * s, isText ? 24 : 0);
   const cx = (pw / 2 + t.x) * s + offX;
   const cy = (ph / 2 + t.y) * s + offY;
 
