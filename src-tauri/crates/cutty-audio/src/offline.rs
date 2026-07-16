@@ -248,6 +248,7 @@ mod tests {
             source_in: 0.0,
             speed: 1.0,
             volume,
+            envelope: None,
             fade_in: None,
             fade_out: None,
         }
@@ -376,6 +377,107 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AudioError::Cancelled), "{err}");
         assert!(!dst.exists());
+    }
+
+    /// Acceptance: a keyframed volume envelope exports with the exact
+    /// preview gain curve. The offline WAV is compared per sample both
+    /// against the analytic fade formula and against blocks rendered
+    /// through `render_block` — the live preview path — so preview,
+    /// export, and the drawn envelope are provably the same curve.
+    #[test]
+    fn keyframed_envelope_exports_the_exact_preview_curve() {
+        use crate::mixer::{place, render_block, Easing, EnvelopePoint, VolumeEnvelope};
+        use std::collections::HashMap;
+
+        // 1 s clip at volume 0.8: linear fade-in over 0.25 s, fade-out
+        // over 0.5 s (the keyframe pairs the fade handles create).
+        let mut segment = seg(0.0, 1.0, 0.8);
+        segment.envelope = Some(VolumeEnvelope {
+            points: vec![
+                EnvelopePoint {
+                    t: 0.0,
+                    value: 0.0,
+                    easing: Easing::Linear,
+                },
+                EnvelopePoint {
+                    t: 0.25,
+                    value: 1.0,
+                    easing: Easing::Linear,
+                },
+                EnvelopePoint {
+                    t: 0.5,
+                    value: 1.0,
+                    easing: Easing::Linear,
+                },
+                EnvelopePoint {
+                    t: 1.0,
+                    value: 0.0,
+                    easing: Easing::Linear,
+                },
+            ],
+        });
+        let timeline = MixerTimeline {
+            segments: vec![segment],
+        };
+        let total = u64::from(EXPORT_SAMPLE_RATE);
+
+        let dst = tmp("offline-envelope.wav");
+        render_timeline_to_wav_with(
+            timeline.clone(),
+            EXPORT_SAMPLE_RATE,
+            total,
+            &dst,
+            &|| false,
+            &mut |_, _| {},
+            &mut |_| Ok(Box::new(ConstSource(1.0))),
+        )
+        .unwrap();
+        let (_, exported) = read_wav_f32(&dst);
+
+        // Per-sample against the analytic envelope…
+        let rate = f64::from(EXPORT_SAMPLE_RATE);
+        for k in 0..total as usize {
+            let t = k as f64 / rate;
+            let ramp = if t < 0.25 {
+                t / 0.25
+            } else if t < 0.5 {
+                1.0
+            } else {
+                1.0 - (t - 0.5) / 0.5
+            };
+            let expected = (0.8 * ramp) as f32;
+            assert!(
+                (exported[k * 2] - expected).abs() < 1e-6,
+                "sample {k}: {} vs {expected}",
+                exported[k * 2]
+            );
+        }
+
+        // …and per-sample against the preview path (render_block).
+        let placed = place(timeline, EXPORT_SAMPLE_RATE);
+        let mut readers = HashMap::new();
+        let mut block = vec![0f32; BLOCK_FRAMES * 2];
+        let mut head = 0i64;
+        while (head as u64) < total {
+            let frames = BLOCK_FRAMES.min((total - head as u64) as usize);
+            render_block(
+                &placed,
+                &mut readers,
+                &mut |_| Ok(Box::new(ConstSource(1.0))),
+                &mut |_, e| panic!("{e}"),
+                head,
+                EXPORT_SAMPLE_RATE,
+                &mut block[..frames * 2],
+            );
+            for (i, s) in block[..frames * 2].iter().enumerate() {
+                let exported_sample = exported[head as usize * 2 + i];
+                assert_eq!(
+                    *s, exported_sample,
+                    "preview and export diverge at frame {head}+{i}"
+                );
+            }
+            head += frames as i64;
+        }
     }
 
     /// Round-trip through symphonia: the WAVs we write must be readable

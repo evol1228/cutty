@@ -29,6 +29,7 @@ pub mod autosave;
 pub mod command;
 pub mod engine;
 pub mod error;
+pub mod keyframes;
 pub mod model;
 pub mod project_file;
 pub mod recents;
@@ -40,13 +41,18 @@ pub use autosave::{
     RecoveryCandidate,
 };
 pub use command::{
-    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, JoinClips,
-    MoveClip, MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RestoreMedia, RippleDelete,
-    RippleInsert, RippleMove, SetClipBlendMode, SetClipOpacity, SetClipText, SetClipTransform,
-    SetClipVolume, SetTrackFlag, SetTransition, SplitClip, TrackFlag, TrimClip,
+    AddClip, AddKeyframe, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip,
+    JoinClips, MoveClip, MoveClipToTrack, MoveKeyframe, MoveTrack, RemoveKeyframe, RemoveMedia,
+    RemoveTrack, RestoreMedia, RippleDelete, RippleInsert, RippleMove, SetClipBlendMode,
+    SetClipOpacity, SetClipText, SetClipTransform, SetClipVolume, SetKeyframes, SetTrackFlag,
+    SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 pub use engine::{Engine, EngineEvent, TrimEdge};
 pub use error::EngineError;
+pub use keyframes::{
+    evaluate as evaluate_keyframes, fade_in_duration, fade_out_duration, Easing, FadeSide,
+    Keyframe, KeyframeProp, Keyframes, FADE_SILENT, KEYFRAME_MIN_DT,
+};
 pub use model::{
     clips_touch, parse_hex_color, BlendMode, Clip, ClipId, MediaId, MediaRef, Project,
     ProjectSettings, TextAlign, TextSpec, TextStyle, Track, TrackId, TrackKind, Transform,

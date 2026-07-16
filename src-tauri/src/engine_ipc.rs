@@ -5,8 +5,9 @@
 use std::sync::{Arc, Mutex};
 
 use cutty_engine::{
-    transition_spans, BlendMode, ClipId, Engine, MediaId, Project, ProjectSettings, SnappedMove,
-    TextSpec, TrackFlag, TrackId, TrackKind, Transform, Transition, TrimEdge,
+    transition_spans, BlendMode, ClipId, Easing, Engine, FadeSide, KeyframeProp, MediaId, Project,
+    ProjectSettings, SnappedMove, TextSpec, TrackFlag, TrackId, TrackKind, Transform, Transition,
+    TrimEdge,
 };
 use tauri::{AppHandle, Emitter, State};
 
@@ -291,6 +292,83 @@ pub fn engine_set_clip_volume(
     volume: f64,
 ) -> Result<(), String> {
     mutate(&app, &state, |e| e.set_clip_volume(ClipId(clip_id), volume))
+}
+
+/// Add a keyframe (or replace the one already at that time) on a clip
+/// property lane. `t` is clip-relative seconds; returns the time the
+/// keyframe landed on after clamping/dedup.
+#[tauri::command]
+pub fn engine_add_keyframe(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    prop: KeyframeProp,
+    t: f64,
+    value: f64,
+    easing: Option<Easing>,
+) -> Result<f64, String> {
+    mutate(&app, &state, |e| {
+        e.add_keyframe(ClipId(clip_id), prop, t, value, easing.unwrap_or_default())
+    })
+}
+
+/// Move the keyframe at `from_t` to `to_t` with a new value (both axes
+/// of a dot drag). Returns the applied time after neighbor clamping.
+#[tauri::command]
+pub fn engine_move_keyframe(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    prop: KeyframeProp,
+    from_t: f64,
+    to_t: f64,
+    value: f64,
+) -> Result<f64, String> {
+    mutate(&app, &state, |e| {
+        e.move_keyframe(ClipId(clip_id), prop, from_t, to_t, value)
+    })
+}
+
+/// Remove the keyframe at clip-relative time `t`.
+#[tauri::command]
+pub fn engine_remove_keyframe(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    prop: KeyframeProp,
+    t: f64,
+) -> Result<(), String> {
+    mutate(&app, &state, |e| {
+        e.remove_keyframe(ClipId(clip_id), prop, t)
+    })
+}
+
+/// Set a clip's fade-in or fade-out duration in seconds (0 removes it)
+/// — sugar over the volume keyframe lane. Returns the applied duration.
+#[tauri::command]
+pub fn engine_set_clip_fade(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+    side: FadeSide,
+    duration: f64,
+) -> Result<f64, String> {
+    mutate(&app, &state, |e| {
+        e.set_clip_fade(ClipId(clip_id), side, duration)
+    })
+}
+
+/// Extract a video clip's audio onto an audio track (one undo step);
+/// the video clip's own volume drops to 0. Returns the new clip's id.
+#[tauri::command]
+pub fn engine_extract_audio(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    clip_id: u64,
+) -> Result<u64, String> {
+    mutate(&app, &state, |e| {
+        e.extract_audio(ClipId(clip_id)).map(|c| c.0)
+    })
 }
 
 /// Set a clip's 2D placement (position/scale/rotation).

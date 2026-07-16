@@ -249,6 +249,7 @@ fn preview_mix_timeline(project: &cutty_engine::Project) -> MixerTimeline {
                 source_in: clip.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                envelope: None,
                 fade_in: None,
                 fade_out: None,
             });
@@ -325,6 +326,7 @@ fn phase2_compositor_export_acceptance() {
                 volume: 0.0,
                 transition_out: None,
                 text: None,
+                keyframes: Default::default(),
             }],
         }
     };

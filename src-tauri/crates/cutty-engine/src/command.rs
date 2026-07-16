@@ -8,6 +8,7 @@
 //! `x - a + a` float drift).
 
 use crate::error::EngineError;
+use crate::keyframes::{Keyframe, KeyframeProp};
 use crate::model::{
     BlendMode, Clip, ClipId, MediaRef, Project, TextSpec, Track, TrackId, Transform, Transition,
 };
@@ -756,6 +757,183 @@ impl Command for SetClipVolume {
 
     fn name(&self) -> &'static str {
         "SetClipVolume"
+    }
+}
+
+fn clip_mut(project: &mut Project, track: TrackId, clip: ClipId) -> Result<&mut Clip, EngineError> {
+    project
+        .track_mut(track)
+        .ok_or(EngineError::UnknownTrack(track))?
+        .clip_mut(clip)
+        .ok_or(EngineError::UnknownClip(clip))
+}
+
+/// Insert one keyframe into a lane (sorted by `t`; the lane is created
+/// when absent). Separation/ordering invariants are the engine's
+/// post-apply validation, like every other command.
+#[derive(Debug, Clone)]
+pub struct AddKeyframe {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub prop: KeyframeProp,
+    pub keyframe: Keyframe,
+}
+
+impl Command for AddKeyframe {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let clip = clip_mut(project, self.track_id, self.clip_id)?;
+        let lane = clip.keyframes.entry(self.prop).or_default();
+        let at = lane.partition_point(|k| k.t <= self.keyframe.t);
+        lane.insert(at, self.keyframe);
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(RemoveKeyframe {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            prop: self.prop,
+            keyframe: self.keyframe,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "AddKeyframe"
+    }
+}
+
+/// Remove one keyframe (captured verbatim, so the inverse restores the
+/// exact floats). A lane losing its last keyframe is dropped entirely
+/// (the no-empty-lanes invariant).
+#[derive(Debug, Clone)]
+pub struct RemoveKeyframe {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub prop: KeyframeProp,
+    pub keyframe: Keyframe,
+}
+
+impl Command for RemoveKeyframe {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let clip = clip_mut(project, self.track_id, self.clip_id)?;
+        let lane = clip
+            .keyframes
+            .get_mut(&self.prop)
+            .ok_or(EngineError::UnknownKeyframe {
+                clip: self.clip_id,
+                t: self.keyframe.t,
+            })?;
+        // Bit-exact match: commands capture the stored keyframe verbatim.
+        let idx = lane.iter().position(|k| k.t == self.keyframe.t).ok_or(
+            EngineError::UnknownKeyframe {
+                clip: self.clip_id,
+                t: self.keyframe.t,
+            },
+        )?;
+        lane.remove(idx);
+        if lane.is_empty() {
+            clip.keyframes.remove(&self.prop);
+        }
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(AddKeyframe {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            prop: self.prop,
+            keyframe: self.keyframe,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "RemoveKeyframe"
+    }
+}
+
+/// Replace one keyframe (time, value, and/or easing — a dot drag moves
+/// on both axes at once). Old and new captured verbatim.
+#[derive(Debug, Clone)]
+pub struct MoveKeyframe {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub prop: KeyframeProp,
+    pub old: Keyframe,
+    pub new: Keyframe,
+}
+
+impl Command for MoveKeyframe {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let clip = clip_mut(project, self.track_id, self.clip_id)?;
+        let lane = clip
+            .keyframes
+            .get_mut(&self.prop)
+            .ok_or(EngineError::UnknownKeyframe {
+                clip: self.clip_id,
+                t: self.old.t,
+            })?;
+        let idx =
+            lane.iter()
+                .position(|k| k.t == self.old.t)
+                .ok_or(EngineError::UnknownKeyframe {
+                    clip: self.clip_id,
+                    t: self.old.t,
+                })?;
+        lane[idx] = self.new;
+        lane.sort_by(|a, b| a.t.total_cmp(&b.t));
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(MoveKeyframe {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            prop: self.prop,
+            old: self.new,
+            new: self.old,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "MoveKeyframe"
+    }
+}
+
+/// Replace a whole keyframe lane (empty = remove it). The primitive
+/// behind multi-keyframe edits that must land as one command: fade
+/// handles and the lane re-anchoring that rides trims.
+#[derive(Debug, Clone)]
+pub struct SetKeyframes {
+    pub track_id: TrackId,
+    pub clip_id: ClipId,
+    pub prop: KeyframeProp,
+    pub old: Vec<Keyframe>,
+    pub new: Vec<Keyframe>,
+}
+
+impl Command for SetKeyframes {
+    fn apply(&self, project: &mut Project) -> Result<(), EngineError> {
+        let clip = clip_mut(project, self.track_id, self.clip_id)?;
+        if self.new.is_empty() {
+            clip.keyframes.remove(&self.prop);
+        } else {
+            clip.keyframes.insert(self.prop, self.new.clone());
+        }
+        Ok(())
+    }
+
+    fn invert(&self) -> Box<dyn Command> {
+        Box::new(SetKeyframes {
+            track_id: self.track_id,
+            clip_id: self.clip_id,
+            prop: self.prop,
+            old: self.new.clone(),
+            new: self.old.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "SetKeyframes"
     }
 }
 

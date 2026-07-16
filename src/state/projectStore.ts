@@ -20,6 +20,15 @@ export interface TransitionPicker {
   y: number;
 }
 
+/** A selected volume-keyframe dot, addressed by its clip-relative time
+ * (the engine's keyframe reference scheme). */
+export interface SelectedKeyframe {
+  clipId: number;
+  /** Clip-relative seconds. Kept in lockstep with engine clamping —
+   * every applied move updates it. */
+  t: number;
+}
+
 interface ProjectState {
   /** Latest engine snapshot; null until the initial fetch lands. */
   project: Project | null;
@@ -33,6 +42,9 @@ interface ProjectState {
   /** Selected transition, by its outgoing clip id (chips and clips have
    * mutually exclusive selection, like CapCut). */
   selectedTransition: number | null;
+  /** Selected volume-keyframe dot (Del removes it). Lives alongside the
+   * clip selection — its clip is always selected too. */
+  selectedKeyframe: SelectedKeyframe | null;
   /** Open transition picker, if any. */
   transitionPicker: TransitionPicker | null;
   /** Playhead position, seconds (playback lands in a later prompt). */
@@ -48,6 +60,7 @@ interface ProjectState {
   setSelection: (ids: number[]) => void;
   toggleSelected: (id: number) => void;
   setSelectedTransition: (fromClipId: number | null) => void;
+  setSelectedKeyframe: (kf: SelectedKeyframe | null) => void;
   setTransitionPicker: (picker: TransitionPicker | null) => void;
   setPlayhead: (sec: number) => void;
   setSnapEnabled: (enabled: boolean) => void;
@@ -62,6 +75,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
   redoDepth: 0,
   selection: [],
   selectedTransition: null,
+  selectedKeyframe: null,
   transitionPicker: null,
   playheadSec: 0,
   snapEnabled: true,
@@ -87,6 +101,18 @@ export const useProjectStore = create<ProjectState>((set) => ({
         state.transitionPicker !== null && spans.has(state.transitionPicker.clipId)
           ? state.transitionPicker
           : null;
+      // A selected keyframe survives only while its dot still exists
+      // (undo/redo/trim may have removed or re-anchored it).
+      let selectedKeyframe = state.selectedKeyframe;
+      if (selectedKeyframe !== null) {
+        const target = selectedKeyframe;
+        const lane = snapshot.project.tracks
+          .flatMap((t) => t.clips)
+          .find((c) => c.id === target.clipId)?.keyframes?.volume;
+        if (!lane?.some((k) => Math.abs(k.t - target.t) < 5e-4)) {
+          selectedKeyframe = null;
+        }
+      }
       return {
         project: snapshot.project,
         transitions: snapshot.transitions,
@@ -97,6 +123,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
             ? state.selection
             : selection,
         selectedTransition,
+        selectedKeyframe,
         transitionPicker,
       };
     }),
@@ -104,18 +131,39 @@ export const useProjectStore = create<ProjectState>((set) => ({
     set((state) => ({
       selection,
       selectedTransition: selection.length > 0 ? null : state.selectedTransition,
+      selectedKeyframe:
+        state.selectedKeyframe !== null &&
+        selection.includes(state.selectedKeyframe.clipId)
+          ? state.selectedKeyframe
+          : null,
     })),
   toggleSelected: (id) =>
-    set((state) => ({
-      selection: state.selection.includes(id)
+    set((state) => {
+      const selection = state.selection.includes(id)
         ? state.selection.filter((s) => s !== id)
-        : [...state.selection, id],
-      selectedTransition: null,
-    })),
+        : [...state.selection, id];
+      return {
+        selection,
+        selectedTransition: null,
+        selectedKeyframe:
+          state.selectedKeyframe !== null &&
+          selection.includes(state.selectedKeyframe.clipId)
+            ? state.selectedKeyframe
+            : null,
+      };
+    }),
   setSelectedTransition: (selectedTransition) =>
     set((state) => ({
       selectedTransition,
       selection: selectedTransition !== null ? [] : state.selection,
+      selectedKeyframe:
+        selectedTransition !== null ? null : state.selectedKeyframe,
+    })),
+  setSelectedKeyframe: (selectedKeyframe) =>
+    set((state) => ({
+      selectedKeyframe,
+      selectedTransition:
+        selectedKeyframe !== null ? null : state.selectedTransition,
     })),
   setTransitionPicker: (transitionPicker) => set({ transitionPicker }),
   setPlayhead: (playheadSec) =>

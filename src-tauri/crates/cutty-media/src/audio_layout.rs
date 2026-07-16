@@ -10,8 +10,8 @@
 //! Audio-track (music) clips never participate — transitions are
 //! video-only.
 
-use cutty_audio::FadeRamp;
-use cutty_engine::{Clip, TransitionSpan};
+use cutty_audio::{EnvelopePoint, FadeRamp, VolumeEnvelope};
+use cutty_engine::{Clip, KeyframeProp, TransitionSpan};
 
 /// A clip's audio placement: possibly extended across transition spans,
 /// with the matching ramps.
@@ -21,6 +21,30 @@ pub(crate) struct AudioPlacement {
     pub source_in: f64,
     pub fade_in: Option<FadeRamp>,
     pub fade_out: Option<FadeRamp>,
+}
+
+/// The clip's volume-keyframe lane baked into mixer terms: clip-relative
+/// keyframe times become absolute timeline seconds (anchored to the
+/// clip's own `timeline_in` — a transition-extended placement doesn't
+/// shift automation), easings map one-to-one. `None` when the clip has
+/// no volume automation. Both the live mixer and the offline export
+/// build their segments through this, so automation previews == exports.
+pub(crate) fn volume_envelope(clip: &Clip) -> Option<VolumeEnvelope> {
+    let lane = clip.keyframes.get(&KeyframeProp::Volume)?;
+    let points = lane
+        .iter()
+        .map(|k| EnvelopePoint {
+            t: clip.timeline_in + k.t,
+            value: k.value,
+            easing: match k.easing {
+                cutty_engine::Easing::Linear => cutty_audio::Easing::Linear,
+                cutty_engine::Easing::EaseIn => cutty_audio::Easing::EaseIn,
+                cutty_engine::Easing::EaseOut => cutty_audio::Easing::EaseOut,
+                cutty_engine::Easing::EaseInOut => cutty_audio::Easing::EaseInOut,
+            },
+        })
+        .collect();
+    Some(VolumeEnvelope { points })
 }
 
 /// Resolve `clip`'s audio placement against the project's transition
@@ -142,6 +166,48 @@ mod tests {
         assert_eq!(p.source_in, 0.0);
         let ramp = p.fade_in.unwrap();
         assert!((ramp.gain_in(2.0) - std::f64::consts::FRAC_1_SQRT_2 as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn volume_envelope_bakes_clip_relative_times_to_absolute() {
+        use cutty_engine::{Easing, FadeSide};
+        let mut engine = Engine::new(ProjectSettings::default());
+        let media = engine.add_media("/tmp/a.flac", 10.0, false, true).unwrap();
+        let audio = engine
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap()
+            .id;
+        let clip_id = engine.add_clip(audio, media, 2.0, 0.0, 4.0).unwrap();
+        let (_, clip) = engine.project().find_clip(clip_id).unwrap();
+        assert!(
+            volume_envelope(clip).is_none(),
+            "no lane → no envelope (unity)"
+        );
+
+        engine.set_clip_fade(clip_id, FadeSide::In, 1.0).unwrap();
+        engine
+            .add_keyframe(
+                clip_id,
+                cutty_engine::KeyframeProp::Volume,
+                2.5,
+                0.5,
+                Easing::EaseInOut,
+            )
+            .unwrap();
+        let (_, clip) = engine.project().find_clip(clip_id).unwrap();
+        let env = volume_envelope(clip).expect("lane → envelope");
+        // Clip at timeline 2.0: local keyframes 0 / 1 / 2.5 become
+        // absolute 2.0 / 3.0 / 4.5, values and easing preserved.
+        let ts: Vec<f64> = env.points.iter().map(|p| p.t).collect();
+        assert_eq!(ts, vec![2.0, 3.0, 4.5]);
+        assert_eq!(env.points[0].value, 0.0);
+        assert_eq!(env.points[2].value, 0.5);
+        assert_eq!(env.points[2].easing, cutty_audio::Easing::EaseInOut);
+        assert_eq!(env.gain_at(2.5), 0.5, "mid-fade");
+        assert_eq!(env.gain_at(0.0), 0.0, "constant before the first point");
     }
 
     #[test]

@@ -38,8 +38,8 @@ pub use playback::{PlayerEvent, TimelinePlayer};
 pub use probe::{probe, AudioStreamInfo, MediaInfo, StreamSummary, VideoStreamInfo};
 pub use proxy::{generate_proxy, proxy_path_for, ProxyProgress};
 pub use render::{
-    for_each_composited_frame, run_export, CancelToken, CompositeRunStats, ExportProgress,
-    ExportQuality, ExportSpec, ExportStage, ExportSummary,
+    export_audio_timeline, for_each_composited_frame, run_export, CancelToken, CompositeRunStats,
+    ExportProgress, ExportQuality, ExportSpec, ExportStage, ExportSummary,
 };
 pub use thumbnail::{generate_thumbnail, thumbnail_path_for};
 pub use tools::ensure_tools;

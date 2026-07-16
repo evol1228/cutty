@@ -3,8 +3,10 @@
 //!
 //! Pipeline: a render thread pulls per-clip samples through
 //! [`ClipReader`]s (decode → mixdown to stereo → linear resample →
-//! volume), sums them into fixed blocks, and pushes the blocks into an
-//! SPSC ring; the cpal callback pops the ring and advances the clock.
+//! per-sample gain: volume × keyframe envelope × transition ramps),
+//! sums them into fixed blocks through the master soft-clamp
+//! ([`soft_clip`]), and pushes the blocks into an SPSC ring; the cpal
+//! callback pops the ring and advances the clock.
 //! Timeline gaps render as silence, so while playing the clock always
 //! advances — playback continues through gaps by construction.
 //!
@@ -42,6 +44,78 @@ pub(crate) const BLOCK_FRAMES: usize = 512;
 
 /// Poll cadence while the ring is full / a rebase is pending.
 const IDLE_POLL: Duration = Duration::from_millis(3);
+
+/// Easing of a volume-envelope segment. Mirrors `cutty_engine::Easing`
+/// one-to-one — the mixer stays engine-independent (like the rest of
+/// [`AudioSegment`]), so the playback layer maps between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Easing {
+    #[default]
+    Linear,
+    /// `x²`.
+    EaseIn,
+    /// `x·(2−x)`.
+    EaseOut,
+    /// Smoothstep `x²·(3−2x)`.
+    EaseInOut,
+}
+
+impl Easing {
+    fn apply(self, x: f64) -> f64 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            Easing::Linear => x,
+            Easing::EaseIn => x * x,
+            Easing::EaseOut => x * (2.0 - x),
+            Easing::EaseInOut => x * x * (3.0 - 2.0 * x),
+        }
+    }
+}
+
+/// One point of a clip's volume automation, **timeline** seconds (the
+/// playback layer bakes clip-relative keyframe times into absolute ones
+/// when it builds segments). `easing` shapes the segment to the next
+/// point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnvelopePoint {
+    pub t: f64,
+    pub value: f64,
+    pub easing: Easing,
+}
+
+/// A clip's volume envelope: a gain **multiplier on top of the
+/// segment's static `volume`**, evaluated per sample. Constant at the
+/// first/last point's value outside the point range, eased in between —
+/// exactly the engine's keyframe evaluation semantics.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VolumeEnvelope {
+    /// Sorted by `t`, non-empty in practice (an empty envelope is
+    /// represented as `AudioSegment::envelope: None`).
+    pub points: Vec<EnvelopePoint>,
+}
+
+impl VolumeEnvelope {
+    /// The gain multiplier at timeline time `t`.
+    pub fn gain_at(&self, t: f64) -> f64 {
+        let Some(last) = self.points.last() else {
+            return 1.0;
+        };
+        let i = self.points.partition_point(|p| p.t <= t);
+        if i == 0 {
+            return self.points[0].value;
+        }
+        if i == self.points.len() {
+            return last.value;
+        }
+        let a = &self.points[i - 1];
+        let b = &self.points[i];
+        let span = b.t - a.t;
+        if span <= 0.0 {
+            return b.value;
+        }
+        a.value + (b.value - a.value) * a.easing.apply((t - a.t) / span)
+    }
+}
 
 /// An equal-power fade over `[start, end]` timeline seconds — the audio
 /// half of a video transition. The incoming gain rises `sin(x·π/2)`, the
@@ -89,6 +163,9 @@ pub struct AudioSegment {
     pub speed: f64,
     /// Linear gain.
     pub volume: f64,
+    /// Volume-keyframe automation, a per-sample gain multiplier on top
+    /// of `volume` (None = unity).
+    pub envelope: Option<VolumeEnvelope>,
     /// Equal-power ramps from video transitions (evaluated per sample on
     /// top of `volume`). Both may be present on a clip inside a chain of
     /// transitions.
@@ -251,7 +328,11 @@ impl ClipReader {
 
         let step = seg.speed * self.src_rate / rate;
         let base_vol = seg.volume as f32;
-        let has_fades = seg.fade_in.is_some() || seg.fade_out.is_some();
+        // Per-sample gain: volume automation and transition ramps are
+        // both evaluated at every output sample — gain changes are
+        // smooth by construction (no block-rate zipper steps).
+        let per_sample_gain =
+            seg.envelope.is_some() || seg.fade_in.is_some() || seg.fade_out.is_some();
         self.evict();
         for (k, frame) in out.chunks_exact_mut(2).enumerate() {
             let i = self.cursor.floor() as i64;
@@ -260,8 +341,11 @@ impl ClipReader {
             let (l1, r1) = self.frame_at(i + 1);
             let frac = (self.cursor - i as f64) as f32;
             let mut vol = base_vol;
-            if has_fades {
+            if per_sample_gain {
                 let t = (t0 + k as i64) as f64 / rate;
+                if let Some(envelope) = &seg.envelope {
+                    vol *= envelope.gain_at(t) as f32;
+                }
                 if let Some(ramp) = &seg.fade_in {
                     vol *= ramp.gain_in(t);
                 }
@@ -344,10 +428,32 @@ pub(crate) fn render_block(
         }
     }
 
-    // Headroom guard: summed clips can exceed full scale; hard-clip
-    // beats wrap-around noise for preview purposes.
+    // Master headroom policy: sum, then soft-clamp. Below the knee the
+    // bus is bit-transparent; above it a tanh knee compresses smoothly
+    // toward ±1.0, so stacked tracks overload musically instead of
+    // hard-clipping (and wrap-around is impossible). One shared mix
+    // path (this function) applies it to preview and export alike.
     for s in out.iter_mut() {
-        *s = s.clamp(-1.0, 1.0);
+        *s = soft_clip(*s);
+    }
+}
+
+/// Where the master soft-clip knee starts (≈ −1.16 dBFS). Everything
+/// below passes through untouched — a legal single-clip mix is
+/// bit-identical to the pre-knee sum.
+pub const SOFT_CLIP_KNEE: f32 = 0.875;
+
+/// Piecewise soft clip: identity inside `±SOFT_CLIP_KNEE`, then a tanh
+/// segment saturating asymptotically at ±1.0. C¹-continuous at the knee
+/// (tanh′(0) = 1).
+#[inline]
+pub fn soft_clip(s: f32) -> f32 {
+    let a = s.abs();
+    if a <= SOFT_CLIP_KNEE {
+        s
+    } else {
+        let over = (a - SOFT_CLIP_KNEE) / (1.0 - SOFT_CLIP_KNEE);
+        (SOFT_CLIP_KNEE + (1.0 - SOFT_CLIP_KNEE) * over.tanh()).copysign(s)
     }
 }
 
@@ -681,6 +787,7 @@ mod tests {
             source_in,
             speed: 1.0,
             volume,
+            envelope: None,
             fade_in: None,
             fade_out: None,
         }
@@ -1025,7 +1132,166 @@ mod tests {
         let segs = [seg(0.0, 1.0, 0.0, 10.0)];
         let (out, _) = render(&segs, 48_000 / 2, 8, RATE);
         assert!(out.iter().all(|&s| (-1.0..=1.0).contains(&s)));
-        assert_eq!(out[2], 1.0, "hard-clipped");
+        assert_eq!(out[2], 1.0, "saturated at full scale");
+    }
+
+    #[test]
+    fn soft_clip_is_transparent_below_the_knee_and_saturates_above() {
+        for s in [-0.875f32, -0.5, -0.001, 0.0, 0.3, 0.7, SOFT_CLIP_KNEE] {
+            assert_eq!(soft_clip(s), s, "identity below the knee");
+        }
+        // C¹ at the knee: just above it stays just above it.
+        let eps = 1e-4f32;
+        let just_over = soft_clip(SOFT_CLIP_KNEE + eps);
+        assert!((just_over - (SOFT_CLIP_KNEE + eps)).abs() < 1e-5);
+        // Monotonic, bounded, symmetric.
+        let mut prev = 0.0f32;
+        for i in 0..200 {
+            let x = i as f32 * 0.05;
+            let y = soft_clip(x);
+            assert!(y >= prev, "monotonic at {x}");
+            assert!(y <= 1.0, "bounded at {x}");
+            assert_eq!(soft_clip(-x), -y, "odd-symmetric at {x}");
+            prev = y;
+        }
+        assert_eq!(soft_clip(100.0), 1.0, "full saturation");
+    }
+
+    /// One point of the mixer's volume-envelope evaluation semantics.
+    fn pt(t: f64, value: f64, easing: Easing) -> EnvelopePoint {
+        EnvelopePoint { t, value, easing }
+    }
+
+    #[test]
+    fn envelope_gain_holds_edges_and_eases_between() {
+        let env = VolumeEnvelope {
+            points: vec![
+                pt(1.0, 0.0, Easing::EaseInOut),
+                pt(2.0, 1.0, Easing::Linear),
+            ],
+        };
+        assert_eq!(env.gain_at(0.0), 0.0, "first value before the range");
+        assert_eq!(env.gain_at(9.0), 1.0, "last value after the range");
+        assert_eq!(env.gain_at(1.5), 0.5, "smoothstep midpoint");
+        let x: f64 = 0.25;
+        assert!((env.gain_at(1.25) - x * x * (3.0 - 2.0 * x)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn envelope_applies_per_sample_with_no_block_steps() {
+        // Constant-1.0 source; envelope ramps 0 → 1 over [0.25, 0.75].
+        // Every output sample must sit exactly on the ramp — a per-block
+        // gain would show staircase plateaus.
+        let mut s = seg(0.0, 1.0, 0.0, 0.5);
+        s.envelope = Some(VolumeEnvelope {
+            points: vec![pt(0.25, 0.0, Easing::Linear), pt(0.75, 1.0, Easing::Linear)],
+        });
+        let placed = place(MixerTimeline { segments: vec![s] }, RATE);
+        let mut readers = HashMap::new();
+        let mut out = vec![0f32; 512 * 2];
+        let head = (0.25 * f64::from(RATE)) as i64 - 64;
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            head,
+            RATE,
+            &mut out,
+        );
+        for k in 0..512usize {
+            let t = (head + k as i64) as f64 / f64::from(RATE);
+            let ramp = ((t - 0.25) / 0.5).clamp(0.0, 1.0);
+            let expected = 0.5 * ramp as f32; // volume × envelope
+            assert!(
+                (out[k * 2] - expected).abs() < 1e-6,
+                "sample {k}: {} vs {expected}",
+                out[k * 2]
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_composes_with_volume_and_transition_ramps() {
+        // Envelope at constant 0.5 under a fade-out transition ramp:
+        // gain = volume × envelope × cos-ramp, per sample.
+        let ramp = FadeRamp {
+            start: 0.0,
+            end: 1.0,
+        };
+        let mut s = seg(0.0, 1.0, 0.0, 0.8);
+        s.envelope = Some(VolumeEnvelope {
+            points: vec![pt(0.0, 0.5, Easing::Linear)],
+        });
+        s.fade_out = Some(ramp);
+        let placed = place(MixerTimeline { segments: vec![s] }, RATE);
+        let mut readers = HashMap::new();
+        let mut out = vec![0f32; 64 * 2];
+        let head = (0.5 * f64::from(RATE)) as i64;
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            head,
+            RATE,
+            &mut out,
+        );
+        for k in 0..64usize {
+            let t = (head + k as i64) as f64 / f64::from(RATE);
+            let expected = 0.8 * 0.5 * ramp.gain_out(t);
+            assert!(
+                (out[k * 2] - expected).abs() < 1e-6,
+                "sample {k}: {} vs {expected}",
+                out[k * 2]
+            );
+        }
+    }
+
+    #[test]
+    fn four_tracks_sum_transparently_below_the_knee_and_compress_above() {
+        // 4 × 0.2 = 0.8 < knee: bit-exact linear sum.
+        let quiet: Vec<AudioSegment> = (0..4).map(|_| seg(0.0, 1.0, 0.0, 0.2)).collect();
+        let placed = place(
+            MixerTimeline {
+                segments: quiet.clone(),
+            },
+            RATE,
+        );
+        let mut readers = HashMap::new();
+        let mut out = vec![0f32; 16 * 2];
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            100,
+            RATE,
+            &mut out,
+        );
+        for s in out.iter() {
+            assert!((s - 0.8).abs() < 1e-6, "transparent sum: {s}");
+        }
+
+        // 4 × 0.3 = 1.2 > knee: compressed smoothly under full scale,
+        // never wrapped or hard-flattened to exactly 1.0.
+        let loud: Vec<AudioSegment> = (0..4).map(|_| seg(0.0, 1.0, 0.0, 0.3)).collect();
+        let placed = place(MixerTimeline { segments: loud }, RATE);
+        let mut readers = HashMap::new();
+        render_block(
+            &placed,
+            &mut readers,
+            &mut |_| Ok(Box::new(ConstOne)),
+            &mut |_, e| panic!("{e}"),
+            100,
+            RATE,
+            &mut out,
+        );
+        let expected = soft_clip(1.2);
+        assert!(expected > SOFT_CLIP_KNEE && expected < 1.0);
+        for s in out.iter() {
+            assert!((s - expected).abs() < 1e-6, "soft-clamped sum: {s}");
+        }
     }
 
     #[test]

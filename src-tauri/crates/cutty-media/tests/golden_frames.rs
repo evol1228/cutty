@@ -133,6 +133,7 @@ fn fixture_project() -> (Project, i64) {
             volume: 1.0,
             transition_out: None,
             text: None,
+            keyframes: Default::default(),
         });
     }
     project.validate().expect("fixture is valid");

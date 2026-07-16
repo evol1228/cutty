@@ -87,6 +87,20 @@ pub enum EngineError {
     #[error("invalid text on clip {clip:?}: {reason}")]
     InvalidText { clip: ClipId, reason: &'static str },
 
+    /// A keyframe lane violates its invariants (ordering, separation,
+    /// empty lane, or a prop the clip cannot animate).
+    #[error("invalid keyframes on clip {clip:?}: {reason}")]
+    InvalidKeyframes { clip: ClipId, reason: &'static str },
+
+    /// No keyframe at (or near) the given clip-relative time.
+    #[error("no keyframe at {t}s on clip {clip:?}")]
+    UnknownKeyframe { clip: ClipId, t: f64 },
+
+    /// The clip cannot have its audio extracted (not a video clip, or
+    /// its media has no audio stream).
+    #[error("cannot extract audio from clip {clip:?}: {reason}")]
+    ExtractAudio { clip: ClipId, reason: &'static str },
+
     /// The operation targets a locked track. `name` is carried so the UI
     /// can say which track without a second lookup.
     #[error("track \"{name}\" is locked — unlock it to edit")]

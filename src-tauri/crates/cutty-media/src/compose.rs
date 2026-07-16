@@ -938,6 +938,7 @@ mod tests {
             volume: 1.0,
             transition_out: None,
             text: None,
+            keyframes: Default::default(),
         }
     }
 

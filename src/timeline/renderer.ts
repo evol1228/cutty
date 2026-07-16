@@ -6,12 +6,24 @@
 
 import type { Clip, Project, Track, TransitionSpan } from "../lib/engineIpc";
 import { useMediaStore } from "../state/mediaStore";
-import { useProjectStore } from "../state/projectStore";
+import {
+  useProjectStore,
+  type SelectedKeyframe,
+} from "../state/projectStore";
 import { requestDraw } from "./dirty";
+import {
+  envelopeValueToY,
+  evalLane,
+  fadeInDuration,
+  fadeOutDuration,
+  volumeLane,
+  type ClipBodyRect,
+} from "./envelope";
 import {
   durationToPx,
   laneHeight,
   laneTop,
+  pxToDuration,
   RULER_H,
   timeToX,
   view,
@@ -81,7 +93,20 @@ const COLORS = {
   transitionIcon: "#ede9fe", // violet-50
   cutMark: "rgba(167, 139, 250, 0.6)", // violet-400
   cutMarkActive: "#fbbf24", // amber-400
+  envelopeLine: "rgba(209, 250, 229, 0.8)", // emerald-100
+  envelopeDot: "#e4e4e7", // zinc-200
+  envelopeDotSelected: "#f59e0b", // amber-500
+  fadeHandle: "#7dd3fc", // sky-300
+  fadeShade: "rgba(9, 9, 11, 0.35)", // zinc-950
 } as const;
+
+/** Radius of a keyframe dot on the volume line, px. */
+const KF_DOT_R = 3;
+/** Radius of a fade handle at a clip's top corner, px. */
+const FADE_HANDLE_R = 3.5;
+/** Distance of the fade-handle center from the clip's top edge, px.
+ * Shared with the controller's hit testing. */
+export const FADE_HANDLE_Y = 5;
 
 /** Transition chip height, px (straddles the cut mid-lane). */
 const CHIP_H = 16;
@@ -386,6 +411,140 @@ function drawClip(
   }
 }
 
+/** Canvas-space body rectangle of a clip (the rounded box `drawClip`
+ * paints). Shared with the controller's envelope hit testing so pixels
+ * and pointer math never drift apart. */
+export function clipBodyRect(
+  clip: Clip,
+  tracks: readonly Track[],
+  trackIndex: number,
+): ClipBodyRect {
+  const x = timeToX(clip.timelineIn);
+  const w = Math.max(durationToPx(clip.timelineOut - clip.timelineIn), 2);
+  const laneY = laneCanvasY(tracks, trackIndex);
+  const laneH = laneHeight(tracks[trackIndex].kind);
+  return { x, y: laneY + 4, w, h: laneH - 9 };
+}
+
+/** The volume rubber band on an audio clip: the envelope polyline (drawn
+ * always — it *is* the clip's volume automation), plus keyframe dots and
+ * corner fade handles once the clip is selected. Fade ramps additionally
+ * shade the faded region so short fades read at a glance. */
+function drawVolumeEnvelope(
+  ctx: CanvasRenderingContext2D,
+  clip: Clip,
+  tracks: readonly Track[],
+  trackIndex: number,
+  selected: boolean,
+  selectedKeyframe: SelectedKeyframe | null,
+): void {
+  const rect = clipBodyRect(clip, tracks, trackIndex);
+  if (rect.w < 14 || rect.h < 12) return;
+  const lane = volumeLane(clip);
+  const duration = clip.timelineOut - clip.timelineIn;
+
+  ctx.save();
+  roundRectPath(ctx, rect.x, rect.y, rect.w, rect.h, 5);
+  ctx.clip();
+
+  // Fade shading: darken under the clip top down to the envelope inside
+  // detected fade spans (purely decorative — the line is the data).
+  const fadeIn = fadeInDuration(lane);
+  const fadeOut = fadeOutDuration(lane, duration);
+  for (const span of [
+    fadeIn !== null ? { from: 0, to: fadeIn } : null,
+    fadeOut !== null ? { from: duration - fadeOut, to: duration } : null,
+  ]) {
+    if (!span || span.to <= span.from) continue;
+    ctx.beginPath();
+    ctx.moveTo(rect.x + durationToPx(span.from), rect.y);
+    ctx.lineTo(rect.x + durationToPx(span.to), rect.y);
+    const steps = Math.min(
+      256,
+      Math.max(2, Math.ceil(durationToPx(span.to - span.from) / 4)),
+    );
+    for (let s = steps; s >= 0; s--) {
+      const t = span.from + ((span.to - span.from) * s) / steps;
+      ctx.lineTo(
+        rect.x + durationToPx(t),
+        envelopeValueToY(rect, evalLane(lane, t)),
+      );
+    }
+    ctx.closePath();
+    ctx.fillStyle = COLORS.fadeShade;
+    ctx.fill();
+  }
+
+  // The envelope polyline, sampled every ~3 px across the *visible*
+  // part of the clip only (a zoomed-in music clip can be tens of
+  // thousands of pixels wide). Exact keyframe times are included so
+  // corners stay crisp; all easings render through the same sampling.
+  const tVis0 = Math.max(0, pxToDuration(-rect.x));
+  const tVis1 = Math.min(duration, pxToDuration(view.widthPx - rect.x));
+  if (tVis1 <= tVis0) {
+    ctx.restore();
+    return;
+  }
+  ctx.strokeStyle = COLORS.envelopeLine;
+  ctx.lineWidth = 1.25;
+  ctx.beginPath();
+  ctx.moveTo(
+    rect.x + durationToPx(tVis0),
+    envelopeValueToY(rect, evalLane(lane, tVis0)),
+  );
+  if (lane.length === 0) {
+    ctx.lineTo(rect.x + durationToPx(tVis1), envelopeValueToY(rect, 1));
+  } else {
+    const step = pxToDuration(3);
+    let t = tVis0;
+    let next = lane.findIndex((k) => k.t > tVis0);
+    if (next < 0) next = lane.length;
+    while (t < tVis1) {
+      t = Math.min(t + step, tVis1);
+      // Land exactly on any keyframe inside this step.
+      while (next < lane.length && lane[next].t <= t) {
+        ctx.lineTo(
+          rect.x + durationToPx(lane[next].t),
+          envelopeValueToY(rect, lane[next].value),
+        );
+        next++;
+      }
+      ctx.lineTo(rect.x + durationToPx(t), envelopeValueToY(rect, evalLane(lane, t)));
+    }
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1;
+
+  if (selected) {
+    // Keyframe dots.
+    for (const kf of lane) {
+      const cx = rect.x + durationToPx(kf.t);
+      const cy = envelopeValueToY(rect, kf.value);
+      const isSelected =
+        selectedKeyframe !== null &&
+        selectedKeyframe.clipId === clip.id &&
+        Math.abs(selectedKeyframe.t - kf.t) < 5e-4;
+      ctx.fillStyle = isSelected ? COLORS.envelopeDotSelected : COLORS.envelopeDot;
+      ctx.beginPath();
+      ctx.arc(cx, cy, isSelected ? KF_DOT_R + 1 : KF_DOT_R, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Fade handles at the top corners (at the fade end when one exists).
+    for (const handle of [
+      { x: rect.x + durationToPx(fadeIn ?? 0) },
+      { x: rect.x + rect.w - durationToPx(fadeOut ?? 0) },
+    ]) {
+      ctx.fillStyle = COLORS.fadeHandle;
+      ctx.strokeStyle = "rgba(9, 9, 11, 0.8)";
+      ctx.beginPath();
+      ctx.arc(handle.x, rect.y + FADE_HANDLE_Y, FADE_HANDLE_R, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
 /** On-canvas geometry of a transition chip. Shared with the controller's
  * hit testing so pixels and pointer math never drift apart. */
 export function chipRect(
@@ -559,8 +718,14 @@ export function drawTimeline(
   height: number,
   overlay: TimelineOverlay,
 ): void {
-  const { project, selection, playheadSec, transitions, selectedTransition } =
-    useProjectStore.getState();
+  const {
+    project,
+    selection,
+    playheadSec,
+    transitions,
+    selectedTransition,
+    selectedKeyframe,
+  } = useProjectStore.getState();
 
   ctx.fillStyle = COLORS.background;
   ctx.fillRect(0, 0, width, height);
@@ -608,6 +773,16 @@ export function drawTimeline(
           names,
           thumbs,
         );
+        if (track.kind === "audio") {
+          drawVolumeEnvelope(
+            ctx,
+            clip,
+            tracks,
+            i,
+            selected.has(clip.id),
+            selectedKeyframe,
+          );
+        }
       }
       ctx.globalAlpha = 1;
       if (track.locked) drawLockHatch(ctx, width, laneY, laneH);

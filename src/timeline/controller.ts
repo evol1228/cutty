@@ -5,13 +5,23 @@
 // exactly one undo entry on release. Snap positions come from the engine;
 // the only local math is pixel↔time conversion and hit-testing.
 
-import type { Clip, Track, TransitionSpan, TrimEdge } from "../lib/engineIpc";
+import type {
+  Clip,
+  FadeSide,
+  Track,
+  TransitionSpan,
+  TrimEdge,
+} from "../lib/engineIpc";
 import {
   engineAddClip,
+  engineAddKeyframe,
   engineBeginTransaction,
   engineCommitTransaction,
   engineMoveClipToTrack,
+  engineMoveKeyframe,
+  engineRemoveKeyframe,
   engineRollbackTransaction,
+  engineSetClipFade,
   engineSetTransition,
   engineSnapClipMove,
   engineSnapTime,
@@ -34,15 +44,30 @@ import {
 } from "./actions";
 import { requestDraw, setDrawCallback } from "./dirty";
 import {
+  envelopeValueToY,
+  envelopeYToValue,
+  evalLane,
+  fadeInDuration,
+  fadeOutDuration,
+  volumeLane,
+} from "./envelope";
+import {
   setTimelineDropTarget,
   setTransitionDropTarget,
   type DragMedia,
   type TimelineDropTarget,
   type TransitionDropTarget,
 } from "./poolDrag";
-import { chipRect, drawTimeline, type TimelineOverlay } from "./renderer";
+import {
+  chipRect,
+  clipBodyRect,
+  drawTimeline,
+  FADE_HANDLE_Y,
+  type TimelineOverlay,
+} from "./renderer";
 import {
   canvasYToContentY,
+  durationToPx,
   laneIndexAtY,
   pxToDuration,
   RULER_H,
@@ -66,6 +91,12 @@ const CHIP_EDGE_PX = 6;
 /** Shortest transition the duration drag requests, seconds (the engine
  * clamps identically — this just keeps the gesture sane). */
 const MIN_TRANSITION_SEC = 0.1;
+/** Grab radius of a volume-keyframe dot, CSS px. */
+const KF_HIT_R = 6;
+/** Grab radius of a fade handle, CSS px. */
+const FADE_HIT_R = 6;
+/** Vertical reach around the volume line for double-click-to-add, px. */
+const LINE_HIT_PX = 4;
 
 type Zone = "start" | "end" | "body";
 
@@ -104,6 +135,22 @@ type Gesture =
       maxDuration: number;
       cancelled: boolean;
     }
+  | {
+      type: "pendingEnvelope";
+      startX: number;
+      startY: number;
+      clipId: number;
+      target: { kind: "dot"; t: number } | { kind: "fade"; side: FadeSide };
+    }
+  | {
+      type: "keyframeDrag";
+      clipId: number;
+      /** Clip-relative time of the dragged keyframe — updated to the
+       * engine's applied (clamped) time after every step. */
+      fromT: number;
+      cancelled: boolean;
+    }
+  | { type: "fadeDrag"; clipId: number; side: FadeSide; cancelled: boolean }
   | { type: "pan"; lastClientX: number }
   | { type: "scrub" };
 
@@ -517,6 +564,132 @@ export function createTimelineController(
     leave: clearTransitionDrag,
   };
 
+  // --- Volume envelope: hit testing + gesture bodies -------------------
+  //
+  // The rubber band, its keyframe dots, and the corner fade handles are
+  // interactive only on *selected* audio clips (first click selects, the
+  // second edits — CapCut's pattern), so envelope grabs never steal the
+  // plain move/trim gestures.
+
+  interface EnvelopeHit {
+    clip: Clip;
+    track: Track;
+    trackIndex: number;
+    target:
+      | { kind: "dot"; t: number }
+      | { kind: "fade"; side: FadeSide }
+      | { kind: "line"; t: number };
+  }
+
+  function hitEnvelope(x: number, y: number): EnvelopeHit | null {
+    const { project, selection } = useProjectStore.getState();
+    if (!project || selection.length === 0) return null;
+    for (let i = 0; i < project.tracks.length; i++) {
+      const track = project.tracks[i];
+      if (track.kind !== "audio") continue;
+      for (const clip of track.clips) {
+        if (!selection.includes(clip.id)) continue;
+        const rect = clipBodyRect(clip, project.tracks, i);
+        if (x < rect.x - FADE_HIT_R || x > rect.x + rect.w + FADE_HIT_R) continue;
+        if (y < rect.y - FADE_HIT_R || y > rect.y + rect.h + FADE_HIT_R) continue;
+        const lane = volumeLane(clip);
+        const duration = clip.timelineOut - clip.timelineIn;
+        const hit = (target: EnvelopeHit["target"]): EnvelopeHit => ({
+          clip,
+          track,
+          trackIndex: i,
+          target,
+        });
+
+        // Fade handles first — they sit at the top edge, above the line.
+        const handleY = rect.y + FADE_HANDLE_Y;
+        const fadeInX = rect.x + durationToPx(fadeInDuration(lane) ?? 0);
+        if (Math.hypot(x - fadeInX, y - handleY) <= FADE_HIT_R) {
+          return hit({ kind: "fade", side: "in" });
+        }
+        const fadeOutX =
+          rect.x + rect.w - durationToPx(fadeOutDuration(lane, duration) ?? 0);
+        if (Math.hypot(x - fadeOutX, y - handleY) <= FADE_HIT_R) {
+          return hit({ kind: "fade", side: "out" });
+        }
+        // Keyframe dots.
+        for (const kf of lane) {
+          const cx = rect.x + durationToPx(kf.t);
+          const cy = envelopeValueToY(rect, kf.value);
+          if (Math.hypot(x - cx, y - cy) <= KF_HIT_R) {
+            return hit({ kind: "dot", t: kf.t });
+          }
+        }
+        // The line itself (double-click adds a keyframe there).
+        const t = Math.min(Math.max(pxToDuration(x - rect.x), 0), duration);
+        const lineY = envelopeValueToY(rect, evalLane(lane, t));
+        if (Math.abs(y - lineY) <= LINE_HIT_PX) {
+          return hit({ kind: "line", t });
+        }
+      }
+    }
+    return null;
+  }
+
+  /** One transient keyframe-drag step: both axes at once. The engine
+   * clamps between neighbors and returns where the dot landed; that
+   * becomes the reference for the next step. */
+  async function applyKeyframeMove(
+    state: { clipId: number; fromT: number },
+    x: number,
+    y: number,
+  ): Promise<void> {
+    const project = useProjectStore.getState().project;
+    if (!project) return;
+    const trackIndex = project.tracks.findIndex((t) =>
+      t.clips.some((c) => c.id === state.clipId),
+    );
+    const clip = project.tracks[trackIndex]?.clips.find(
+      (c) => c.id === state.clipId,
+    );
+    if (!clip) return;
+    const rect = clipBodyRect(clip, project.tracks, trackIndex);
+    const toT = pxToDuration(x - rect.x);
+    const value = envelopeYToValue(rect, y);
+    try {
+      state.fromT = await engineMoveKeyframe(
+        state.clipId,
+        "volume",
+        state.fromT,
+        toT,
+        value,
+      );
+      useProjectStore
+        .getState()
+        .setSelectedKeyframe({ clipId: state.clipId, t: state.fromT });
+    } catch {
+      // Reference went stale mid-gesture (e.g. concurrent snapshot); the
+      // dot stays at its last applied spot.
+    }
+    requestDraw();
+  }
+
+  /** One transient fade-drag step: handle x → fade duration from the
+   * clip edge; the engine clamps against the clip and the other fade. */
+  async function applyFade(
+    clipId: number,
+    side: FadeSide,
+    x: number,
+  ): Promise<void> {
+    const project = useProjectStore.getState().project;
+    const clip = project?.tracks
+      .flatMap((t) => t.clips)
+      .find((c) => c.id === clipId);
+    if (!clip) return;
+    const t = xToTime(x);
+    const duration =
+      side === "in" ? t - clip.timelineIn : clip.timelineOut - t;
+    await engineSetClipFade(clipId, side, Math.max(0, duration)).catch(
+      () => undefined,
+    );
+    requestDraw();
+  }
+
   // --- Hit testing -----------------------------------------------------
 
   /** Transition chip under the pointer (chips draw above clips, so they
@@ -633,6 +806,29 @@ export function createTimelineController(
       return;
     }
 
+    // Envelope elements on selected audio clips (dots, fade handles).
+    // Line hits fall through — a single click on the rubber band still
+    // moves the clip; double-click (below) adds a keyframe.
+    const env = hitEnvelope(x, y);
+    if (env && env.target.kind !== "line") {
+      if (env.track.locked) {
+        toast(`Track "${env.track.name}" is locked — unlock it to edit.`);
+        return;
+      }
+      if (env.target.kind === "dot") {
+        store.setSelectedKeyframe({ clipId: env.clip.id, t: env.target.t });
+      }
+      gesture = {
+        type: "pendingEnvelope",
+        startX: x,
+        startY: y,
+        clipId: env.clip.id,
+        target: env.target,
+      };
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+
     const hit = hitTest(x, y);
     if (hit.region === "ruler") {
       gesture = { type: "scrub" };
@@ -681,6 +877,17 @@ export function createTimelineController(
           if (canvas.title !== "") canvas.title = "";
           return;
         }
+        const env = hitEnvelope(x, y);
+        if (env) {
+          canvas.style.cursor =
+            env.target.kind === "fade"
+              ? "ew-resize"
+              : env.target.kind === "dot"
+                ? "grab"
+                : "crosshair";
+          if (canvas.title !== "") canvas.title = "";
+          return;
+        }
         const hit = hitTest(x, y);
         canvas.style.cursor = cursorFor(hit);
         // Missing-media tooltip on hovered clips (text clips have none).
@@ -724,6 +931,40 @@ export function createTimelineController(
             cancelled: false,
           };
         }
+        return;
+      }
+      case "pendingEnvelope": {
+        const dx = x - gesture.startX;
+        const dy = y - gesture.startY;
+        if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
+        const { clipId, target } = gesture;
+        enqueue(() => engineBeginTransaction());
+        if (target.kind === "dot") {
+          gesture = {
+            type: "keyframeDrag",
+            clipId,
+            fromT: target.t,
+            cancelled: false,
+          };
+          canvas.style.cursor = "grabbing";
+        } else {
+          gesture = {
+            type: "fadeDrag",
+            clipId,
+            side: target.side,
+            cancelled: false,
+          };
+        }
+        return;
+      }
+      case "keyframeDrag": {
+        const g = gesture;
+        coalesce(() => applyKeyframeMove(g, x, y));
+        return;
+      }
+      case "fadeDrag": {
+        const { clipId, side } = gesture;
+        coalesce(() => applyFade(clipId, side, x));
         return;
       }
       case "move": {
@@ -814,6 +1055,20 @@ export function createTimelineController(
         }
         break;
       }
+      case "keyframeDrag": {
+        const g = gesture;
+        if (!g.cancelled) {
+          finishGesture(() => applyKeyframeMove(g, x, y));
+        }
+        break;
+      }
+      case "fadeDrag": {
+        const { clipId, side, cancelled } = gesture;
+        if (!cancelled) {
+          finishGesture(() => applyFade(clipId, side, x));
+        }
+        break;
+      }
       default:
         break;
     }
@@ -825,7 +1080,9 @@ export function createTimelineController(
     if (
       gesture.type === "move" ||
       gesture.type === "trim" ||
-      gesture.type === "transitionDuration"
+      gesture.type === "transitionDuration" ||
+      gesture.type === "keyframeDrag" ||
+      gesture.type === "fadeDrag"
     ) {
       cancelGesture();
     }
@@ -871,7 +1128,9 @@ export function createTimelineController(
     if (
       gesture.type === "move" ||
       gesture.type === "trim" ||
-      gesture.type === "transitionDuration"
+      gesture.type === "transitionDuration" ||
+      gesture.type === "keyframeDrag" ||
+      gesture.type === "fadeDrag"
     ) {
       if (e.key === "Escape") {
         gesture.cancelled = true;
@@ -923,6 +1182,16 @@ export function createTimelineController(
       case "Delete":
       case "Backspace": {
         const store = useProjectStore.getState();
+        // Most specific selection first: a keyframe dot, then a
+        // transition chip, then whole clips.
+        if (store.selectedKeyframe !== null) {
+          const { clipId, t } = store.selectedKeyframe;
+          store.setSelectedKeyframe(null);
+          void engineRemoveKeyframe(clipId, "volume", t).catch((err) =>
+            toast(String(err), "error"),
+          );
+          break;
+        }
         if (store.selectedTransition !== null) {
           const clipId = store.selectedTransition;
           store.setSelectedTransition(null);
@@ -1033,14 +1302,52 @@ export function createTimelineController(
   function onDoubleClick(e: MouseEvent): void {
     const { x, y } = canvasPos(e);
     const chip = hitTransition(x, y);
-    if (!chip) return;
-    useProjectStore.getState().setSelectedTransition(chip.span.fromClipId);
-    useProjectStore.getState().setTransitionPicker({
-      clipId: chip.span.fromClipId,
-      kind: chip.span.kind,
-      x: e.clientX,
-      y: e.clientY,
-    });
+    if (chip) {
+      useProjectStore.getState().setSelectedTransition(chip.span.fromClipId);
+      useProjectStore.getState().setTransitionPicker({
+        clipId: chip.span.fromClipId,
+        kind: chip.span.kind,
+        x: e.clientX,
+        y: e.clientY,
+      });
+      return;
+    }
+    // Volume line: double-click adds a keyframe at the envelope's
+    // current value (the curve doesn't jump); double-click on a dot
+    // removes it.
+    const env = hitEnvelope(x, y);
+    if (!env) return;
+    if (env.track.locked) {
+      toast(`Track "${env.track.name}" is locked — unlock it to edit.`);
+      return;
+    }
+    const store = useProjectStore.getState();
+    if (env.target.kind === "dot") {
+      store.setSelectedKeyframe(null);
+      void engineRemoveKeyframe(env.clip.id, "volume", env.target.t).catch(
+        (err) => toast(String(err), "error"),
+      );
+      return;
+    }
+    if (env.target.kind === "line") {
+      const t = env.target.t;
+      const value = evalLane(volumeLane(env.clip), t);
+      enqueue(async () => {
+        try {
+          const applied = await engineAddKeyframe(
+            env.clip.id,
+            "volume",
+            t,
+            value,
+          );
+          useProjectStore
+            .getState()
+            .setSelectedKeyframe({ clipId: env.clip.id, t: applied });
+        } catch (err) {
+          toast(String(err), "error");
+        }
+      });
+    }
   }
 
   canvas.addEventListener("pointerdown", onPointerDown);

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::EngineError;
+use crate::keyframes::{KeyframeProp, Keyframes, KEYFRAME_MIN_DT};
 
 /// Comparison tolerance for timeline math. Touching clip edges (`a.out ==
 /// b.in`) must not read as an overlap after f64 arithmetic.
@@ -340,6 +341,13 @@ pub struct Clip {
     /// v2; see [`TrackKind::Text`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextSpec>,
+    /// Keyframe lanes (`{prop → [Keyframe]}`, times clip-relative — see
+    /// [`crate::keyframes`]). Volume automation in Phase 2; transform/
+    /// opacity reuse this in Phase 3. Additive schema field
+    /// (`serde(default)`): unanimated clips serialize byte-identically
+    /// to before.
+    #[serde(default, skip_serializing_if = "Keyframes::is_empty")]
+    pub keyframes: Keyframes,
 }
 
 impl Clip {
@@ -652,6 +660,56 @@ impl Project {
                 property: "transform.scale",
                 value: t.scale,
             });
+        }
+        Self::validate_keyframes(clip)?;
+        Ok(())
+    }
+
+    /// Keyframe-lane invariants: no empty lanes, times finite and inside
+    /// the clip, sorted with at least [`KEYFRAME_MIN_DT`] separation,
+    /// per-prop legal values, and no volume automation on soundless
+    /// (text) clips.
+    fn validate_keyframes(clip: &Clip) -> Result<(), EngineError> {
+        let duration = clip.duration();
+        for (prop, lane) in &clip.keyframes {
+            if lane.is_empty() {
+                return Err(EngineError::InvalidKeyframes {
+                    clip: clip.id,
+                    reason: "empty keyframe lane",
+                });
+            }
+            if *prop == KeyframeProp::Volume && clip.text.is_some() {
+                return Err(EngineError::InvalidKeyframes {
+                    clip: clip.id,
+                    reason: "volume keyframes on a text clip",
+                });
+            }
+            let mut prev: Option<f64> = None;
+            for kf in lane {
+                if !kf.t.is_finite() || kf.t < -EPS || kf.t > duration + EPS {
+                    return Err(EngineError::InvalidProperty {
+                        clip: clip.id,
+                        property: "keyframe.t",
+                        value: kf.t,
+                    });
+                }
+                if !prop.valid_value(kf.value) {
+                    return Err(EngineError::InvalidProperty {
+                        clip: clip.id,
+                        property: prop.name(),
+                        value: kf.value,
+                    });
+                }
+                if let Some(prev) = prev {
+                    if kf.t - prev < KEYFRAME_MIN_DT - EPS {
+                        return Err(EngineError::InvalidKeyframes {
+                            clip: clip.id,
+                            reason: "keyframes out of order or closer than the minimum separation",
+                        });
+                    }
+                }
+                prev = Some(kf.t);
+            }
         }
         Ok(())
     }

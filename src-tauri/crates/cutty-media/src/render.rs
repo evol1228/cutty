@@ -330,9 +330,11 @@ pub(crate) fn plan_video_segments(project: &Project, fps: f64) -> Vec<PlannedSeg
 /// for video media, the original for audio-only media (see module docs).
 /// Unlike preview (which renders silence until a proxy appears), export
 /// refuses to run while a needed proxy is still generating. Transition
-/// crossfades come from the same [`crate::audio_layout`] placement the
-/// live mixer uses, so the exported mix equals the preview mix.
-pub(crate) fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, MediaError> {
+/// crossfades and volume-keyframe envelopes come from the same
+/// [`crate::audio_layout`] resolution the live mixer uses, so the
+/// exported mix equals the preview mix. Public for the envelope
+/// acceptance tests; `run_export` drives it internally.
+pub fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, MediaError> {
     let spans = cutty_engine::transition_spans(project);
     let mut segments = Vec::new();
     for track in project.tracks.iter().filter(|t| !t.muted) {
@@ -370,6 +372,7 @@ pub(crate) fn export_audio_timeline(project: &Project) -> Result<MixerTimeline, 
                 source_in: placement.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                envelope: crate::audio_layout::volume_envelope(clip),
                 fade_in: placement.fade_in,
                 fade_out: placement.fade_out,
             });

@@ -277,6 +277,7 @@ fn mixer_timeline(project: &Project, sources: &Sources) -> MixerTimeline {
                 source_in: placement.source_in,
                 speed: clip.speed,
                 volume: clip.volume,
+                envelope: crate::audio_layout::volume_envelope(clip),
                 fade_in: placement.fade_in,
                 fade_out: placement.fade_out,
             });

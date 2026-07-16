@@ -73,6 +73,25 @@ export interface TextSpec {
   style: TextStyle;
 }
 
+/** Easing of the segment from a keyframe to the next. */
+export type Easing = "linear" | "easeIn" | "easeOut" | "easeInOut";
+
+/** One keyframe on a clip property lane. `t` is clip-relative seconds
+ * (from the clip's timelineIn) — automation moves with the clip. */
+export interface Keyframe {
+  t: number;
+  value: number;
+  easing: Easing;
+}
+
+/** Keyframable clip property (volume now; transform/opacity in Phase 3).
+ * Volume keyframes are a gain *multiplier* on top of the clip's static
+ * `volume`. */
+export type KeyframeProp = "volume";
+
+/** Which clip edge a fade handle drags. */
+export type FadeSide = "in" | "out";
+
 export interface Clip {
   id: number;
   /** Absent exactly on text clips (which carry `text` instead). */
@@ -90,6 +109,9 @@ export interface Clip {
   transitionOut?: Transition | null;
   /** Present exactly on text-track clips. */
   text?: TextSpec | null;
+  /** Keyframe lanes by property; absent = no animation. Lanes are
+   * sorted by `t` and never empty (engine invariants). */
+  keyframes?: Partial<Record<KeyframeProp, Keyframe[]>>;
 }
 
 export interface Track {
@@ -273,6 +295,68 @@ export function engineSetClipVolume(
   volume: number,
 ): Promise<void> {
   return invoke("engine_set_clip_volume", { clipId, volume });
+}
+
+/** Add a keyframe (or replace the one at that time). `t` is
+ * clip-relative seconds; returns where it landed after clamping. */
+export function engineAddKeyframe(
+  clipId: number,
+  prop: KeyframeProp,
+  t: number,
+  value: number,
+  easing?: Easing,
+): Promise<number> {
+  return invoke<number>("engine_add_keyframe", {
+    clipId,
+    prop,
+    t,
+    value,
+    easing: easing ?? null,
+  });
+}
+
+/** Move the keyframe at `fromT` to `toT` with a new value (a dot drag
+ * moves both axes). Returns the applied time after neighbor clamping —
+ * feed it back as the next step's `fromT`. */
+export function engineMoveKeyframe(
+  clipId: number,
+  prop: KeyframeProp,
+  fromT: number,
+  toT: number,
+  value: number,
+): Promise<number> {
+  return invoke<number>("engine_move_keyframe", {
+    clipId,
+    prop,
+    fromT,
+    toT,
+    value,
+  });
+}
+
+/** Remove the keyframe at clip-relative time `t`. */
+export function engineRemoveKeyframe(
+  clipId: number,
+  prop: KeyframeProp,
+  t: number,
+): Promise<void> {
+  return invoke("engine_remove_keyframe", { clipId, prop, t });
+}
+
+/** Set a fade-in/out duration in seconds (0 removes it) — sugar over
+ * the volume keyframe lane. Returns the applied (clamped) duration. */
+export function engineSetClipFade(
+  clipId: number,
+  side: FadeSide,
+  duration: number,
+): Promise<number> {
+  return invoke<number>("engine_set_clip_fade", { clipId, side, duration });
+}
+
+/** Extract a video clip's audio onto an audio track (one undo step);
+ * the video clip's own volume drops to 0. Returns the new clip's id. */
+export function engineExtractAudio(clipId: number): Promise<number> {
+  return invoke<number>("engine_extract_audio", { clipId });
 }
 
 /** Set a clip's 2D placement (position/scale/rotation). */

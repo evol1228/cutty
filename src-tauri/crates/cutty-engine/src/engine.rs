@@ -4,18 +4,25 @@
 use serde::Serialize;
 
 use crate::command::{
-    AddClip, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip, MoveClip,
-    MoveClipToTrack, MoveTrack, RemoveMedia, RemoveTrack, RippleDelete, RippleMove,
-    SetClipBlendMode, SetClipOpacity, SetClipText, SetClipTransform, SetClipVolume, SetTrackFlag,
-    SetTransition, SplitClip, TrackFlag, TrimClip,
+    AddClip, AddKeyframe, AddTrack, ApplyTransaction, ClipSpan, Command, Compound, DeleteClip,
+    MoveClip, MoveClipToTrack, MoveKeyframe, MoveTrack, RemoveKeyframe, RemoveMedia, RemoveTrack,
+    RippleDelete, RippleMove, SetClipBlendMode, SetClipOpacity, SetClipText, SetClipTransform,
+    SetClipVolume, SetKeyframes, SetTrackFlag, SetTransition, SplitClip, TrackFlag, TrimClip,
 };
 use crate::error::EngineError;
+use crate::keyframes::{
+    self, Easing, FadeSide, Keyframe, KeyframeProp, Keyframes, KEYFRAME_MIN_DT,
+};
 use crate::model::{
     clips_touch, BlendMode, Clip, ClipId, MediaId, MediaRef, Project, ProjectSettings, TextSpec,
     Track, TrackId, TrackKind, Transform, Transition, EPS, MAX_TRANSITION_DURATION,
     MIN_CLIP_DURATION, MIN_TRANSITION_DURATION,
 };
 use crate::resolve::transition_duration_limit;
+
+/// Matching tolerance when the UI names a keyframe by its time: half the
+/// separation minimum, so a reference can never grab a neighbor.
+const KEYFRAME_MATCH_EPS: f64 = KEYFRAME_MIN_DT / 2.0;
 
 /// Which clip edge a trim operation drags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +448,7 @@ impl Engine {
             volume: 1.0,
             transition_out: None,
             text: None,
+            keyframes: Keyframes::default(),
         };
         self.execute(Box::new(AddClip { track_id, clip }))?;
         Ok(id)
@@ -514,6 +522,7 @@ impl Engine {
             volume: 1.0,
             transition_out: None,
             text: Some(text),
+            keyframes: Keyframes::default(),
         };
 
         match target {
@@ -720,12 +729,42 @@ impl Engine {
             new.source_out = new.timeline_out - new.timeline_in;
         }
 
-        self.execute_structural(Box::new(TrimClip {
+        let trim = Box::new(TrimClip {
             track_id: track.id,
             clip_id,
             old,
             new,
-        }))?;
+        });
+        // Keyframes keep their absolute timeline positions through a
+        // trim: the lane re-anchors to the new window (with boundary
+        // keyframes where the window cuts a moving envelope), riding the
+        // same undo entry as the trim itself.
+        let windowed = keyframes::window_lanes(
+            &clip.keyframes,
+            new.timeline_in - old.timeline_in,
+            new.timeline_out - old.timeline_in,
+        );
+        if windowed == clip.keyframes {
+            self.execute_structural(trim)?;
+        } else {
+            let mut parts: Vec<Box<dyn Command>> = vec![trim];
+            for (prop, old_lane) in clip.keyframes.clone() {
+                let new_lane = windowed.get(&prop).cloned().unwrap_or_default();
+                if new_lane != old_lane {
+                    parts.push(Box::new(SetKeyframes {
+                        track_id: track.id,
+                        clip_id,
+                        prop,
+                        old: old_lane,
+                        new: new_lane,
+                    }));
+                }
+            }
+            self.execute_structural(Box::new(Compound {
+                name: "TrimClip",
+                parts,
+            }))?;
+        }
         Ok(applied)
     }
 
@@ -751,17 +790,24 @@ impl Engine {
         let original = clip.clone();
         let source_at = original.source_in + (at - original.timeline_in) * original.speed;
 
+        let offset = at - original.timeline_in;
+
         let mut left = original.clone();
         left.timeline_out = at;
         left.source_out = source_at;
         // The out cut (and any transition bound to it) belongs to the
         // right half; the left half's new cut at the split point has none.
         left.transition_out = None;
+        // Each half keeps the window of the automation it covers, with
+        // boundary keyframes holding the envelope value at the cut — the
+        // split is inaudible (see `keyframes::window_lane`).
+        left.keyframes = keyframes::window_lanes(&original.keyframes, 0.0, offset);
 
         let mut right = original.clone();
         right.id = ClipId(self.next_id());
         right.timeline_in = at;
         right.source_in = source_at;
+        right.keyframes = keyframes::window_lanes(&original.keyframes, offset, original.duration());
         if original.text.is_some() {
             // No source medium: each half re-normalizes to [0, duration)
             // and keeps the whole (duplicated) text payload.
@@ -803,6 +849,329 @@ impl Engine {
             old: clip.volume,
             new: volume,
         }))
+    }
+
+    // ------------------------------------------------------------------
+    // Keyframes (volume automation now; Phase 3 reuses the machinery)
+    // ------------------------------------------------------------------
+
+    /// The keyframe in `prop`'s lane at (clip-relative) time `t`, within
+    /// the UI-reference tolerance.
+    fn keyframe_at(clip: &Clip, prop: KeyframeProp, t: f64) -> Result<Keyframe, EngineError> {
+        clip.keyframes
+            .get(&prop)
+            .and_then(|lane| {
+                lane.iter()
+                    .find(|k| (k.t - t).abs() <= KEYFRAME_MATCH_EPS)
+                    .copied()
+            })
+            .ok_or(EngineError::UnknownKeyframe { clip: clip.id, t })
+    }
+
+    /// Add a keyframe at clip-relative time `t` (clamped to the clip).
+    /// Landing on an existing keyframe (within [`KEYFRAME_MIN_DT`])
+    /// **replaces** it in place — same-time duplicates cannot exist.
+    /// Returns the time the keyframe actually landed on. Undoable.
+    pub fn add_keyframe(
+        &mut self,
+        clip_id: ClipId,
+        prop: KeyframeProp,
+        t: f64,
+        value: f64,
+        easing: Easing,
+    ) -> Result<f64, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if !t.is_finite() {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "keyframe.t",
+                value: t,
+            });
+        }
+        if !prop.valid_value(value) {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: prop.name(),
+                value,
+            });
+        }
+        let t = t.clamp(0.0, clip.duration());
+        let track_id = track.id;
+        // Dedup at the same time: replace the existing keyframe.
+        if let Some(existing) = clip
+            .keyframes
+            .get(&prop)
+            .and_then(|lane| lane.iter().find(|k| (k.t - t).abs() < KEYFRAME_MIN_DT))
+        {
+            let applied = existing.t;
+            let new = Keyframe {
+                t: applied,
+                value,
+                easing,
+            };
+            if *existing != new {
+                let old = *existing;
+                self.execute(Box::new(MoveKeyframe {
+                    track_id,
+                    clip_id,
+                    prop,
+                    old,
+                    new,
+                }))?;
+            }
+            return Ok(applied);
+        }
+        self.execute(Box::new(AddKeyframe {
+            track_id,
+            clip_id,
+            prop,
+            keyframe: Keyframe { t, value, easing },
+        }))?;
+        Ok(t)
+    }
+
+    /// Move the keyframe at `from_t` to `to_t` with a new value (a dot
+    /// drag moves on both axes; easing is kept). `to_t` is clamped
+    /// between the neighboring keyframes and the clip bounds — keyframes
+    /// cannot cross. Returns the applied time. Undoable.
+    pub fn move_keyframe(
+        &mut self,
+        clip_id: ClipId,
+        prop: KeyframeProp,
+        from_t: f64,
+        to_t: f64,
+        value: f64,
+    ) -> Result<f64, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if !from_t.is_finite() || !to_t.is_finite() {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "keyframe.t",
+                value: to_t,
+            });
+        }
+        if !prop.valid_value(value) {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: prop.name(),
+                value,
+            });
+        }
+        let old = Self::keyframe_at(clip, prop, from_t)?;
+        let lane = &clip.keyframes[&prop];
+        let idx = lane
+            .iter()
+            .position(|k| k.t == old.t)
+            .expect("keyframe_at found it");
+        let lo = if idx > 0 {
+            lane[idx - 1].t + KEYFRAME_MIN_DT
+        } else {
+            0.0
+        };
+        let hi = if idx + 1 < lane.len() {
+            lane[idx + 1].t - KEYFRAME_MIN_DT
+        } else {
+            clip.duration()
+        };
+        let t = to_t.clamp(lo, hi.max(lo));
+        let new = Keyframe {
+            t,
+            value,
+            easing: old.easing,
+        };
+        if new == old {
+            return Ok(t);
+        }
+        self.execute(Box::new(MoveKeyframe {
+            track_id: track.id,
+            clip_id,
+            prop,
+            old,
+            new,
+        }))?;
+        Ok(t)
+    }
+
+    /// Remove the keyframe at clip-relative time `t`. Undoable.
+    pub fn remove_keyframe(
+        &mut self,
+        clip_id: ClipId,
+        prop: KeyframeProp,
+        t: f64,
+    ) -> Result<(), EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        let keyframe = Self::keyframe_at(clip, prop, t)?;
+        self.execute(Box::new(RemoveKeyframe {
+            track_id: track.id,
+            clip_id,
+            prop,
+            keyframe,
+        }))
+    }
+
+    /// Set a clip's fade-in or fade-out to `duration` seconds (0 removes
+    /// it) — pure sugar over the volume keyframe lane: a fade is a
+    /// silent keyframe at the clip edge ramping to the envelope's value
+    /// (see [`keyframes::fade_in_duration`]). The duration is clamped to
+    /// the clip and against the opposite fade; the applied duration is
+    /// returned. One undoable command.
+    pub fn set_clip_fade(
+        &mut self,
+        clip_id: ClipId,
+        side: FadeSide,
+        duration: f64,
+    ) -> Result<f64, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if !duration.is_finite() || duration < 0.0 {
+            return Err(EngineError::InvalidProperty {
+                clip: clip_id,
+                property: "fade.duration",
+                value: duration,
+            });
+        }
+        if clip.text.is_some() {
+            return Err(EngineError::InvalidKeyframes {
+                clip: clip_id,
+                reason: "volume keyframes on a text clip",
+            });
+        }
+        let old = clip
+            .keyframes
+            .get(&KeyframeProp::Volume)
+            .cloned()
+            .unwrap_or_default();
+        let (new, applied) = keyframes::with_fade(&old, clip.duration(), side, duration);
+        if new != old {
+            self.execute(Box::new(SetKeyframes {
+                track_id: track.id,
+                clip_id,
+                prop: KeyframeProp::Volume,
+                old,
+                new,
+            }))?;
+        }
+        Ok(applied)
+    }
+
+    /// Extract a video clip's audio onto an audio track: a new audio
+    /// clip referencing the **same media and source range** (volume and
+    /// volume automation carried over) is placed at the same timeline
+    /// position, and the video clip's own volume drops to 0. The
+    /// topmost unlocked audio track with room takes the clip; when none
+    /// has room a new audio lane is created at the bottom of the panel.
+    /// One undoable command; returns the new audio clip's id.
+    ///
+    /// The clips stay independent afterwards (no linked editing yet —
+    /// moving or trimming one does not follow the other).
+    pub fn extract_audio(&mut self, clip_id: ClipId) -> Result<ClipId, EngineError> {
+        self.require_clip_unlocked(clip_id)?;
+        let (track, clip) = self
+            .project
+            .find_clip(clip_id)
+            .ok_or(EngineError::UnknownClip(clip_id))?;
+        if track.kind != TrackKind::Video {
+            return Err(EngineError::ExtractAudio {
+                clip: clip_id,
+                reason: "only video clips carry embedded audio",
+            });
+        }
+        let media_id = clip.media_id.ok_or(EngineError::ExtractAudio {
+            clip: clip_id,
+            reason: "clip has no media",
+        })?;
+        let media = self
+            .project
+            .media(media_id)
+            .ok_or(EngineError::UnknownMedia(media_id))?;
+        if !media.has_audio {
+            return Err(EngineError::ExtractAudio {
+                clip: clip_id,
+                reason: "the source file has no audio stream",
+            });
+        }
+        let video_track_id = track.id;
+        let clip = clip.clone();
+
+        let span_free = |t: &Track| {
+            t.clips.iter().all(|c| {
+                c.timeline_out <= clip.timeline_in + EPS || c.timeline_in >= clip.timeline_out - EPS
+            })
+        };
+        let target = self
+            .project
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio && !t.locked && span_free(t))
+            .map(|t| t.id);
+
+        // The audio clip takes over the sound: same window, same gain,
+        // same automation. Only the volume lane carries over — other
+        // (Phase 3) lanes animate the picture and stay with the video.
+        let mut audio_keyframes = Keyframes::default();
+        if let Some(lane) = clip.keyframes.get(&KeyframeProp::Volume) {
+            audio_keyframes.insert(KeyframeProp::Volume, lane.clone());
+        }
+        let audio_clip = Clip {
+            id: ClipId(self.next_id()),
+            media_id: Some(media_id),
+            timeline_in: clip.timeline_in,
+            timeline_out: clip.timeline_out,
+            source_in: clip.source_in,
+            source_out: clip.source_out,
+            transform: Transform::default(),
+            opacity: 1.0,
+            blend_mode: BlendMode::default(),
+            speed: clip.speed,
+            volume: clip.volume,
+            transition_out: None,
+            text: None,
+            keyframes: audio_keyframes,
+        };
+        let audio_clip_id = audio_clip.id;
+
+        let mut parts: Vec<Box<dyn Command>> = Vec::new();
+        let target = match target {
+            Some(id) => id,
+            None => {
+                let id = TrackId(self.next_id());
+                parts.push(Box::new(AddTrack {
+                    index: self.project.tracks.len(),
+                    track: Track::new(id, TrackKind::Audio, self.next_track_name(TrackKind::Audio)),
+                }));
+                id
+            }
+        };
+        parts.push(Box::new(AddClip {
+            track_id: target,
+            clip: audio_clip,
+        }));
+        parts.push(Box::new(SetClipVolume {
+            track_id: video_track_id,
+            clip_id,
+            old: clip.volume,
+            new: 0.0,
+        }));
+        self.execute(Box::new(Compound {
+            name: "ExtractAudio",
+            parts,
+        }))?;
+        Ok(audio_clip_id)
     }
 
     /// Set a clip's 2D placement (position/scale/rotation, static values —

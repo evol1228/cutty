@@ -15,6 +15,9 @@ pub mod source;
 
 pub use clock::PlaybackClock;
 pub use error::AudioError;
-pub use mixer::{AudioSegment, FadeRamp, MixerTimeline, TimelineAudio};
+pub use mixer::{
+    soft_clip, AudioSegment, Easing, EnvelopePoint, FadeRamp, MixerTimeline, TimelineAudio,
+    VolumeEnvelope, SOFT_CLIP_KNEE,
+};
 pub use offline::{render_timeline_to_wav, EXPORT_SAMPLE_RATE};
 pub use source::{AudioSource, SymphoniaSource};

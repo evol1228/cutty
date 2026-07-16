@@ -9,7 +9,11 @@ import {
   cachedFontFamilies,
   engineBeginTransaction,
   engineCommitTransaction,
+  engineExtractAudio,
+  engineRemoveKeyframe,
+  engineRollbackTransaction,
   engineSetClipBlendMode,
+  engineSetClipFade,
   engineSetClipOpacity,
   engineSetClipText,
   engineSetClipTransform,
@@ -17,6 +21,7 @@ import {
   BLEND_MODES,
   type BlendMode,
   type Clip,
+  type FadeSide,
   type TextAlign,
   type TextSpec,
   type TextStyle,
@@ -25,6 +30,11 @@ import {
 } from "../lib/engineIpc";
 import { useProjectStore } from "../state/projectStore";
 import { toast } from "../state/toastStore";
+import {
+  fadeInDuration,
+  fadeOutDuration,
+  volumeLane,
+} from "../timeline/envelope";
 import SelectField from "./ui/SelectField";
 
 const TABS = ["Video", "Audio", "Text", "Speed", "Animation", "Adjustment"] as const;
@@ -406,9 +416,83 @@ function VolumeControl({ clip }: { clip: Clip }) {
   );
 }
 
+/** Fade in/out durations as scrubbable numbers — the same engine sugar
+ * the timeline corner handles drive, so both UIs stay in agreement. */
+function FadeControls({ clip }: { clip: Clip }) {
+  const duration = clip.timelineOut - clip.timelineIn;
+  const lane = volumeLane(clip);
+  const apply = (side: FadeSide) => (v: number) => {
+    void engineSetClipFade(clip.id, side, v).catch(() => undefined);
+  };
+  return (
+    <section>
+      <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+        Fade
+      </h3>
+      <div className="grid grid-cols-2 gap-x-3">
+        <DragNumber
+          label="Fade in"
+          value={fadeInDuration(lane) ?? 0}
+          sensitivity={0.02}
+          decimals={2}
+          suffix="s"
+          min={0}
+          max={duration}
+          commit={apply("in")}
+        />
+        <DragNumber
+          label="Fade out"
+          value={fadeOutDuration(lane, duration) ?? 0}
+          sensitivity={0.02}
+          decimals={2}
+          suffix="s"
+          min={0}
+          max={duration}
+          commit={apply("out")}
+        />
+      </div>
+    </section>
+  );
+}
+
+/** Volume-automation summary: keyframe count + clear (the dots
+ * themselves are edited on the timeline clip). */
+function KeyframeSummary({ clip }: { clip: Clip }) {
+  const lane = volumeLane(clip);
+  if (lane.length === 0) return null;
+  const clear = async () => {
+    // One undo entry for the whole clear.
+    await engineBeginTransaction();
+    try {
+      // Removing back-to-front keeps every reference time valid.
+      for (const kf of [...lane].reverse()) {
+        await engineRemoveKeyframe(clip.id, "volume", kf.t);
+      }
+      await engineCommitTransaction();
+    } catch (err) {
+      await engineRollbackTransaction().catch(() => undefined);
+      toast(String(err), "error");
+    }
+  };
+  return (
+    <div className="flex items-center justify-between text-[11px] text-zinc-500">
+      <span>
+        {lane.length} volume keyframe{lane.length === 1 ? "" : "s"}
+      </span>
+      <button
+        onClick={() => void clear()}
+        className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-zinc-800"
+      >
+        Clear
+      </button>
+    </div>
+  );
+}
+
 function AudioTab() {
   const selected = useSelectedClip();
   const project = useProjectStore((s) => s.project);
+  const setSelection = useProjectStore((s) => s.setSelection);
   const media = selected
     ? (project?.media.find((m) => m.id === selected.clip.mediaId) ?? null)
     : null;
@@ -419,9 +503,37 @@ function AudioTab() {
   if (media === null || !media.hasAudio) {
     return <Placeholder text="This clip has no audio" hint="Audio" />;
   }
+  const { clip, track } = selected;
+  const extract = async () => {
+    try {
+      const audioClipId = await engineExtractAudio(clip.id);
+      setSelection([audioClipId]);
+    } catch (err) {
+      toast(`Could not extract audio: ${String(err)}`, "error");
+    }
+  };
   return (
-    <div className="w-full p-4">
-      <VolumeControl clip={selected.clip} />
+    <div className="w-full space-y-5 overflow-y-auto p-4">
+      <VolumeControl clip={clip} />
+      <FadeControls clip={clip} />
+      <KeyframeSummary clip={clip} />
+      {track.kind === "video" && (
+        <section>
+          <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+            Extract
+          </h3>
+          <button
+            onClick={() => void extract()}
+            className="rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+          >
+            Extract audio to track
+          </button>
+          <p className="mt-1.5 text-[11px] leading-snug text-zinc-600">
+            Copies this clip's audio to an audio track and mutes the video
+            clip. One undo step.
+          </p>
+        </section>
+      )}
     </div>
   );
 }
